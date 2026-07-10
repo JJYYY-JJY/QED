@@ -36,7 +36,7 @@ claude:
 # --- Codex (OpenAI) ---
 codex:
   cli_path: "codex"
-  model: "gpt-5.5"
+  model: "gpt-5.6-sol"
   reasoning_effort: "xhigh"
 
 # --- Gemini (Google) ---
@@ -101,17 +101,17 @@ decomposition:
   # Per-agent model selection. Each entry is a dict like:
   #   decomposer:
   #     provider: "codex"
-  #     model: "gpt-5.5"           # optional — overrides global codex.model
+  #     model: "gpt-5.6-sol"       # optional — overrides global codex.model
   #     reasoning_effort: "xhigh"  # optional — overrides global codex.reasoning_effort
   # Unset knobs fall back to the global codex:/gemini:/claude: section.
   models:
     decomposer:
       provider: "codex"           # creates/revises proof decomposition plan
-      model: "gpt-5.5-pro"
+      model: "gpt-5.6-sol"
       reasoning_effort: "xhigh"
     single_prover:
       provider: "codex"           # executes decomposition plan, writes complete proof
-      model: "gpt-5.5"
+      model: "gpt-5.6-sol"
       reasoning_effort: "xhigh"
     regulator:
       provider: "codex"           # decides REVISE_PROOF/REVISE_PLAN/REWRITE after verification fails
