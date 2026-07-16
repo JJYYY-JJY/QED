@@ -112,6 +112,15 @@ STAGE_TRANSITIONS: dict[RunStage, frozenset[RunStage]] = {
     RunStage.COMPLETE: frozenset(),
 }
 
+THREAD_TRANSITIONS: dict[ThreadStatus, frozenset[ThreadStatus]] = {
+    ThreadStatus.ACTIVE: frozenset(
+        {ThreadStatus.COMPLETED, ThreadStatus.FAILED, ThreadStatus.CANCELLED}
+    ),
+    ThreadStatus.COMPLETED: frozenset(),
+    ThreadStatus.FAILED: frozenset(),
+    ThreadStatus.CANCELLED: frozenset(),
+}
+
 
 class StoreModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -435,6 +444,13 @@ class RunStore:
             BEFORE DELETE ON verifications
             BEGIN
                 SELECT RAISE(ABORT, 'verification is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS threads_terminal_status_guard
+            BEFORE UPDATE OF status ON threads
+            WHEN OLD.status != 'active' AND NEW.status != OLD.status
+            BEGIN
+                SELECT RAISE(ABORT, 'terminal thread status is immutable');
             END;
             """
         )
@@ -817,6 +833,36 @@ class RunStore:
         ).fetchall()
         return tuple(self._thread_from_row(row) for row in rows)
 
+    def transition_thread(
+        self, thread_id: str, target: ThreadStatus
+    ) -> ThreadRecord:
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = self._require_thread_row(connection, thread_id)
+            current = ThreadStatus(row["status"])
+            if target not in THREAD_TRANSITIONS[current]:
+                raise InvalidTransitionError(
+                    f"invalid thread transition: {current.value} -> {target.value}"
+                )
+            connection.execute(
+                "UPDATE threads SET status = ?, updated_at = ? WHERE id = ?",
+                (target.value, _render_time(now), thread_id),
+            )
+            run = self._require_run_row(connection, row["run_id"])
+            self._append_event(
+                connection,
+                row["run_id"],
+                event_type="thread.status_changed",
+                stage=RunStage(run["stage"]),
+                payload={
+                    "thread_id": thread_id,
+                    "from": current.value,
+                    "to": target.value,
+                },
+                created_at=now,
+            )
+        return self.get_thread(thread_id)
+
     def create_candidate(
         self, candidate: ProofCandidate, *, thread_id: str | None = None
     ) -> CandidateRecord:
@@ -972,6 +1018,11 @@ class RunStore:
                 thread = self._require_thread_row(connection, report.verifier_thread_id)
                 if thread["run_id"] != run_id:
                     raise ConflictError("verification thread belongs to another run")
+                if (
+                    ThreadRole(thread["role"]) is not ThreadRole.VERIFIER
+                    or thread["parent_thread_id"] is not None
+                ):
+                    raise ConflictError("verification requires a fresh verifier thread")
                 connection.execute(
                     """
                     INSERT INTO verifications (
