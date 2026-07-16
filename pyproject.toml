@@ -47,7 +47,7 @@ prerelease = "if-necessary-or-explicit"
 packages = ["src/qed"]
 
 [tool.pytest.ini_options]
-addopts = "-ra --strict-config --strict-markers"
+addopts = "-ra --strict-config --strict-markers -m 'not real_codex'"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
