@@ -1,0 +1,4 @@
+interface:
+  display_name: "QED Proof Review"
+  short_description: "Review frozen proofs and report step-linked findings"
+  default_prompt: "Use $qed-proof-review to independently review a frozen proof and report step-linked findings."

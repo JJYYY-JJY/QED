@@ -1,0 +1,4 @@
+interface:
+  display_name: "QED Literature"
+  short_description: "Collect primary-source evidence for QED research"
+  default_prompt: "Use $qed-literature to collect primary-source evidence with frozen citation metadata and content hashes."
