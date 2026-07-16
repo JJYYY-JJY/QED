@@ -239,6 +239,33 @@ pythontex-files-*/
 # xcolor
 *.xcp
 
+## Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+## QED runtime state
+.qed/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+## Frontend build and test output
+node_modules/
+dist/
+frontend/test-results/
+frontend/playwright-report/
+
+## Local Impeccable consent and runtime state
+.impeccable/config.local.json
+.impeccable/live/selection.json
+
 # xmpincl
 *.xmpi
 

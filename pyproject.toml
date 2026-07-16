@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "proofqed"
+version = "0.1.0"
+description = "Codex-native mathematical research with independently verified proof candidates"
+readme = "README.md"
+requires-python = ">=3.13,<3.15"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Chenyang An" },
+  { name = "Qihao Ye" },
+  { name = "Minghao Pan" },
+  { name = "Jiayun Zhang" },
+]
+dependencies = [
+  "fastapi>=0.116",
+  "openai-codex==0.1.0b3",
+  "openai-codex-cli-bin==0.137.0a4",
+  "pydantic==2.13.4",
+  "pydantic-settings>=2.10",
+  "structlog>=25.4",
+  "tomli-w>=1.2",
+  "typer>=0.16",
+  "uvicorn[standard]>=0.35",
+]
+
+[project.scripts]
+qed = "qed.cli:app"
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28",
+  "mypy>=1.17",
+  "pytest>=8.4",
+  "pytest-asyncio>=1.1",
+  "pytest-cov>=6.2",
+  "ruff>=0.12",
+]
+
+[tool.uv]
+prerelease = "if-necessary-or-explicit"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qed"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "real_codex: opt-in tests that invoke an authenticated Codex runtime",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = ["proved_statements"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["qed"]
+plugins = ["pydantic.mypy"]
+
+[tool.coverage.run]
+branch = true
+source = ["qed"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
