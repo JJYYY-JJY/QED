@@ -304,11 +304,14 @@ TSWLatexianTemp*
 
 *.pyc
 
-*api*
-
 __pycache__/
-docs/
 *.pyc
+
+# Local credentials and machine state
+.env
+.env.*
+!.env.example
+.impeccable/config.local.json
 
 # Streamlit UI runtime data
 ui/proof_runs/
