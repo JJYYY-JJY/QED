@@ -19,6 +19,7 @@
  *   dedupeAgainstCache(findings, cache, sessionId, filePath)
  *   renderTemplate(findings, filePath, config, opts)
  *   renderCleanAck(filePath, opts) / renderPendingAck(filePath, known, opts)
+ *   renderDesignSystemNote(scanOptions) / appendDesignSystemNote(text, scanOptions)
  *   shouldEmitAckForFile(filePath, config?)
  *   writeAuditLog(env, entry)
  *   loadDetector() -> Promise<{ detectText, detectHtml }>
@@ -1428,9 +1429,14 @@ export function designSystemOptions(config, detector, projectCwd) {
   }
 }
 
+export function renderDesignSystemNote(scanOptions) {
+  if (!scanOptions?.designSystem?.mdNewerThanJson) return '';
+  return `${ENVELOPE_PREFIX} DESIGN.md is newer than .impeccable/design.json. Run ${IMPECCABLE_COMMAND} document to refresh the design-system sidecar.`;
+}
+
 export function appendDesignSystemNote(text, scanOptions) {
-  if (!text || !scanOptions?.designSystem?.mdNewerThanJson) return text;
-  return `${text}\n\n${ENVELOPE_PREFIX} DESIGN.md is newer than .impeccable/design.json. Run ${IMPECCABLE_COMMAND} document to refresh the design-system sidecar.`;
+  const note = renderDesignSystemNote(scanOptions);
+  return text && note ? `${text}\n\n${note}` : text;
 }
 
 // The directive footer is the part of the hook output that steers model

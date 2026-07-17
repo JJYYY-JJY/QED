@@ -81,14 +81,14 @@ These commands ran against the current candidate on 2026-07-17:
 | --- | --- |
 | `uv run ruff check .` | Passed |
 | `uv run mypy src` | Passed |
-| `uv run pytest` | 220 passed, 1 opt-in real Codex test deselected |
+| `uv run pytest` | 229 passed, 1 opt-in real Codex test deselected |
 | `uv build` | Source distribution and wheel built |
 | `npm run lint` | Passed |
 | `npm run typecheck` | Passed |
 | `npm test` | 3 files and 10 tests passed |
 | `npm run build` | Passed |
 | `npm run impeccable` | Passed with no anti-pattern findings |
-| `npm run test:impeccable` | 76 passed |
+| `npm run test:impeccable` | 103 passed |
 | `npm run test:e2e` | 5 passed, 3 expected skips |
 
 The `real_codex` smoke test is present and collectable, but no real Codex call

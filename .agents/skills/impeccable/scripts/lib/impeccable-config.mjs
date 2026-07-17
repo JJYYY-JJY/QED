@@ -15,9 +15,9 @@
  *   }
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import { join, dirname, isAbsolute, relative, resolve } from 'node:path';
-import { readContainedFile, writeContainedFile } from './safe-fs.mjs';
+import { readContainedFile, updateContainedFile, writeContainedFile } from './safe-fs.mjs';
 import { createGlobMatcher, matchesAnyGlob } from './safe-glob.mjs';
 
 export { matchesAnyGlob };
@@ -546,20 +546,15 @@ export function ensureConfigGitExclude(root) {
     const gitDir = resolveGitDir(root);
     if (!gitDir) return false;
     const target = join(gitDir, 'info', 'exclude');
-    const existing = existsSync(target) ? readFileSync(target, 'utf-8') : '';
     const block = [EXCLUDE_OPEN, ...EXCLUDE_PATTERNS, EXCLUDE_CLOSE].join('\n');
     const markerRe = new RegExp(`${escapeRegExp(EXCLUDE_OPEN)}[\\s\\S]*?${escapeRegExp(EXCLUDE_CLOSE)}`);
-    let updated;
-    if (markerRe.test(existing)) {
-      updated = existing.replace(markerRe, block);
-    } else {
-      const prefix = existing.length === 0 ? '' : existing.endsWith('\n') ? existing : `${existing}\n`;
-      updated = `${prefix}${block}\n`;
-    }
-    if (updated !== existing) {
-      mkdirSync(dirname(target), { recursive: true });
-      writeFileSync(target, updated);
-    }
+    updateContainedFile(root, target, (raw) => {
+      const existing = raw || '';
+      const updated = markerRe.test(existing)
+        ? existing.replace(markerRe, block)
+        : `${existing.length === 0 ? '' : existing.endsWith('\n') ? existing : `${existing}\n`}${block}\n`;
+      return updated === existing ? undefined : updated;
+    }, { encoding: 'utf-8' });
     return true;
   } catch {
     return false;
@@ -568,19 +563,11 @@ export function ensureConfigGitExclude(root) {
 
 function resolveGitDir(root) {
   const dotGit = join(root, '.git');
-  if (!existsSync(dotGit)) return null;
   try {
-    if (statSync(dotGit).isDirectory()) return dotGit;
-    // A `.git` file (worktree/submodule) points elsewhere: "gitdir: <path>".
-    const match = readFileSync(dotGit, 'utf-8').match(/gitdir:\s*(.+)/);
-    if (match) {
-      const resolved = match[1].trim();
-      return isAbsolute(resolved) ? resolved : join(root, resolved);
-    }
+    return lstatSync(dotGit).isDirectory() ? dotGit : null;
   } catch {
-    /* fall through */
+    return null;
   }
-  return null;
 }
 
 function escapeRegExp(value) {

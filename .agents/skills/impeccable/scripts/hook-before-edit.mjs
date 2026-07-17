@@ -19,7 +19,6 @@ import {
   EDIT_COUNT_THRESHOLD,
   GENERATED_PATH,
   SENSITIVE_PATH,
-  appendDesignSystemNote,
   designSystemOptions,
   filterFindings,
   isNativePlatform,
@@ -28,6 +27,7 @@ import {
   persistCache,
   readCache,
   readConfig,
+  renderDesignSystemNote,
   renderTemplate,
   resolveCacheCwd,
   resolveProjectCwd,
@@ -35,10 +35,15 @@ import {
   truthy,
   writeAuditLog,
 } from './hook-lib.mjs';
+import { IMPECCABLE_COMMAND } from './lib/provider.mjs';
 import { readContainedFile } from './lib/safe-fs.mjs';
 import { createGlobMatcher } from './lib/safe-glob.mjs';
 
 const MAX_HOOK_FILE_BYTES = 1024 * 1024;
+const CURSOR_MESSAGE_MAX_CHARS = 4000;
+const STANDARD_FINDINGS_HEADER = '[impeccable@1] Design hook findings requiring review';
+const BLOCKED_FINDINGS_HEADER = '[impeccable@1] Impeccable design hook blocked this write before it landed. Design hook findings requiring review';
+const CURSOR_BUDGET_FALLBACK = `[impeccable@1] Impeccable blocked this write because design findings exceeded the Cursor context budget. Run ${IMPECCABLE_COMMAND} audit, then resolve real findings or classify intentional findings before finalizing.`;
 
 async function readStdin() {
   if (process.stdin.isTTY) return '';
@@ -365,13 +370,22 @@ async function detectProposedHtml(detector, content, filePath, scanOptions) {
   }
 }
 
-function cursorBlockMessage(findings, filePath, config, cwd) {
-  const rendered = renderTemplate(findings, filePath, config, { cwd });
-  const blocked = rendered.replace(
-    '[impeccable@1] Design hook findings requiring review',
-    '[impeccable@1] Impeccable design hook blocked this write before it landed. Design hook findings requiring review',
-  );
-  return blocked.length > 4000 ? `${blocked.slice(0, 3984)}\n...(truncated)` : blocked;
+function cursorBlockMessage(findings, filePath, config, cwd, extraMessages = []) {
+  const suffix = extraMessages.filter(Boolean).map((message) => `\n\n${message}`).join('');
+  const headerGrowth = BLOCKED_FINDINGS_HEADER.length - STANDARD_FINDINGS_HEADER.length;
+  const renderBudget = CURSOR_MESSAGE_MAX_CHARS - headerGrowth - suffix.length;
+  const configuredBudget = Number(config?.limits?.maxChars);
+  const maxChars = Number.isFinite(configuredBudget) && configuredBudget > 0
+    ? Math.min(configuredBudget, renderBudget)
+    : renderBudget;
+  const rendered = renderTemplate(findings, filePath, {
+    ...config,
+    limits: { ...config?.limits, maxChars },
+  }, { cwd });
+  const message = `${rendered.replace(STANDARD_FINDINGS_HEADER, BLOCKED_FINDINGS_HEADER)}${suffix}`;
+  if (message.length <= CURSOR_MESSAGE_MAX_CHARS) return message;
+  const fallback = `${CURSOR_BUDGET_FALLBACK}${suffix}`;
+  return fallback.length <= CURSOR_MESSAGE_MAX_CHARS ? fallback : CURSOR_BUDGET_FALLBACK;
 }
 
 function findingSignature(findings) {
@@ -391,8 +405,12 @@ function bumpCursorDenial(cache, sessionId, filePath, findings) {
   fileEntry.cursorDenials = fileEntry.cursorDenials && typeof fileEntry.cursorDenials === 'object'
     ? fileEntry.cursorDenials
     : {};
-  fileEntry.cursorDenials[key] = (fileEntry.cursorDenials[key] || 0) + 1;
-  return { key, count: fileEntry.cursorDenials[key] };
+  const previous = Number(fileEntry.cursorDenials[key]);
+  const count = Number.isSafeInteger(previous) && previous >= 0
+    ? Math.min(previous + 1, Number.MAX_SAFE_INTEGER)
+    : 1;
+  fileEntry.cursorDenials[key] = count;
+  return { key, count };
 }
 
 async function main() {
@@ -499,13 +517,14 @@ async function main() {
     });
   }
 
-  const message = appendDesignSystemNote(cursorBlockMessage(filtered, filePath, config, cwd), scanOptions);
   const sessionId = event.session_id || event.conversation_id || 'unknown';
   const cache = readCache(cwd);
   const denial = bumpCursorDenial(cache, sessionId, filePath, filtered);
   persistCache(cwd, cache);
+  const extraMessages = [renderDesignSystemNote(scanOptions)];
   if (denial.count > EDIT_COUNT_THRESHOLD) {
-    const warning = `${message}\n\nThis is the ${denial.count}th repeated denial for the same file and finding signature, so Impeccable is allowing this write to avoid a loop. Reconsider the issue immediately after the tool runs.`;
+    extraMessages.push(`This is the ${denial.count}th repeated denial for the same file and finding signature, so Impeccable is allowing this write to avoid a loop. Reconsider the issue immediately after the tool runs.`);
+    const message = cursorBlockMessage(filtered, filePath, config, cwd, extraMessages);
     return allow({
       ...audit,
       findings: (findings || []).length,
@@ -513,13 +532,14 @@ async function main() {
       cursorDenialKey: denial.key,
       cursorDenialCount: denial.count,
       downgraded: true,
-      chars: warning.length,
+      chars: message.length,
       durationMs: Date.now() - started,
     }, {
-      user_message: warning,
-      agent_message: warning,
+      user_message: message,
+      agent_message: message,
     });
   }
+  const message = cursorBlockMessage(filtered, filePath, config, cwd, extraMessages);
   return deny(message, {
     ...audit,
     findings: (findings || []).length,
