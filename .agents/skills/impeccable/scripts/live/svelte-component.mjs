@@ -8,13 +8,13 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { createHash } from 'node:crypto';
 import {
   ensureContainedDirectory,
   readContainedFile,
   readContainedDirectory,
   removeContainedDirectory,
+  removeContainedFile,
   resolveContainedPath,
   writeContainedFile,
 } from '../lib/safe-fs.mjs';
@@ -911,14 +911,13 @@ export function removeAllSvelteComponentSessions(cwd = process.cwd()) {
 }
 
 export function deferredAcceptsPath(cwd = process.cwd()) {
-  const key = createHash('sha1').update(path.resolve(cwd)).digest('hex').slice(0, 16);
-  return path.join(os.tmpdir(), 'impeccable-live', key, 'deferred-svelte-component-accepts.json');
+  return path.join(path.resolve(cwd), DEFERRED_ACCEPTS_FILE);
 }
 
 export function readDeferredAccepts(cwd = process.cwd()) {
   const file = deferredAcceptsPath(cwd);
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf-8'));
+    return JSON.parse(readContainedFile(cwd, file, 'utf-8'));
   } catch {
     return { accepts: [] };
   }
@@ -926,11 +925,10 @@ export function readDeferredAccepts(cwd = process.cwd()) {
 
 export function writeDeferredAccept(entry, cwd = process.cwd()) {
   const file = deferredAcceptsPath(cwd);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
   const data = readDeferredAccepts(cwd);
   data.accepts = (data.accepts || []).filter((item) => item.id !== entry.id);
   data.accepts.push({ ...entry, createdAt: new Date().toISOString() });
-  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  writeContainedFile(cwd, file, JSON.stringify(data, null, 2) + '\n', { encoding: 'utf-8' });
 }
 
 export function applyDeferredSvelteComponentAccepts(cwd = process.cwd()) {
@@ -961,9 +959,9 @@ export function applyDeferredSvelteComponentAccepts(cwd = process.cwd()) {
     }
   }
   if (remaining.length > 0) {
-    fs.writeFileSync(file, JSON.stringify({ accepts: remaining }, null, 2) + '\n', 'utf-8');
+    writeContainedFile(cwd, file, JSON.stringify({ accepts: remaining }, null, 2) + '\n', { encoding: 'utf-8' });
   } else {
-    try { fs.rmSync(file, { force: true }); } catch {}
+    try { removeContainedFile(cwd, file, { force: true }); } catch {}
   }
   return { applied: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
 }

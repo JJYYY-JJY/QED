@@ -88,7 +88,7 @@ These commands ran against the completed working tree on 2026-07-16:
 | `npm test` | 3 files and 9 tests passed |
 | `npm run build` | Passed |
 | `npm run impeccable` | Passed with no anti-pattern findings |
-| `npm run test:impeccable` | 43 passed |
+| `npm run test:impeccable` | 44 passed |
 | `npm run test:e2e` | 4 passed, 2 expected desktop-project skips |
 
 No real Codex call was made. It remains opt-in because it consumes credentials,

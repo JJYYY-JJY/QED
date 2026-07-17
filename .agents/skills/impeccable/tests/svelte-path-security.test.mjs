@@ -8,11 +8,14 @@ import { fileURLToPath } from 'node:url';
 
 import { resolveDesignSidecarPath } from '../scripts/lib/impeccable-paths.mjs';
 import {
+  applyDeferredSvelteComponentAccepts,
+  deferredAcceptsPath,
   findSvelteComponentManifest,
   inlineSvelteComponentAccept,
   removeAllSvelteComponentSessions,
   removeSvelteComponentSession,
   scaffoldSvelteComponentSession,
+  writeDeferredAccept,
 } from '../scripts/live/svelte-component.mjs';
 
 function fixture(t) {
@@ -98,6 +101,26 @@ test('Svelte session scaffolding refuses a symlinked component root', (t) => {
 
   assert.equal(fs.existsSync(path.join(outside, '__runtime.js')), false);
   assert.equal(fs.existsSync(path.join(outside, 'deadbeef')), false);
+});
+
+test('deferred Svelte accepts stay in contained project state', (t) => {
+  const root = fixture(t);
+  const project = path.join(root, 'project');
+  const outside = path.join(root, 'outside.json');
+  const deferred = deferredAcceptsPath(project);
+  fs.mkdirSync(path.dirname(deferred), { recursive: true });
+  fs.writeFileSync(outside, 'KEEP\n');
+  fs.symlinkSync(outside, deferred);
+
+  assert.equal(deferred, path.join(project, '.impeccable', 'live', 'deferred-svelte-component-accepts.json'));
+  assert.throws(
+    () => writeDeferredAccept({ id: 'deadbeef', variantNum: 1 }, project),
+    /symbolic link/,
+  );
+  const result = applyDeferredSvelteComponentAccepts(project);
+
+  assert.equal(result.applied, 0);
+  assert.equal(fs.readFileSync(outside, 'utf-8'), 'KEEP\n');
 });
 
 test('Svelte accept rejects a manifest redirected to a non-Svelte project file', (t) => {
