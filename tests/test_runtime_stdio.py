@@ -5,7 +5,13 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
-from qed.runtime import StdioAppServerTransport, build_app_server_argv
+import pytest
+
+from qed.runtime import (
+    RuntimeRequestTimeout,
+    StdioAppServerTransport,
+    build_app_server_argv,
+)
 
 
 class FakeStdout:
@@ -41,6 +47,7 @@ class FakeStdin:
     def __init__(self, process: FakeProcess) -> None:
         self.process = process
         self.messages: list[dict[str, Any]] = []
+        self.slow_written = asyncio.Event()
 
     def write(self, data: bytes) -> None:
         message = json.loads(data)
@@ -55,6 +62,10 @@ class FakeStdin:
             self.process.stdout.lines.put_nowait(
                 json.dumps({"method": "server/ready", "params": {}}).encode() + b"\n"
             )
+        elif method == "fast":
+            self._reply(request_id, {"ok": True})
+        elif method == "slow":
+            self.slow_written.set()
 
     def _reply(self, request_id: object, result: dict[str, Any]) -> None:
         response = {"id": request_id, "result": result}
@@ -115,4 +126,55 @@ async def test_stdio_transport_initializes_once_and_broadcasts_notifications() -
     assert await anext(notifications) == {"method": "server/ready", "params": {}}
 
     await notifications.aclose()
+    await transport.close()
+
+
+async def test_cancelled_request_late_response_does_not_poison_transport() -> None:
+    process = FakeProcess()
+
+    async def spawn(argv: tuple[str, ...]) -> FakeProcess:
+        return process
+
+    transport = StdioAppServerTransport(
+        Path("/opt/codex/bin/codex"), process_factory=cast(Any, spawn)
+    )
+    slow = asyncio.create_task(transport.request("slow", {}))
+    await process.stdin.slow_written.wait()
+    slow_request = next(
+        message for message in process.stdin.messages if message.get("method") == "slow"
+    )
+
+    slow.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await slow
+    process.stdin._reply(slow_request["id"], {"late": True})
+    await asyncio.sleep(0)
+
+    result = await asyncio.wait_for(transport.request("fast", {}), timeout=0.1)
+
+    assert result == {"ok": True}
+    await transport.close()
+
+
+async def test_timed_out_request_late_response_does_not_poison_transport() -> None:
+    process = FakeProcess()
+
+    async def spawn(argv: tuple[str, ...]) -> FakeProcess:
+        return process
+
+    transport = StdioAppServerTransport(
+        Path("/opt/codex/bin/codex"),
+        process_factory=cast(Any, spawn),
+        request_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(RuntimeRequestTimeout, match="slow.*timed out"):
+        await transport.request("slow", {})
+    slow_request = next(
+        message for message in process.stdin.messages if message.get("method") == "slow"
+    )
+    process.stdin._reply(slow_request["id"], {"late": True})
+    await asyncio.sleep(0)
+
+    assert await transport.request("fast", {}) == {"ok": True}
     await transport.close()

@@ -11,6 +11,10 @@ from typing import Any, Protocol, cast
 from .app_server import RuntimeProtocolError
 
 
+class RuntimeRequestTimeout(RuntimeProtocolError):
+    pass
+
+
 def resolve_codex_executable(executable: str | Path | None = None) -> Path:
     value = "codex" if executable is None else str(executable)
     candidate = value if Path(value).is_absolute() else shutil.which(value)
@@ -86,9 +90,13 @@ class StdioAppServerTransport:
         executable: Path,
         *,
         process_factory: ProcessFactory = _spawn,
+        request_timeout_seconds: float = 30.0,
     ) -> None:
+        if request_timeout_seconds <= 0:
+            raise ValueError("App Server request timeout must be positive")
         self._argv = build_app_server_argv(executable)
         self._process_factory = process_factory
+        self._request_timeout_seconds = request_timeout_seconds
         self._process: _Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._startup_lock = asyncio.Lock()
@@ -160,9 +168,14 @@ class StdioAppServerTransport:
         )
         self._pending[request_id] = future
         try:
-            await self._write({"id": request_id, "method": method, "params": params})
-            return await future
+            async with asyncio.timeout(self._request_timeout_seconds):
+                await self._write({"id": request_id, "method": method, "params": params})
+                return await asyncio.shield(future)
+        except TimeoutError as error:
+            raise RuntimeRequestTimeout(f"App Server request {method!r} timed out") from error
         finally:
+            if not future.done():
+                future.cancel()
             self._pending.pop(request_id, None)
 
     async def _raw_notify(self, method: str, params: dict[str, Any]) -> None:
@@ -218,9 +231,15 @@ class StdioAppServerTransport:
         return value
 
     def _resolve_response(self, request_id: object, message: dict[str, Any]) -> None:
-        if not isinstance(request_id, int) or request_id not in self._pending:
+        if not isinstance(request_id, int):
             raise RuntimeProtocolError(f"App Server returned unknown request id {request_id!r}")
-        future = self._pending[request_id]
+        future = self._pending.get(request_id)
+        if future is None:
+            if 0 < request_id < self._next_id:
+                return
+            raise RuntimeProtocolError(f"App Server returned unknown request id {request_id!r}")
+        if future.done():
+            return
         error = message.get("error")
         if error is not None:
             future.set_exception(RuntimeProtocolError(f"App Server request failed: {error!r}"))

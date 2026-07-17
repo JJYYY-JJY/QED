@@ -43,6 +43,15 @@ class _ExecProcess(Protocol):
 
     def terminate(self) -> None: ...
 
+    def kill(self) -> None: ...
+
+
+class _ActiveExec:
+    def __init__(self, process: _ExecProcess) -> None:
+        self.process = process
+        self.interrupted = False
+        self.stop_lock = asyncio.Lock()
+
 
 ExecProcessFactory = Callable[[tuple[str, ...], Path], Awaitable[Any]]
 
@@ -130,14 +139,18 @@ class ExecRuntime:
         process_factory: ExecProcessFactory = _spawn,
         turn_id_factory: Callable[[], str] = lambda: str(uuid4()),
         capability_runtime: CodexRuntime | None = None,
+        terminate_timeout_seconds: float = 5.0,
     ) -> None:
         if not executable.is_absolute():
             raise ValueError("codex exec executable must be absolute")
+        if terminate_timeout_seconds <= 0:
+            raise ValueError("codex exec termination timeout must be positive")
         self._executable = executable
         self._process_factory = process_factory
         self._turn_id_factory = turn_id_factory
         self._capability_runtime = capability_runtime
-        self._active: dict[tuple[str, str], _ExecProcess] = {}
+        self._terminate_timeout_seconds = terminate_timeout_seconds
+        self._active: dict[tuple[str, str], _ActiveExec] = {}
 
     def supports(self, request: RunRequest) -> bool:
         return (
@@ -162,12 +175,16 @@ class ExecRuntime:
         terminal_usage: dict[str, Any] | None = None
         thread_id: str | None = None
         process: _ExecProcess | None = None
+        active: _ActiveExec | None = None
+        stderr_task: asyncio.Task[bytes] | None = None
         active_key: tuple[str, str] | None = None
         with tempfile.TemporaryDirectory(prefix="qed-codex-") as directory:
             schema_path = Path(directory) / "output-schema.json"
             schema_path.write_text(json.dumps(request.output_schema), encoding="utf-8")
             argv = build_exec_argv(self._executable, request, schema_path)
             process = cast(_ExecProcess, await self._process_factory(argv, cwd))
+            active = _ActiveExec(process)
+            stderr_task = asyncio.create_task(self._drain_stderr(process.stderr))
             try:
                 while line := await process.stdout.readline():
                     event = self._decode_event(line)
@@ -187,7 +204,7 @@ class ExecRuntime:
                             backend=RuntimeBackend.EXEC,
                         )
                         active_key = (turn.thread_id, turn.turn_id)
-                        self._active[active_key] = process
+                        self._active[active_key] = active
                         yield TurnStarted(turn=turn)
                         continue
                     if event_type == "item.completed":
@@ -235,8 +252,20 @@ class ExecRuntime:
                     raise RuntimeProtocolError("codex exec event omitted string type")
 
                 returncode = await process.wait()
+                stderr = await stderr_task
+                if active.interrupted:
+                    if turn is None:
+                        raise RuntimeProtocolError(
+                            "codex exec was interrupted before turn.started"
+                        )
+                    yield TurnCompleted(turn=turn, status="interrupted", output=final_output)
+                    return
                 if returncode != 0:
-                    raise RuntimeProtocolError(f"codex exec exited with status {returncode}")
+                    detail = stderr.decode(errors="replace").strip()
+                    suffix = f": {detail}" if detail else ""
+                    raise RuntimeProtocolError(
+                        f"codex exec exited with status {returncode}{suffix}"
+                    )
                 if turn is None or terminal is None:
                     raise RuntimeProtocolError("codex exec ended without a terminal turn event")
                 if terminal_usage is not None:
@@ -250,8 +279,9 @@ class ExecRuntime:
                 if active_key is not None:
                     self._active.pop(active_key, None)
                 if process.returncode is None:
-                    process.terminate()
-                    await process.wait()
+                    await self._stop(active)
+                if stderr_task is not None:
+                    await stderr_task
 
     @staticmethod
     def _decode_event(line: bytes) -> dict[str, Any]:
@@ -278,19 +308,43 @@ class ExecRuntime:
             reasoning_output_tokens=token("reasoning_output_tokens"),
         )
 
+    @staticmethod
+    async def _drain_stderr(reader: _Reader) -> bytes:
+        retained = bytearray()
+        while line := await reader.readline():
+            retained.extend(line)
+            if len(retained) > 65_536:
+                del retained[:-65_536]
+        return bytes(retained)
+
+    async def _stop(self, active: _ActiveExec) -> None:
+        async with active.stop_lock:
+            process = active.process
+            if process.returncode is not None:
+                return
+            process.terminate()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(process.wait()),
+                    timeout=self._terminate_timeout_seconds,
+                )
+            except TimeoutError:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+
     async def interrupt(self, turn: TurnRef) -> None:
         if turn.backend is not RuntimeBackend.EXEC:
             raise ValueError("cannot interrupt a non-exec turn through ExecRuntime")
-        process = self._active.get((turn.thread_id, turn.turn_id))
-        if process is None:
+        active = self._active.get((turn.thread_id, turn.turn_id))
+        if active is None:
             raise ValueError("codex exec turn is not active")
-        process.terminate()
-        await process.wait()
+        active.interrupted = True
+        await self._stop(active)
 
     async def close(self) -> None:
-        processes = tuple(set(self._active.values()))
-        for process in processes:
-            if process.returncode is None:
-                process.terminate()
-        if processes:
-            await asyncio.gather(*(process.wait() for process in processes))
+        active_turns = tuple(self._active.values())
+        for active in active_turns:
+            active.interrupted = True
+        if active_turns:
+            await asyncio.gather(*(self._stop(active) for active in active_turns))

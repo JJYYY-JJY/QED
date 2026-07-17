@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -15,6 +16,7 @@ from qed.runtime import (
     ResumeThread,
     RunRequest,
     RuntimeBackend,
+    RuntimeEvent,
     ThreadStarted,
     TokenUsageUpdated,
     TurnCompleted,
@@ -259,6 +261,103 @@ async def test_interrupt_addresses_the_exact_app_server_turn() -> None:
     ]
 
 
+async def test_concurrent_streams_ignore_other_turn_lifecycle_events() -> None:
+    notifications = [
+        {
+            "method": "turn/started",
+            "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}},
+        },
+        {
+            "method": "turn/started",
+            "params": {"threadId": "thread-2", "turn": {"id": "turn-2"}},
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-2",
+                "turnId": "turn-2",
+                "item": {
+                    "id": "item-2",
+                    "type": "agentMessage",
+                    "text": '{"stream":2}',
+                    "phase": "final_answer",
+                },
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "agentMessage",
+                    "text": '{"stream":1}',
+                    "phase": "final_answer",
+                },
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-2",
+                "turn": {"id": "turn-2", "status": "completed"},
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "completed"},
+            },
+        },
+    ]
+    transport = FakeTransport(
+        {
+            "thread/start": [
+                {"thread": {"id": "thread-1"}},
+                {"thread": {"id": "thread-2"}},
+            ],
+            "turn/start": [
+                {"turn": {"id": "turn-1"}},
+                {"turn": {"id": "turn-2"}},
+            ],
+        },
+        notifications=notifications,
+    )
+    runtime = AppServerRuntime(transport)
+
+    async def collect(label: int) -> list[RuntimeEvent]:
+        request = RunRequest(
+            model="gpt-5.6-sol",
+            effort="high",
+            prompt=f"Return stream {label}.",
+            output_schema={"type": "object", "additionalProperties": False},
+        )
+        return [event async for event in runtime.stream(request)]
+
+    first, second = await asyncio.gather(collect(1), collect(2))
+
+    assert first[-1] == TurnCompleted(
+        turn=TurnRef(
+            thread_id="thread-1",
+            turn_id="turn-1",
+            backend=RuntimeBackend.APP_SERVER,
+        ),
+        status="completed",
+        output='{"stream":1}',
+    )
+    assert second[-1] == TurnCompleted(
+        turn=TurnRef(
+            thread_id="thread-2",
+            turn_id="turn-2",
+            backend=RuntimeBackend.APP_SERVER,
+        ),
+        status="completed",
+        output='{"stream":2}',
+    )
+
+
 async def test_explicit_network_policy_builds_allowlist_first_config() -> None:
     transport = FakeTransport(
         {
@@ -266,6 +365,19 @@ async def test_explicit_network_policy_builds_allowlist_first_config() -> None:
             "turn/start": [{"turn": {"id": "turn-1"}}],
         },
         notifications=[
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "item-1",
+                        "type": "agentMessage",
+                        "text": "{}",
+                        "phase": "final_answer",
+                    },
+                },
+            },
             {
                 "method": "turn/completed",
                 "params": {

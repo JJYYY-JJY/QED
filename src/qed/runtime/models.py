@@ -3,13 +3,16 @@ from __future__ import annotations
 import re
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, Self, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+OutputModel = TypeVar("OutputModel", bound=BaseModel)
 
 
 class RuntimeBackend(StrEnum):
@@ -82,7 +85,7 @@ class RunRequest(_FrozenModel):
     effort: str = Field(default="auto", min_length=1)
     proactive: bool = False
     prompt: str = Field(min_length=1)
-    output_schema: dict[str, Any]
+    output_schema: dict[str, Any] = Field(min_length=1)
     thread: ThreadTarget = Field(default_factory=FreshThread)
     role: WorkRole = WorkRole.GENERAL
     sandbox: SandboxMode = SandboxMode.READ_ONLY
@@ -93,6 +96,13 @@ class RunRequest(_FrozenModel):
 
     @model_validator(mode="after")
     def validate_network_controls(self) -> Self:
+        if self.role is WorkRole.VERIFIER and (
+            not isinstance(self.thread, FreshThread)
+            or self.sandbox is not SandboxMode.READ_ONLY
+            or self.web_search is not WebSearchMode.DISABLED
+            or self.command_network is not None
+        ):
+            raise ValueError("verifier turns must be fresh, read-only, and offline")
         network_roles = {WorkRole.LITERATURE, WorkRole.CITATION}
         if self.web_search is not WebSearchMode.DISABLED and self.role not in network_roles:
             raise ValueError("web search is limited to literature and citation turns")
@@ -218,6 +228,19 @@ class TurnCompleted(_FrozenModel):
     turn: TurnRef
     status: Literal["completed", "failed", "interrupted"]
     output: str | None = None
+
+    @model_validator(mode="after")
+    def validate_completed_output(self) -> Self:
+        if self.status == "completed" and (
+            self.output is None or not self.output.strip()
+        ):
+            raise ValueError("completed turn must include structured output")
+        return self
+
+    def parse_output_as(self, output_type: type[OutputModel]) -> OutputModel:
+        if self.status != "completed" or self.output is None:
+            raise ValueError("only completed turns have structured output")
+        return output_type.model_validate_json(self.output, strict=True)
 
 
 RuntimeEvent = (

@@ -223,6 +223,8 @@ class AppServerRuntime:
         fallback_output: str | None = None
         async for notification in notifications:
             method, params = self._notification_shape(notification)
+            if self._targets_other_turn(params, turn_ref):
+                continue
             if method == "turn/started":
                 started = _TurnParams.model_validate(params)
                 self._require_turn(started.thread_id, started.turn, turn_ref)
@@ -362,6 +364,17 @@ class AppServerRuntime:
     def _require_turn(thread_id: str, turn: dict[str, Any], expected: TurnRef) -> None:
         if thread_id != expected.thread_id or turn.get("id") != expected.turn_id:
             raise RuntimeProtocolError("received lifecycle event for an unexpected turn")
+
+    @staticmethod
+    def _targets_other_turn(params: dict[str, Any], expected: TurnRef) -> bool:
+        thread_id = params.get("threadId")
+        if isinstance(thread_id, str) and thread_id != expected.thread_id:
+            return True
+        turn_id = params.get("turnId")
+        turn = params.get("turn")
+        if turn_id is None and isinstance(turn, dict):
+            turn_id = turn.get("id")
+        return isinstance(turn_id, str) and turn_id != expected.turn_id
 
     async def interrupt(self, turn: TurnRef) -> None:
         if turn.backend is not RuntimeBackend.APP_SERVER:

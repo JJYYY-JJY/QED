@@ -36,6 +36,7 @@ from .models import (
 from .router import RoutedCodexRuntime, create_codex_runtime
 from .sdk import SdkRuntime
 from .stdio import (
+    RuntimeRequestTimeout,
     StdioAppServerTransport,
     build_app_server_argv,
     resolve_codex_executable,
@@ -62,6 +63,7 @@ __all__ = [
     "RuntimeEvent",
     "RuntimePreference",
     "RuntimeProtocolError",
+    "RuntimeRequestTimeout",
     "SandboxMode",
     "SdkRuntime",
     "StdioAppServerTransport",

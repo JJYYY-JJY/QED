@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from qed.runtime import (
     CapabilityRequest,
@@ -11,11 +13,20 @@ from qed.runtime import (
     RestrictedNetworkPolicy,
     ResumeThread,
     RunRequest,
+    RuntimeBackend,
     SandboxMode,
+    TurnCompleted,
+    TurnRef,
     WebSearchMode,
     WorkRole,
     resolve_capability,
 )
+
+
+class VerdictOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    verdict: Literal["PASS", "FAIL"]
 
 
 def _request(**overrides: object) -> RunRequest:
@@ -37,6 +48,37 @@ def test_run_request_defaults_to_a_fresh_read_only_offline_turn() -> None:
     assert request.web_search is WebSearchMode.DISABLED
     assert request.command_network is None
     assert "approval" not in RunRequest.model_fields
+
+
+def test_run_request_rejects_an_empty_output_schema() -> None:
+    with pytest.raises(ValidationError, match="output_schema"):
+        _request(output_schema={})
+
+
+def test_completed_turn_requires_and_strictly_parses_structured_output() -> None:
+    turn = TurnRef(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        backend=RuntimeBackend.MOCK,
+    )
+
+    with pytest.raises(ValidationError, match="structured output"):
+        TurnCompleted(turn=turn, status="completed", output=None)
+
+    completed = TurnCompleted(
+        turn=turn,
+        status="completed",
+        output='{"verdict":"PASS"}',
+    )
+    assert completed.parse_output_as(VerdictOutput) == VerdictOutput(verdict="PASS")
+
+    malformed = TurnCompleted(
+        turn=turn,
+        status="completed",
+        output='{"verdict":1}',
+    )
+    with pytest.raises(ValidationError):
+        malformed.parse_output_as(VerdictOutput)
 
 
 @pytest.mark.parametrize(
@@ -64,6 +106,25 @@ def test_only_literature_roles_may_enable_web_search() -> None:
 
     assert request.web_search is WebSearchMode.LIVE
     assert request.command_network is None
+
+
+def test_verifier_role_requires_a_fresh_read_only_offline_thread() -> None:
+    verifier = _request(role=WorkRole.VERIFIER)
+
+    assert isinstance(verifier.thread, FreshThread)
+    assert verifier.sandbox is SandboxMode.READ_ONLY
+    assert verifier.web_search is WebSearchMode.DISABLED
+
+    with pytest.raises(ValidationError, match="verifier turns must be fresh"):
+        _request(
+            role=WorkRole.VERIFIER,
+            thread=ResumeThread(thread_id="prior-verifier"),
+        )
+    with pytest.raises(ValidationError, match="verifier turns must be fresh"):
+        _request(
+            role=WorkRole.VERIFIER,
+            sandbox=SandboxMode.WORKSPACE_WRITE,
+        )
 
 
 def test_literature_role_accepts_indexed_web_search() -> None:

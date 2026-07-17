@@ -100,6 +100,47 @@ class FakeProcess:
         self.returncode = -15
 
 
+class QueueReader:
+    def __init__(self) -> None:
+        self.lines: asyncio.Queue[bytes] = asyncio.Queue()
+        self.read_count = 0
+
+    async def readline(self) -> bytes:
+        self.read_count += 1
+        return await self.lines.get()
+
+
+class StubbornProcess:
+    def __init__(self) -> None:
+        self.stdout = QueueReader()
+        self.stderr = QueueReader()
+        self.returncode: int | None = None
+        self.terminated = False
+        self.killed = False
+        self._finished = asyncio.Event()
+        for event in (
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {"type": "turn.started"},
+        ):
+            self.stdout.lines.put_nowait(json.dumps(event).encode() + b"\n")
+        self.stderr.lines.put_nowait(b"diagnostic output\n")
+
+    async def wait(self) -> int:
+        await self._finished.wait()
+        assert self.returncode is not None
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self.stdout.lines.put_nowait(b"")
+        self.stderr.lines.put_nowait(b"")
+        self._finished.set()
+
+
 async def test_exec_fallback_maps_jsonl_and_usage() -> None:
     process = FakeProcess(
         [
@@ -164,3 +205,33 @@ async def test_exec_fallback_fails_if_cli_exits_without_terminal_event() -> None
 
     with pytest.raises(RuntimeProtocolError, match="terminal"):
         _ = [event async for event in runtime.stream(_request())]
+
+
+async def test_exec_interrupt_escalates_and_completes_stream_as_interrupted() -> None:
+    process = StubbornProcess()
+
+    async def spawn(argv: tuple[str, ...], cwd: Path) -> StubbornProcess:
+        return process
+
+    runtime = ExecRuntime(
+        Path("/opt/codex/bin/codex"),
+        process_factory=spawn,
+        turn_id_factory=lambda: "local-turn-1",
+        terminate_timeout_seconds=0.01,
+    )
+    stream = runtime.stream(_request())
+    assert await anext(stream) == ThreadStarted(
+        thread_id="thread-1", backend=RuntimeBackend.EXEC
+    )
+    started = await anext(stream)
+    assert isinstance(started, TurnStarted)
+
+    await runtime.interrupt(started.turn)
+    remaining = [event async for event in stream]
+
+    assert remaining == [
+        TurnCompleted(turn=started.turn, status="interrupted", output=None)
+    ]
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.stderr.read_count >= 1
