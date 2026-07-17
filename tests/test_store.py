@@ -37,16 +37,21 @@ REQUIRED_TABLES = {
     "artifacts",
     "adjudications",
     "candidate_decisions",
+    "cancel_commands",
     "candidates",
     "evidence",
     "events",
     "execution_segments",
     "plans",
+    "resume_commands",
+    "runtime_resolutions",
     "runs",
     "run_inputs",
     "schema_metadata",
+    "start_commands",
     "stage_outputs",
     "threads",
+    "turn_inputs",
     "verifications",
 }
 
@@ -103,7 +108,7 @@ def test_store_persists_schema_lifecycle_and_monotonic_events(tmp_path) -> None:
 
     with RunStore(database) as store:
         info = store.info()
-        assert info.schema_version == 1
+        assert info.schema_version == 2
         assert info.journal_mode == "wal"
         assert info.foreign_keys is True
         assert set(info.tables) == REQUIRED_TABLES
@@ -119,7 +124,6 @@ def test_store_persists_schema_lifecycle_and_monotonic_events(tmp_path) -> None:
         assert created.config_sha256 == config.sha256
         assert created.input_sha256 == run_input.sha256
         assert created.provenance == provenance()
-
         running = store.transition_run("run-1", RunStatus.RUNNING)
         assert running.status is RunStatus.RUNNING
         literature = store.transition_stage("run-1", RunStage.LITERATURE)
@@ -149,6 +153,26 @@ def test_store_persists_schema_lifecycle_and_monotonic_events(tmp_path) -> None:
         )
         assert next_event.seq == 5
         assert [event.seq for event in reopened.list_events("run-1", after_seq=3)] == [4, 5]
+
+
+def test_store_migrates_additive_database_schema_v1_to_v2(tmp_path) -> None:
+    database = tmp_path / "qed.sqlite3"
+    with RunStore(database):
+        pass
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE turn_inputs")
+        connection.execute("DROP TABLE runtime_resolutions")
+        connection.execute("DROP TABLE resume_commands")
+        connection.execute("DROP TABLE start_commands")
+        connection.execute("DROP TABLE cancel_commands")
+        connection.execute(
+            "UPDATE schema_metadata SET value = '1' WHERE key = 'schema_version'"
+        )
+
+    with RunStore(database) as migrated:
+        assert migrated.info().schema_version == 2
+        assert set(migrated.info().tables) == REQUIRED_TABLES
 
 
 def test_invalid_transitions_are_rejected_and_cancelled_run_resumes_after_reopen(
@@ -188,11 +212,47 @@ def test_invalid_transitions_are_rejected_and_cancelled_run_resumes_after_reopen
         assert resumed.cancellation_requested is False
         assert resumed.resumable is False
         assert resumed.resume_count == 1
-
         with pytest.raises(InvalidTransitionError, match="not resumable"):
             reopened.resume_run("run-1")
 
         assert [event.seq for event in reopened.list_events("run-1")] == [1, 2, 3, 4, 5]
+
+
+def test_start_command_claim_is_durable_and_exclusive_across_connections(
+    tmp_path,
+) -> None:
+    database = tmp_path / "qed.sqlite3"
+    first = RunStore(database)
+    second = RunStore(database)
+    try:
+        first.create_run(
+            "run-claim",
+            config=QEDConfig(),
+            input_sha256=ABC_SHA256,
+            provenance=provenance(),
+        )
+
+        claimed = first.start_run_command(
+            "run-claim",
+            idempotency_key="start-claim-1",
+        )
+        replayed = second.start_run_command(
+            "run-claim",
+            idempotency_key="start-claim-1",
+        )
+
+        assert claimed.replayed is False
+        assert replayed.replayed is True
+        assert claimed.accepted_status is RunStatus.CREATED
+        assert replayed.accepted_status is RunStatus.CREATED
+        with pytest.raises(InvalidTransitionError, match="cannot start"):
+            second.start_run_command(
+                "run-claim",
+                idempotency_key="start-claim-2",
+            )
+    finally:
+        second.close()
+        first.close()
 
 
 def test_sealed_candidates_and_verifications_remain_immutable_across_resume(tmp_path) -> None:
@@ -493,6 +553,13 @@ def test_invalid_ids_hashes_and_sizes_do_not_leave_poisoned_rows(tmp_path) -> No
                 input_sha256=ABC_SHA256,
                 provenance=provenance(),
             )
+        with pytest.raises(ValueError, match="run_id"):
+            store.create_run(
+                "run:colon",
+                config=QEDConfig(),
+                input_sha256=ABC_SHA256,
+                provenance=provenance(),
+            )
         store.create_run(
             "run-1",
             config=QEDConfig(),
@@ -661,14 +728,22 @@ def test_cancel_and_resume_commands_are_idempotent_and_rotate_execution_version(
             worker_id="worker-1",
             lease_token="secret-token-1",
         )
-
-        cancelling = store.request_cancel("run-1")
-        assert store.request_cancel("run-1") == cancelling
         token = ExecutionToken(
             segment_id=first.id,
             version=first.version,
             lease_token="secret-token-1",
         )
+        store.add_thread(
+            "active-prover",
+            run_id="run-1",
+            role="prover",
+            model="gpt-5.6-sol",
+            provenance=provenance("active-prover"),
+            execution=token,
+        )
+
+        cancelling = store.request_cancel("run-1")
+        assert store.request_cancel("run-1") == cancelling
         with pytest.raises(ConflictError, match="not writable while cancelling"):
             store.append_event(
                 "run-1",
@@ -677,8 +752,23 @@ def test_cancel_and_resume_commands_are_idempotent_and_rotate_execution_version(
                 payload={},
                 execution=token,
             )
-        cancelled = store.acknowledge_cancel("run-1")
+        with pytest.raises(ConflictError, match="active execution lease"):
+            store.acknowledge_cancel("run-1")
+        cancelled = store.acknowledge_cancel("run-1", execution=token)
         assert store.acknowledge_cancel("run-1") == cancelled
+        assert store.get_thread("active-prover").status.value == "cancelled"
+        cancellation_events = store.list_events("run-1")
+        assert any(
+            event.event_type == "thread.status_changed"
+            and event.payload["thread_id"] == "active-prover"
+            and event.payload["to"] == "cancelled"
+            for event in cancellation_events
+        )
+        assert any(
+            event.event_type == "execution.released"
+            and event.payload["segment_id"] == first.id
+            for event in cancellation_events
+        )
         resumed = store.resume_run("run-1", idempotency_key="resume-command-1")
         assert store.resume_run("run-1", idempotency_key="resume-command-1") == resumed
         assert resumed.resume_count == 1
@@ -690,6 +780,257 @@ def test_cancel_and_resume_commands_are_idempotent_and_rotate_execution_version(
             lease_token="secret-token-2",
         )
         assert second.version == first.version + 1
+
+
+def test_execution_runtime_resolution_is_full_hashed_and_immutable(tmp_path) -> None:
+    resolution = {
+        "model": "gpt-5.6-sol",
+        "selected_effort": "ultra",
+        "proactive_multi_agent": True,
+    }
+    with RunStore(tmp_path / "qed.sqlite3") as store:
+        store.create_run(
+            "run-1",
+            config=QEDConfig(),
+            run_input=RunInput(problem="A problem"),
+            provenance=provenance(),
+        )
+        store.transition_run("run-1", RunStatus.RUNNING)
+        lease = store.acquire_execution(
+            "run-1",
+            segment_id="segment-1",
+            worker_id="worker-1",
+            lease_token="secret-token-1",
+            runtime_version="0.144.5",
+        )
+        token = ExecutionToken(
+            segment_id=lease.id,
+            version=lease.version,
+            lease_token="secret-token-1",
+        )
+
+        assert store.record_execution_resolution(
+            token,
+            runtime_version="0.144.5",
+            resolution=resolution,
+        ) == resolution
+        assert store.record_execution_resolution(
+            token,
+            runtime_version="0.144.5",
+            resolution=resolution,
+        ) == resolution
+        assert store.get_execution_resolution(lease.id) == resolution
+        assert (
+            store.get_execution(lease.id).runtime_resolution_sha256
+            == canonical_sha256(resolution)
+        )
+
+        with pytest.raises(ConflictError, match="immutable"):
+            store.record_execution_resolution(
+                token,
+                runtime_version="0.144.5",
+                resolution={**resolution, "selected_effort": "high"},
+            )
+
+
+def test_expired_execution_lease_cannot_block_external_cancellation(tmp_path) -> None:
+    clock = FrozenClock()
+    with RunStore(tmp_path / "qed.sqlite3", clock=clock) as store:
+        store.create_run(
+            "run-1",
+            config=QEDConfig(),
+            run_input=RunInput(problem="A problem"),
+            provenance=provenance(),
+        )
+        store.transition_run("run-1", RunStatus.RUNNING)
+        lease = store.acquire_execution(
+            "run-1",
+            segment_id="segment-1",
+            worker_id="crashed-worker",
+            lease_token="secret-token-1",
+            lease_seconds=1,
+        )
+        token = ExecutionToken(
+            segment_id=lease.id,
+            version=lease.version,
+            lease_token="secret-token-1",
+        )
+        store.add_thread(
+            "orphaned-prover",
+            run_id="run-1",
+            role="prover",
+            model="gpt-5.6-sol",
+            provenance=provenance("orphaned-prover"),
+            execution=token,
+        )
+        store.request_cancel("run-1")
+
+        clock.advance(2)
+        cancelled = store.acknowledge_cancel("run-1")
+
+        assert cancelled.status is RunStatus.CANCELLED
+        assert store.get_execution(lease.id).released_at == clock.now
+        assert store.get_thread("orphaned-prover").status.value == "cancelled"
+
+
+def test_persisted_turn_start_blocks_crash_recovery_until_terminal(tmp_path) -> None:
+    database = tmp_path / "qed.sqlite3"
+    now = [NOW]
+    with RunStore(database, clock=lambda: now[0]) as store:
+        store.create_run(
+            "run-started",
+            config=QEDConfig(),
+            input_sha256=ABC_SHA256,
+            provenance=provenance(),
+        )
+        store.transition_run("run-started", RunStatus.RUNNING)
+        lease = store.acquire_execution(
+            "run-started",
+            segment_id="segment-started",
+            worker_id="worker-started",
+            lease_token="secret-started",
+            lease_seconds=1,
+            runtime_version="test-runtime",
+        )
+        token = ExecutionToken(
+            segment_id=lease.id,
+            version=lease.version,
+            lease_token="secret-started",
+        )
+        store.append_event(
+            "run-started",
+            event_type="runtime.turn_started",
+            stage=RunStage.INTAKE,
+            payload={
+                "thread_id": "remote-thread",
+                "turn_id": "remote-turn",
+                "backend": "app_server",
+                "turn_input_id": "turn-input-1",
+                "attempt": 1,
+            },
+            execution=token,
+        )
+
+    now[0] += timedelta(seconds=2)
+    with RunStore(database, clock=lambda: now[0]) as reopened:
+        with pytest.raises(ConflictError, match="confirmed terminal"):
+            reopened.acquire_execution(
+                "run-started",
+                segment_id="replacement-segment",
+                worker_id="replacement-worker",
+                lease_token="replacement-secret",
+            )
+        reopened.request_cancel("run-started")
+        with pytest.raises(ConflictError, match="confirmed terminal"):
+            reopened.acknowledge_cancel("run-started")
+
+        reopened.record_turn_completed(
+            "run-started",
+            payload={
+                "thread_id": "remote-thread",
+                "turn_id": "remote-turn",
+                "backend": "app_server",
+                "status": "interrupted",
+            },
+            execution=token,
+        )
+        assert reopened.acknowledge_cancel("run-started").status is RunStatus.CANCELLED
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "interrupted"])
+def test_expired_lease_cannot_override_unconfirmed_runtime_turn(
+    tmp_path, terminal_status: str
+) -> None:
+    now = [NOW]
+    with RunStore(tmp_path / "qed.sqlite3", clock=lambda: now[0]) as store:
+        store.create_run(
+            "run-unconfirmed",
+            config=QEDConfig(),
+            input_sha256=ABC_SHA256,
+            provenance=provenance(),
+        )
+        store.transition_run("run-unconfirmed", RunStatus.RUNNING)
+        lease = store.acquire_execution(
+            "run-unconfirmed",
+            segment_id="segment-unconfirmed",
+            worker_id="worker-unconfirmed",
+            lease_token="secret-unconfirmed",
+            lease_seconds=1,
+            runtime_version="test-runtime",
+        )
+        token = ExecutionToken(
+            segment_id=lease.id,
+            version=lease.version,
+            lease_token="secret-unconfirmed",
+        )
+        payload = {
+            "thread_id": "remote-thread",
+            "turn_id": "remote-turn",
+            "backend": "app_server",
+            "reason": "stream_ended",
+        }
+        store.record_turn_terminal_unconfirmed(
+            "run-unconfirmed",
+            payload=payload,
+            execution=token,
+        )
+        with pytest.raises(ConflictError, match="confirmed terminal"):
+            store.release_execution(token)
+
+        now[0] += timedelta(seconds=2)
+
+        with pytest.raises(ConflictError, match="confirmed terminal"):
+            store.acquire_execution(
+                "run-unconfirmed",
+                segment_id="replacement-segment",
+                worker_id="replacement-worker",
+                lease_token="replacement-secret",
+            )
+
+        store.record_turn_completed(
+            "run-unconfirmed",
+            payload={
+                "thread_id": "remote-thread",
+                "turn_id": "remote-turn",
+                "backend": "app_server",
+                "status": terminal_status,
+            },
+            execution=token,
+        )
+        assert store.release_execution(token).released_at == now[0]
+        store.request_cancel("run-unconfirmed")
+        assert store.acknowledge_cancel("run-unconfirmed").status is RunStatus.CANCELLED
+
+
+def test_resume_idempotency_receipt_survives_failure_and_reopen(tmp_path) -> None:
+    database = tmp_path / "qed.sqlite3"
+    with RunStore(database) as store:
+        store.create_run(
+            "run-1",
+            config=QEDConfig(),
+            run_input=RunInput(problem="A problem"),
+            provenance=provenance(),
+        )
+        store.transition_run("run-1", RunStatus.RUNNING)
+        store.request_cancel("run-1")
+        store.acknowledge_cancel("run-1")
+        first = store.resume_run("run-1", idempotency_key="resume-command-1")
+        assert first.resume_count == 1
+        failed = store.transition_run("run-1", RunStatus.FAILED)
+        event_count = len(store.list_events("run-1"))
+
+    with RunStore(database) as reopened:
+        replayed = reopened.resume_run(
+            "run-1", idempotency_key="resume-command-1"
+        )
+        assert replayed == failed
+        assert len(reopened.list_events("run-1")) == event_count
+
+        retried = reopened.resume_run(
+            "run-1", idempotency_key="resume-command-2"
+        )
+        assert retried.status is RunStatus.RUNNING
+        assert retried.resume_count == 2
 
 
 def test_typed_artifacts_are_required_for_semantic_stage_progress_and_completion(
@@ -773,6 +1114,7 @@ def test_typed_artifacts_are_required_for_semantic_stage_progress_and_completion
         for kind, local_id, external_id in (
             ("structural", "structural-thread", "codex-verifier-1"),
             ("detailed", "detailed-thread", "codex-verifier-2"),
+            ("citation", "citation-thread", "codex-verifier-3"),
         ):
             store.add_thread(
                 local_id,
@@ -793,9 +1135,11 @@ def test_typed_artifacts_are_required_for_semantic_stage_progress_and_completion
                         category="correctness",
                         status=CheckStatus.PASS,
                         summary="The proof passes this independent check.",
+                        evidence_ids=(evidence.id,) if kind == "citation" else (),
                     ),
                 ),
                 verifier_thread_id=local_id,
+                verifier_external_thread_id=external_id,
                 provenance=provenance(local_id),
                 created_at=NOW,
             )
@@ -984,6 +1328,7 @@ def prepare_adjudication_for_revision(
     for kind, local_id, external_id in (
         ("structural", "structural-thread", "codex-verifier-1"),
         ("detailed", "detailed-thread", "codex-verifier-2"),
+        ("citation", "citation-thread", "codex-verifier-3"),
     ):
         store.add_thread(
             local_id,
@@ -1004,9 +1349,11 @@ def prepare_adjudication_for_revision(
                     category="correctness",
                     status=CheckStatus.PASS,
                     summary="Independent report.",
+                    evidence_ids=(evidence.id,) if kind == "citation" else (),
                 ),
             ),
             verifier_thread_id=local_id,
+            verifier_external_thread_id=external_id,
             provenance=provenance(local_id),
             created_at=NOW,
         )
@@ -1050,6 +1397,162 @@ def test_revision_counters_increment_once_within_budget(
         prepare_adjudication_for_revision(store, config=config, outcome=outcome)
         transitioned = store.transition_stage("run-1", target)
         assert getattr(transitioned, counter) == 1
+
+
+def test_revise_plan_requires_a_plan_from_the_new_planning_cycle(tmp_path) -> None:
+    config = QEDConfig(budgets=BudgetPolicy(plan_revisions=2))
+    with RunStore(tmp_path / "qed.sqlite3") as store:
+        prepare_adjudication_for_revision(
+            store,
+            config=config,
+            outcome="revise_plan",
+        )
+        store.transition_stage("run-1", RunStage.PLANNING)
+
+        with pytest.raises(InvalidTransitionError, match="typed plan"):
+            store.transition_stage("run-1", RunStage.PROVING)
+
+        prior_plan = store.list_plans("run-1")[0]
+        store.add_plan(
+            "run-1",
+            prior_plan.model_copy(
+                update={"id": "plan-2", "strategy": "Use the revised strategy."}
+            ),
+        )
+        assert store.transition_stage("run-1", RunStage.PROVING).stage is RunStage.PROVING
+
+
+def test_plans_follow_creation_event_order_when_timestamps_tie(tmp_path) -> None:
+    config = QEDConfig(budgets=BudgetPolicy(plan_revisions=2))
+    with RunStore(tmp_path / "qed.sqlite3", clock=lambda: NOW) as store:
+        prepare_adjudication_for_revision(
+            store,
+            config=config,
+            outcome="revise_plan",
+        )
+        store.transition_stage("run-1", RunStage.PLANNING)
+        original = store.list_plans("run-1")[0]
+        revised = original.model_copy(
+            update={"id": "a-revised-plan", "strategy": "Use the revised strategy."}
+        )
+        store.add_plan("run-1", revised)
+
+        assert [plan.id for plan in store.list_plans("run-1")] == [
+            original.id,
+            revised.id,
+        ]
+        assert [plan.id for plan in store.snapshot("run-1").plans] == [
+            original.id,
+            revised.id,
+        ]
+
+
+def test_verification_requires_reports_for_a_candidate_from_the_latest_proving_cycle(
+    tmp_path,
+) -> None:
+    with RunStore(tmp_path / "qed.sqlite3") as store:
+        prepare_adjudication_for_revision(
+            store,
+            config=QEDConfig(),
+            outcome="revise_proof",
+        )
+        prior_candidate = store.get_candidate("candidate-1").candidate
+        store.transition_stage("run-1", RunStage.PROVING)
+        store.add_thread(
+            "prover-thread-2",
+            run_id="run-1",
+            role="prover",
+            model="gpt-5.6-sol",
+            provenance=provenance("prover-thread-2"),
+        )
+        revised_proof = "A proof from the revised proving cycle."
+        current_candidate = prior_candidate.model_copy(
+            update={
+                "id": "candidate-2",
+                "attempt": 2,
+                "proof": revised_proof,
+                "proof_sha256": sha256_text(revised_proof),
+                "provenance": provenance("prover-thread-2"),
+            }
+        )
+        store.create_candidate(current_candidate, thread_id="prover-thread-2")
+        store.seal_candidate(current_candidate.id)
+        store.transition_stage("run-1", RunStage.VERIFICATION)
+
+        def add_reports(target: ProofCandidate, prefix: str) -> None:
+            for index, kind in enumerate(
+                ("structural", "detailed", "citation"),
+                start=1,
+            ):
+                thread_id = f"{prefix}-{kind}-thread"
+                external_id = f"codex-{prefix}-verifier-{index}"
+                store.add_thread(
+                    thread_id,
+                    run_id="run-1",
+                    role="verifier",
+                    model="gpt-5.6-sol",
+                    provenance=provenance(thread_id),
+                    external_thread_id=external_id,
+                )
+                store.add_verification(
+                    "run-1",
+                    VerificationReport(
+                        id=f"{prefix}-{kind}-report",
+                        candidate_id=target.id,
+                        candidate_sha256=target.proof_sha256,
+                        kind=kind,  # type: ignore[arg-type]
+                        checks=(
+                            VerificationCheck(
+                                id=f"{prefix}-{kind}-check",
+                                category="correctness",
+                                status=CheckStatus.PASS,
+                                summary="Independent report for this cycle.",
+                                evidence_ids=("evidence-1",)
+                                if kind == "citation"
+                                else (),
+                            ),
+                        ),
+                        verifier_thread_id=thread_id,
+                        verifier_external_thread_id=external_id,
+                        provenance=provenance(thread_id),
+                        created_at=NOW,
+                    ),
+                )
+
+        add_reports(prior_candidate, "historical-candidate")
+        with pytest.raises(InvalidTransitionError, match="independent threads"):
+            store.transition_stage("run-1", RunStage.ADJUDICATION)
+
+        add_reports(current_candidate, "current-candidate")
+        assert (
+            store.transition_stage("run-1", RunStage.ADJUDICATION).stage
+            is RunStage.ADJUDICATION
+        )
+
+
+def test_adjudications_follow_event_sequence_when_timestamps_and_ids_disagree(
+    tmp_path,
+) -> None:
+    config = QEDConfig(budgets=BudgetPolicy(plan_revisions=1))
+    with RunStore(tmp_path / "qed.sqlite3", clock=FrozenClock()) as store:
+        prepare_adjudication_for_revision(
+            store,
+            config=config,
+            outcome="accept",
+        )
+        first = store.list_adjudications("run-1")[0]
+        second = first.model_copy(
+            update={
+                "id": "adjudication-0",
+                "outcome": "revise_plan",
+                "rationale": "The later event requests a plan revision.",
+            }
+        )
+        store.add_adjudication("run-1", second)
+
+        assert store.list_adjudications("run-1") == (first, second)
+        assert store.snapshot("run-1").adjudications == (first, second)
+        assert store.transition_stage("run-1", RunStage.PLANNING).stage is RunStage.PLANNING
 
 
 @pytest.mark.parametrize(

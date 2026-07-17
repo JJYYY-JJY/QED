@@ -108,23 +108,32 @@ def test_only_literature_roles_may_enable_web_search() -> None:
     assert request.command_network is None
 
 
-def test_verifier_role_requires_a_fresh_read_only_offline_thread() -> None:
-    verifier = _request(role=WorkRole.VERIFIER)
+@pytest.mark.parametrize("role", [WorkRole.VERIFIER, WorkRole.CITATION])
+def test_verification_roles_require_a_fresh_read_only_thread(role: WorkRole) -> None:
+    verifier = _request(role=role)
 
     assert isinstance(verifier.thread, FreshThread)
     assert verifier.sandbox is SandboxMode.READ_ONLY
     assert verifier.web_search is WebSearchMode.DISABLED
 
-    with pytest.raises(ValidationError, match="verifier turns must be fresh"):
+    with pytest.raises(ValidationError, match="verification turns must be fresh"):
         _request(
-            role=WorkRole.VERIFIER,
+            role=role,
             thread=ResumeThread(thread_id="prior-verifier"),
         )
-    with pytest.raises(ValidationError, match="verifier turns must be fresh"):
+    with pytest.raises(ValidationError, match="verification turns must be fresh"):
         _request(
-            role=WorkRole.VERIFIER,
+            role=role,
             sandbox=SandboxMode.WORKSPACE_WRITE,
         )
+
+
+def test_citation_role_may_use_live_search_while_remaining_read_only() -> None:
+    request = _request(role=WorkRole.CITATION, web_search=WebSearchMode.LIVE)
+
+    assert isinstance(request.thread, FreshThread)
+    assert request.sandbox is SandboxMode.READ_ONLY
+    assert request.web_search is WebSearchMode.LIVE
 
 
 def test_literature_role_accepts_indexed_web_search() -> None:
@@ -142,11 +151,12 @@ def test_command_network_requires_an_explicit_restricted_policy() -> None:
     assert request.command_network is not None
     assert request.command_network.domains == ("api.crossref.org",)
 
-    with pytest.raises(ValidationError, match="restricted"):
-        RestrictedNetworkPolicy(domains=("*",))
+    for wildcard in ("*", "*.example.com"):
+        with pytest.raises(ValidationError, match="restricted"):
+            RestrictedNetworkPolicy(domains=(wildcard,))
 
 
-def test_auto_effort_uses_last_advertised_only_for_proactive_multi_agent() -> None:
+def test_auto_effort_uses_ultra_only_for_proactive_multi_agent() -> None:
     model = ModelCapability(
         model="gpt-5.6-sol",
         advertised_efforts=("low", "medium", "high", "xhigh", "max", "ultra"),
@@ -165,6 +175,30 @@ def test_auto_effort_uses_last_advertised_only_for_proactive_multi_agent() -> No
     assert proactive.proactive_multi_agent is True
     assert ordinary.selected_effort == "low"
     assert ordinary.proactive_multi_agent is False
+
+
+def test_proactive_multi_agent_fails_closed_without_selected_ultra() -> None:
+    model = ModelCapability(
+        model="gpt-5.6-sol",
+        advertised_efforts=("low", "high"),
+        default_effort="low",
+    )
+
+    automatic = resolve_capability(
+        CapabilityRequest(model=model.model, proactive=True),
+        model=model,
+        multi_agent=True,
+    )
+    explicit = resolve_capability(
+        CapabilityRequest(model=model.model, effort="high", proactive=True),
+        model=model,
+        multi_agent=True,
+    )
+
+    assert automatic.selected_effort == "low"
+    assert automatic.proactive_multi_agent is False
+    assert explicit.selected_effort == "high"
+    assert explicit.proactive_multi_agent is False
 
 
 def test_explicit_effort_is_validated_against_the_exact_model() -> None:

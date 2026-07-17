@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from openai_codex import ApprovalMode, AsyncCodex, CodexConfig, Sandbox
@@ -70,11 +71,21 @@ class SdkRuntime:
         client: _SdkClient | None = None,
         *,
         capability_runtime: CodexRuntime | None = None,
+        executable: Path | None = None,
     ) -> None:
         if client is None:
+            if executable is None or not executable.is_absolute():
+                raise ValueError(
+                    "SdkRuntime requires the resolved absolute Codex executable"
+                )
             client = cast(
                 _SdkClient,
-                AsyncCodex(CodexConfig(experimental_api=False)),
+                AsyncCodex(
+                    CodexConfig(
+                        codex_bin=str(executable),
+                        experimental_api=False,
+                    )
+                ),
             )
         self._client = client
         self._capability_runtime = capability_runtime
@@ -98,9 +109,14 @@ class SdkRuntime:
             )
         return await self._capability_runtime.probe(request)
 
-    async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
+    def preflight(self, request: RunRequest) -> None:
         if not self.supports(request):
-            raise ValueError("requested controls are not representable by the published SDK")
+            raise ValueError(
+                "requested controls are not representable by the published SDK"
+            )
+
+    async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
+        self.preflight(request)
 
         sandbox = self._sandbox(request.sandbox)
         lifecycle: dict[str, Any] = {
@@ -138,6 +154,7 @@ class SdkRuntime:
         self._handles[key] = handle
         final_output: str | None = None
         fallback_output: str | None = None
+        terminal_observed = False
         try:
             yield TurnStarted(turn=turn)
             async for raw_notification in handle.stream():
@@ -185,6 +202,13 @@ class SdkRuntime:
                     continue
                 if method == "error":
                     error = _ErrorParams.model_validate(params)
+                    if (
+                        error.thread_id != turn.thread_id
+                        or error.turn_id != turn.turn_id
+                    ):
+                        raise RuntimeProtocolError(
+                            "received error for an unexpected SDK turn"
+                        )
                     yield RuntimeErrorEvent(
                         message=error.error.message,
                         retryable=error.will_retry,
@@ -203,6 +227,7 @@ class SdkRuntime:
                     terminal_status = cast(
                         Literal["completed", "failed", "interrupted"], status
                     )
+                    terminal_observed = True
                     yield TurnCompleted(
                         turn=turn,
                         status=terminal_status,
@@ -212,7 +237,8 @@ class SdkRuntime:
                 yield UnknownNotification(method=method, payload=params)
             raise RuntimeProtocolError("SDK stream ended before turn/completed")
         finally:
-            self._handles.pop(key, None)
+            if terminal_observed:
+                self._handles.pop(key, None)
 
     @staticmethod
     def _notification(notification: Any) -> tuple[str, dict[str, Any]]:
@@ -245,4 +271,7 @@ class SdkRuntime:
         await handle.interrupt()
 
     async def close(self) -> None:
-        await self._client.close()
+        try:
+            await self._client.close()
+        finally:
+            self._handles.clear()

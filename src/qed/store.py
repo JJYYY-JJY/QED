@@ -34,8 +34,10 @@ from qed.schemas import (
 )
 
 SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 2
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class StoreError(RuntimeError):
@@ -136,6 +138,16 @@ THREAD_TRANSITIONS: dict[ThreadStatus, frozenset[ThreadStatus]] = {
     ThreadStatus.CANCELLED: frozenset(),
 }
 
+RUNTIME_DRAIN_EVENTS = frozenset(
+    {
+        "runtime.turn_started",
+        "runtime.token_usage",
+        "runtime.item_completed",
+        "runtime.unknown_notification",
+        "runtime.error",
+    }
+)
+
 
 class StoreModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -168,6 +180,25 @@ class RunRecord(StoreModel):
     strategy_rewrite_count: Annotated[int, Field(ge=0)]
     created_at: datetime
     updated_at: datetime
+
+
+class ResumeCommandResult(StoreModel):
+    run: RunRecord
+    replayed: bool
+    accepted_status: RunStatus
+
+
+class StartCommandResult(StoreModel):
+    run: RunRecord
+    replayed: bool
+    accepted_status: RunStatus
+
+
+class CancelCommandResult(StoreModel):
+    run: RunRecord
+    replayed: bool
+    accepted_status: RunStatus
+    accepted_execution_version: int
 
 
 class ThreadRecord(StoreModel):
@@ -230,6 +261,17 @@ class StageOutputRecord(StoreModel):
     created_at: datetime
 
 
+class TurnInputRecord(StoreModel):
+    id: str
+    run_id: str
+    role: str
+    prompt_version: str
+    output_schema_sha256: Sha256
+    payload: dict[str, JsonValue]
+    payload_sha256: Sha256
+    created_at: datetime
+
+
 class ArtifactRecord(StoreModel):
     id: str
     run_id: str
@@ -263,16 +305,27 @@ class ExecutionLease(StoreModel):
     updated_at: datetime
 
 
+class RuntimeResolutionRecord(StoreModel):
+    segment_id: str
+    run_id: str
+    schema_version: int
+    resolution: JsonValue
+    resolution_sha256: Sha256
+    created_at: datetime
+
+
 class RunSnapshot(StoreModel):
     run: RunRecord
     run_input: RunInput | None = None
     events: tuple[Event, ...]
     stage_outputs: tuple[StageOutputRecord, ...]
+    turn_inputs: tuple[TurnInputRecord, ...] = ()
     threads: tuple[ThreadRecord, ...]
     candidates: tuple[CandidateRecord, ...]
     verifications: tuple[VerificationRecord, ...]
     artifacts: tuple[ArtifactRecord, ...]
     execution_segments: tuple[ExecutionLease, ...] = ()
+    runtime_resolutions: tuple[RuntimeResolutionRecord, ...] = ()
     evidence: tuple[Evidence, ...] = ()
     plans: tuple[Plan, ...] = ()
     adjudications: tuple[Adjudication, ...] = ()
@@ -301,6 +354,14 @@ def _validate_id(value: str, *, field: str) -> str:
     if not isinstance(value, str) or _ID_PATTERN.fullmatch(value) is None:
         raise ValueError(
             f"{field} must be 1-128 ASCII identifier characters without path separators"
+        )
+    return value
+
+
+def _validate_run_id(value: str) -> str:
+    if not isinstance(value, str) or _RUN_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            "run_id must be 1-128 ASCII letters, digits, dots, underscores, or hyphens"
         )
     return value
 
@@ -400,6 +461,28 @@ class RunStore:
                 self._connection.commit()
 
     def _initialize_schema(self) -> None:
+        metadata_exists = self._connection.execute(
+            """
+            SELECT 1 FROM sqlite_schema
+            WHERE type = 'table' AND name = 'schema_metadata'
+            """
+        ).fetchone()
+        prior_version: int | None = None
+        if metadata_exists is not None:
+            version_row = self._connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            if version_row is None:
+                raise StoreError("database schema metadata is missing its version")
+            try:
+                prior_version = int(version_row["value"])
+            except (TypeError, ValueError) as error:
+                raise StoreError("database schema version is not an integer") from error
+            if prior_version not in {1, DATABASE_SCHEMA_VERSION}:
+                raise StoreError(
+                    f"unsupported schema version {prior_version}; "
+                    f"expected 1 or {DATABASE_SCHEMA_VERSION}"
+                )
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS schema_metadata (
@@ -472,6 +555,24 @@ class RunStore:
                 content_sha256 TEXT NOT NULL,
                 provenance_json TEXT NOT NULL,
                 provenance_sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS turn_inputs (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                output_schema_sha256 TEXT NOT NULL CHECK (
+                    length(output_schema_sha256) = 64
+                    AND output_schema_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                payload_json TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL CHECK (
+                    length(payload_sha256) = 64
+                    AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
             ) STRICT;
@@ -591,6 +692,50 @@ class RunStore:
                 FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
             ) STRICT;
 
+            CREATE TABLE IF NOT EXISTS resume_commands (
+                run_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                accepted_status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, idempotency_key),
+                FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS start_commands (
+                run_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                accepted_status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, idempotency_key),
+                FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS cancel_commands (
+                run_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                accepted_status TEXT NOT NULL,
+                accepted_execution_version INTEGER NOT NULL CHECK (
+                    accepted_execution_version >= 0
+                ),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, idempotency_key),
+                FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS runtime_resolutions (
+                segment_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                resolution_json TEXT NOT NULL,
+                resolution_sha256 TEXT NOT NULL CHECK (
+                    length(resolution_sha256) = 64
+                    AND resolution_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (segment_id) REFERENCES execution_segments(id) ON DELETE CASCADE,
+                FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+            ) STRICT;
+
             CREATE TABLE IF NOT EXISTS adjudications (
                 id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL,
@@ -615,7 +760,11 @@ class RunStore:
             ) STRICT;
 
             CREATE INDEX IF NOT EXISTS events_run_seq_idx ON events(run_id, seq);
+            CREATE INDEX IF NOT EXISTS events_stage_entry_idx
+                ON events(run_id, event_type, stage, seq DESC);
             CREATE INDEX IF NOT EXISTS stage_outputs_run_idx ON stage_outputs(run_id, stage);
+            CREATE INDEX IF NOT EXISTS turn_inputs_run_idx
+                ON turn_inputs(run_id, created_at, id);
             CREATE INDEX IF NOT EXISTS evidence_run_idx ON evidence(run_id, created_at, id);
             CREATE INDEX IF NOT EXISTS plans_run_idx ON plans(run_id, created_at, id);
             CREATE INDEX IF NOT EXISTS threads_run_idx ON threads(run_id, role);
@@ -628,6 +777,14 @@ class RunStore:
             CREATE INDEX IF NOT EXISTS artifacts_run_idx ON artifacts(run_id, kind);
             CREATE INDEX IF NOT EXISTS execution_segments_run_idx
                 ON execution_segments(run_id, version);
+            CREATE INDEX IF NOT EXISTS resume_commands_run_idx
+                ON resume_commands(run_id, created_at, idempotency_key);
+            CREATE INDEX IF NOT EXISTS start_commands_run_idx
+                ON start_commands(run_id, created_at, idempotency_key);
+            CREATE INDEX IF NOT EXISTS cancel_commands_run_idx
+                ON cancel_commands(run_id, created_at, idempotency_key);
+            CREATE INDEX IF NOT EXISTS runtime_resolutions_run_idx
+                ON runtime_resolutions(run_id, created_at, segment_id);
             CREATE INDEX IF NOT EXISTS adjudications_run_idx
                 ON adjudications(run_id, created_at, id);
             CREATE INDEX IF NOT EXISTS candidate_decisions_run_idx
@@ -727,6 +884,14 @@ class RunStore:
             BEFORE DELETE ON stage_outputs BEGIN
                 SELECT RAISE(ABORT, 'stage output is immutable');
             END;
+            CREATE TRIGGER IF NOT EXISTS turn_inputs_update_guard
+            BEFORE UPDATE ON turn_inputs BEGIN
+                SELECT RAISE(ABORT, 'turn input is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS turn_inputs_delete_guard
+            BEFORE DELETE ON turn_inputs BEGIN
+                SELECT RAISE(ABORT, 'turn input is immutable');
+            END;
             CREATE TRIGGER IF NOT EXISTS artifacts_update_guard
             BEFORE UPDATE ON artifacts BEGIN
                 SELECT RAISE(ABORT, 'artifact is immutable');
@@ -735,19 +900,49 @@ class RunStore:
             BEFORE DELETE ON artifacts BEGIN
                 SELECT RAISE(ABORT, 'artifact is immutable');
             END;
+            CREATE TRIGGER IF NOT EXISTS runtime_resolutions_update_guard
+            BEFORE UPDATE ON runtime_resolutions BEGIN
+                SELECT RAISE(ABORT, 'runtime resolution is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS runtime_resolutions_delete_guard
+            BEFORE DELETE ON runtime_resolutions BEGIN
+                SELECT RAISE(ABORT, 'runtime resolution is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS resume_commands_update_guard
+            BEFORE UPDATE ON resume_commands BEGIN
+                SELECT RAISE(ABORT, 'resume command is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS resume_commands_delete_guard
+            BEFORE DELETE ON resume_commands BEGIN
+                SELECT RAISE(ABORT, 'resume command is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS start_commands_update_guard
+            BEFORE UPDATE ON start_commands BEGIN
+                SELECT RAISE(ABORT, 'start command is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS start_commands_delete_guard
+            BEFORE DELETE ON start_commands BEGIN
+                SELECT RAISE(ABORT, 'start command is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS cancel_commands_update_guard
+            BEFORE UPDATE ON cancel_commands BEGIN
+                SELECT RAISE(ABORT, 'cancel command is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS cancel_commands_delete_guard
+            BEFORE DELETE ON cancel_commands BEGIN
+                SELECT RAISE(ABORT, 'cancel command is immutable');
+            END;
             """
         )
-        existing = self._connection.execute(
-            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-        ).fetchone()
-        if existing is None:
+        if prior_version is None:
             self._connection.execute(
                 "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
+                (str(DATABASE_SCHEMA_VERSION),),
             )
-        elif int(existing["value"]) != SCHEMA_VERSION:
-            raise StoreError(
-                f"unsupported schema version {existing['value']}; expected {SCHEMA_VERSION}"
+        elif prior_version == 1:
+            self._connection.execute(
+                "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+                (str(DATABASE_SCHEMA_VERSION),),
             )
 
     def info(self) -> StoreInfo:
@@ -787,7 +982,7 @@ class RunStore:
         run_input: RunInput | None = None,
         provenance: Provenance,
     ) -> RunRecord:
-        _validate_id(run_id, field="run_id")
+        _validate_run_id(run_id)
         if run_input is None and input_sha256 is None:
             raise ValueError("create_run requires run_input or input_sha256")
         if run_input is not None:
@@ -897,6 +1092,10 @@ class RunStore:
             run = self._require_run_row(connection, run_id)
             if RunStatus(run["status"]) is not RunStatus.RUNNING:
                 raise InvalidTransitionError("execution may be acquired only for a running run")
+            if self._unconfirmed_runtime_turns(connection, run_id):
+                raise ConflictError(
+                    "cannot acquire execution without a confirmed terminal turn"
+                )
             existing = connection.execute(
                 "SELECT * FROM execution_segments WHERE id = ?", (segment_id,)
             ).fetchone()
@@ -986,6 +1185,97 @@ class RunStore:
             )
         return self.get_execution(execution.segment_id)
 
+    def record_execution_resolution(
+        self,
+        execution: ExecutionToken,
+        *,
+        runtime_version: str,
+        resolution: JsonValue,
+    ) -> JsonValue:
+        """Bind a full, content-addressed runtime resolution before model work."""
+
+        _validate_nonempty(runtime_version, field="runtime_version")
+        rendered = canonical_json(resolution)
+        resolution_sha256 = canonical_sha256(resolution)
+        now = self._now()
+        with self._transaction() as connection:
+            segment = self._validate_execution_token(connection, execution, now=now)
+            if segment["runtime_version"] not in {None, runtime_version}:
+                raise ConflictError("execution runtime version is immutable")
+            if segment["runtime_resolution_sha256"] not in {
+                None,
+                resolution_sha256,
+            }:
+                raise ConflictError("execution runtime resolution is immutable")
+            existing = connection.execute(
+                "SELECT * FROM runtime_resolutions WHERE segment_id = ?",
+                (segment["id"],),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["run_id"] != segment["run_id"]
+                    or existing["resolution_json"] != rendered
+                    or existing["resolution_sha256"] != resolution_sha256
+                ):
+                    raise ConflictError("execution runtime resolution is immutable")
+                return cast(JsonValue, json.loads(existing["resolution_json"]))
+            connection.execute(
+                """
+                UPDATE execution_segments
+                SET runtime_version = ?, runtime_resolution_sha256 = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    runtime_version,
+                    resolution_sha256,
+                    _render_time(now),
+                    segment["id"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO runtime_resolutions (
+                    segment_id, run_id, schema_version, resolution_json,
+                    resolution_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    segment["id"],
+                    segment["run_id"],
+                    SCHEMA_VERSION,
+                    rendered,
+                    resolution_sha256,
+                    _render_time(now),
+                ),
+            )
+            run = self._require_run_row(connection, segment["run_id"])
+            self._append_event(
+                connection,
+                segment["run_id"],
+                event_type="execution.runtime_resolved",
+                stage=RunStage(run["stage"]),
+                payload={
+                    "segment_id": segment["id"],
+                    "runtime_version": runtime_version,
+                    "resolution_sha256": resolution_sha256,
+                },
+                created_at=now,
+            )
+        return cast(JsonValue, json.loads(rendered))
+
+    def get_execution_resolution(self, segment_id: str) -> JsonValue:
+        _validate_id(segment_id, field="segment_id")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM runtime_resolutions WHERE segment_id = ?",
+                (segment_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"execution runtime resolution not found: {segment_id}"
+                )
+            return self._runtime_resolution_from_row(row).resolution
+
     def release_execution(self, execution: ExecutionToken) -> ExecutionLease:
         now = self._now()
         with self._transaction() as connection:
@@ -993,6 +1283,10 @@ class RunStore:
             self._validate_execution_identity(row, execution)
             if row["released_at"] is not None:
                 return self._execution_from_row(row)
+            if self._unconfirmed_runtime_turns(connection, row["run_id"]):
+                raise ConflictError(
+                    "cannot release execution without a confirmed terminal turn"
+                )
             connection.execute(
                 """
                 UPDATE execution_segments SET released_at = ?, updated_at = ? WHERE id = ?
@@ -1019,6 +1313,33 @@ class RunStore:
             if row is None:
                 raise NotFoundError(f"execution segment not found: {segment_id}")
             return self._execution_from_row(row)
+
+    def list_execution_segments(self, run_id: str) -> tuple[ExecutionLease, ...]:
+        _validate_id(run_id, field="run_id")
+        with self._lock:
+            self._require_run_row(self._connection, run_id)
+            rows = self._connection.execute(
+                """
+                SELECT * FROM execution_segments
+                WHERE run_id = ? ORDER BY version
+                """,
+                (run_id,),
+            ).fetchall()
+            return tuple(self._execution_from_row(row) for row in rows)
+
+    def latest_stage_entry(self, run_id: str, stage: RunStage) -> Event | None:
+        _validate_id(run_id, field="run_id")
+        with self._lock:
+            self._require_run_row(self._connection, run_id)
+            row = self._connection.execute(
+                """
+                SELECT * FROM events
+                WHERE run_id = ? AND event_type = 'run.stage_changed' AND stage = ?
+                ORDER BY seq DESC LIMIT 1
+                """,
+                (run_id, stage.value),
+            ).fetchone()
+            return self._event_from_row(row) if row is not None else None
 
     def get_run(self, run_id: str) -> RunRecord:
         with self._lock:
@@ -1047,7 +1368,21 @@ class RunStore:
         with self._transaction() as connection:
             row = self._require_run_row(connection, run_id)
             if target is not RunStatus.RUNNING:
-                self._authorize_execution(connection, run_id, execution)
+                unleased_failure = (
+                    target is RunStatus.FAILED
+                    and execution is None
+                    and connection.execute(
+                        """
+                        SELECT 1 FROM execution_segments
+                        WHERE run_id = ? AND released_at IS NULL
+                        LIMIT 1
+                        """,
+                        (run_id,),
+                    ).fetchone()
+                    is None
+                )
+                if not unleased_failure:
+                    self._authorize_execution(connection, run_id, execution)
             current = RunStatus(row["status"])
             if target not in RUN_TRANSITIONS[current]:
                 raise InvalidTransitionError(
@@ -1083,6 +1418,47 @@ class RunStore:
             )
         return self.get_run(run_id)
 
+    def pause_unleased_run(self, run_id: str) -> RunRecord:
+        """Pause a claimed command that was cancelled before acquiring capacity."""
+
+        now = self._now()
+        with self._transaction() as connection:
+            row = self._require_run_row(connection, run_id)
+            current = RunStatus(row["status"])
+            if current is RunStatus.PAUSED:
+                return self._run_from_row(row)
+            if current is not RunStatus.RUNNING:
+                raise InvalidTransitionError(
+                    f"cannot pause an unleased run while it is {current.value}"
+                )
+            live = connection.execute(
+                """
+                SELECT 1 FROM execution_segments
+                WHERE run_id = ? AND released_at IS NULL AND lease_expires_at > ?
+                LIMIT 1
+                """,
+                (run_id, _render_time(now)),
+            ).fetchone()
+            if live is not None:
+                raise ConflictError("cannot pause a run with a live execution lease")
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = ?, resumable = 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (RunStatus.PAUSED.value, _render_time(now), run_id),
+            )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="run.status_changed",
+                stage=RunStage(row["stage"]),
+                payload={"from": current.value, "to": RunStatus.PAUSED.value},
+                created_at=now,
+            )
+        return self.get_run(run_id)
+
     def request_cancel(self, run_id: str) -> RunRecord:
         now = self._now()
         with self._transaction() as connection:
@@ -1112,7 +1488,84 @@ class RunStore:
             )
         return self.get_run(run_id)
 
-    def acknowledge_cancel(self, run_id: str) -> RunRecord:
+    def cancel_run_command(
+        self,
+        run_id: str,
+        *,
+        idempotency_key: str,
+    ) -> CancelCommandResult:
+        _validate_run_id(run_id)
+        _validate_id(idempotency_key, field="idempotency_key")
+        now = self._now()
+        with self._transaction() as connection:
+            row = self._require_run_row(connection, run_id)
+            prior_command = connection.execute(
+                """
+                SELECT accepted_status, accepted_execution_version
+                FROM cancel_commands
+                WHERE run_id = ? AND idempotency_key = ?
+                """,
+                (run_id, idempotency_key),
+            ).fetchone()
+            if prior_command is not None:
+                return CancelCommandResult(
+                    run=self._run_from_row(row),
+                    replayed=True,
+                    accepted_status=RunStatus(prior_command["accepted_status"]),
+                    accepted_execution_version=int(
+                        prior_command["accepted_execution_version"]
+                    ),
+                )
+            current = RunStatus(row["status"])
+            if RunStatus.CANCELLING not in RUN_TRANSITIONS[current]:
+                raise InvalidTransitionError(
+                    f"cannot request cancellation while run is {current.value}"
+                )
+            execution_version = int(row["execution_version"])
+            connection.execute(
+                """
+                INSERT INTO cancel_commands (
+                    run_id, idempotency_key, accepted_status,
+                    accepted_execution_version, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    idempotency_key,
+                    current.value,
+                    execution_version,
+                    _render_time(now),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = ?, cancellation_requested = 1, resumable = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                (RunStatus.CANCELLING.value, _render_time(now), run_id),
+            )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="run.cancel_requested",
+                stage=RunStage(row["stage"]),
+                payload={"from": current.value, "to": RunStatus.CANCELLING.value},
+                created_at=now,
+            )
+        return CancelCommandResult(
+            run=self.get_run(run_id),
+            replayed=False,
+            accepted_status=current,
+            accepted_execution_version=execution_version,
+        )
+
+    def acknowledge_cancel(
+        self,
+        run_id: str,
+        *,
+        execution: ExecutionToken | None = None,
+    ) -> RunRecord:
         now = self._now()
         with self._transaction() as connection:
             row = self._require_run_row(connection, run_id)
@@ -1123,6 +1576,44 @@ class RunStore:
                 raise InvalidTransitionError(
                     f"cannot acknowledge cancellation while run is {current.value}"
                 )
+            if self._unconfirmed_runtime_turns(connection, run_id):
+                raise ConflictError(
+                    "cannot acknowledge cancellation without a confirmed terminal turn"
+                )
+            active_segments = connection.execute(
+                """
+                SELECT * FROM execution_segments
+                WHERE run_id = ? AND released_at IS NULL
+                ORDER BY version DESC
+                """,
+                (run_id,),
+            ).fetchall()
+            live_segments = tuple(
+                segment
+                for segment in active_segments
+                if _parse_time(segment["lease_expires_at"]) > now
+            )
+            if live_segments:
+                if execution is None:
+                    raise ConflictError(
+                        "the active execution lease must acknowledge cancellation"
+                    )
+                owner = live_segments[0]
+                self._validate_execution_identity(owner, execution)
+                if (
+                    owner["run_id"] != run_id
+                    or int(owner["version"]) != int(row["execution_version"])
+                ):
+                    raise ConflictError("stale execution token")
+
+            active_threads = connection.execute(
+                """
+                SELECT id, status FROM threads
+                WHERE run_id = ? AND status = ?
+                ORDER BY created_at, id
+                """,
+                (run_id, ThreadStatus.ACTIVE.value),
+            ).fetchall()
             connection.execute(
                 """
                 UPDATE runs
@@ -1131,14 +1622,47 @@ class RunStore:
                 """,
                 (RunStatus.CANCELLED.value, _render_time(now), run_id),
             )
-            connection.execute(
-                """
-                UPDATE execution_segments
-                SET released_at = COALESCE(released_at, ?), updated_at = ?
-                WHERE run_id = ? AND released_at IS NULL
-                """,
-                (_render_time(now), _render_time(now), run_id),
-            )
+            for segment in active_segments:
+                connection.execute(
+                    """
+                    UPDATE execution_segments
+                    SET released_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_render_time(now), _render_time(now), segment["id"]),
+                )
+                self._append_event(
+                    connection,
+                    run_id,
+                    event_type="execution.released",
+                    stage=RunStage(row["stage"]),
+                    payload={
+                        "segment_id": segment["id"],
+                        "version": segment["version"],
+                    },
+                    created_at=now,
+                )
+            for thread in active_threads:
+                connection.execute(
+                    "UPDATE threads SET status = ?, updated_at = ? WHERE id = ?",
+                    (
+                        ThreadStatus.CANCELLED.value,
+                        _render_time(now),
+                        thread["id"],
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    run_id,
+                    event_type="thread.status_changed",
+                    stage=RunStage(row["stage"]),
+                    payload={
+                        "thread_id": thread["id"],
+                        "from": ThreadStatus.ACTIVE.value,
+                        "to": ThreadStatus.CANCELLED.value,
+                    },
+                    created_at=now,
+                )
             self._append_event(
                 connection,
                 run_id,
@@ -1152,24 +1676,126 @@ class RunStore:
     def resume_run(
         self, run_id: str, *, idempotency_key: str | None = None
     ) -> RunRecord:
+        return self.resume_run_command(
+            run_id,
+            idempotency_key=idempotency_key,
+        ).run
+
+    def start_run_command(
+        self,
+        run_id: str,
+        *,
+        idempotency_key: str,
+    ) -> StartCommandResult:
+        _validate_run_id(run_id)
+        _validate_id(idempotency_key, field="idempotency_key")
+        now = self._now()
+        with self._transaction() as connection:
+            row = self._require_run_row(connection, run_id)
+            prior_command = connection.execute(
+                """
+                SELECT accepted_status FROM start_commands
+                WHERE run_id = ? AND idempotency_key = ?
+                """,
+                (run_id, idempotency_key),
+            ).fetchone()
+            if prior_command is not None:
+                return StartCommandResult(
+                    run=self._run_from_row(row),
+                    replayed=True,
+                    accepted_status=RunStatus(prior_command["accepted_status"]),
+                )
+            current = RunStatus(row["status"])
+            if current is not RunStatus.CREATED:
+                raise InvalidTransitionError(
+                    f"run cannot start while it is {current.value}"
+                )
+            connection.execute(
+                """
+                INSERT INTO start_commands (
+                    run_id, idempotency_key, accepted_status, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (run_id, idempotency_key, current.value, _render_time(now)),
+            )
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = ?, cancellation_requested = 0, resumable = 0,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (RunStatus.RUNNING.value, _render_time(now), run_id),
+            )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="run.status_changed",
+                stage=RunStage(row["stage"]),
+                payload={"from": current.value, "to": RunStatus.RUNNING.value},
+                created_at=now,
+            )
+        return StartCommandResult(
+            run=self.get_run(run_id),
+            replayed=False,
+            accepted_status=current,
+        )
+
+    def resume_run_command(
+        self,
+        run_id: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> ResumeCommandResult:
         if idempotency_key is not None:
             _validate_id(idempotency_key, field="idempotency_key")
         now = self._now()
         with self._transaction() as connection:
             row = self._require_run_row(connection, run_id)
             current = RunStatus(row["status"])
-            if (
-                idempotency_key is not None
-                and row["last_resume_key"] == idempotency_key
-                and current is RunStatus.RUNNING
-            ):
-                return self._run_from_row(row)
+            if idempotency_key is not None:
+                prior_command = connection.execute(
+                    """
+                    SELECT accepted_status FROM resume_commands
+                    WHERE run_id = ? AND idempotency_key = ?
+                    """,
+                    (run_id, idempotency_key),
+                ).fetchone()
+                if prior_command is not None:
+                    return ResumeCommandResult(
+                        run=self._run_from_row(row),
+                        replayed=True,
+                        accepted_status=RunStatus(prior_command["accepted_status"]),
+                    )
             if not bool(row["resumable"]) or current not in {
                 RunStatus.PAUSED,
                 RunStatus.CANCELLED,
                 RunStatus.FAILED,
             }:
                 raise InvalidTransitionError(f"run is not resumable while {current.value}")
+            if self._unconfirmed_runtime_turns(connection, run_id):
+                raise ConflictError(
+                    "run has an unconfirmed terminal runtime turn"
+                )
+            live_execution = connection.execute(
+                """
+                SELECT 1 FROM execution_segments
+                WHERE run_id = ? AND released_at IS NULL AND lease_expires_at > ?
+                LIMIT 1
+                """,
+                (run_id, _render_time(now)),
+            ).fetchone()
+            if live_execution is not None:
+                raise ConflictError("run still has a live execution lease")
+            if idempotency_key is not None:
+                connection.execute(
+                    """
+                    INSERT INTO resume_commands (
+                        run_id, idempotency_key, accepted_status, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (run_id, idempotency_key, current.value, _render_time(now)),
+                )
             connection.execute(
                 """
                 UPDATE runs
@@ -1192,7 +1818,30 @@ class RunStore:
                 payload={"from": current.value, "to": RunStatus.RUNNING.value},
                 created_at=now,
             )
-        return self.get_run(run_id)
+        return ResumeCommandResult(
+            run=self.get_run(run_id),
+            replayed=False,
+            accepted_status=current,
+        )
+
+    def get_resume_command_status(
+        self,
+        run_id: str,
+        *,
+        idempotency_key: str,
+    ) -> RunStatus | None:
+        _validate_run_id(run_id)
+        _validate_id(idempotency_key, field="idempotency_key")
+        with self._lock:
+            self._require_run_row(self._connection, run_id)
+            row = self._connection.execute(
+                """
+                SELECT accepted_status FROM resume_commands
+                WHERE run_id = ? AND idempotency_key = ?
+                """,
+                (run_id, idempotency_key),
+            ).fetchone()
+        return None if row is None else RunStatus(row["accepted_status"])
 
     def transition_stage(
         self,
@@ -1251,42 +1900,74 @@ class RunStore:
         *,
         execution: ExecutionToken | None = None,
     ) -> Evidence:
+        return self.add_evidence_batch(
+            run_id,
+            (evidence,),
+            execution=execution,
+        )[0]
+
+    def add_evidence_batch(
+        self,
+        run_id: str,
+        evidence: tuple[Evidence, ...],
+        *,
+        execution: ExecutionToken | None = None,
+    ) -> tuple[Evidence, ...]:
+        """Persist one model evidence batch atomically."""
+
         _validate_id(run_id, field="run_id")
-        _validate_id(evidence.id, field="evidence.id")
+        if not evidence:
+            raise ValueError("evidence batch cannot be empty")
+        for item in evidence:
+            _validate_id(item.id, field="evidence.id")
+        if len({item.id for item in evidence}) != len(evidence):
+            raise ValueError("evidence batch ids must be unique")
         now = self._now()
-        rendered = canonical_json(evidence)
-        with self._transaction() as connection:
-            run = self._require_run_row(connection, run_id)
-            self._authorize_execution(connection, run_id, execution)
-            if RunStage(run["stage"]) is not RunStage.LITERATURE:
-                raise InvalidTransitionError("typed evidence may be added only in literature")
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO evidence (
-                        id, run_id, schema_version, evidence_json, evidence_sha256, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        evidence.id,
+        rendered = tuple(canonical_json(item) for item in evidence)
+        try:
+            with self._transaction() as connection:
+                run = self._require_run_row(connection, run_id)
+                self._authorize_execution(connection, run_id, execution)
+                if RunStage(run["stage"]) is not RunStage.LITERATURE:
+                    raise InvalidTransitionError(
+                        "typed evidence may be added only in literature"
+                    )
+                for item, item_json in zip(evidence, rendered, strict=True):
+                    connection.execute(
+                        """
+                        INSERT INTO evidence (
+                            id, run_id, schema_version, evidence_json,
+                            evidence_sha256, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            item.id,
+                            run_id,
+                            item.schema_version,
+                            item_json,
+                            canonical_sha256(item),
+                            _render_time(now),
+                        ),
+                    )
+                    self._append_event(
+                        connection,
                         run_id,
-                        evidence.schema_version,
-                        rendered,
-                        canonical_sha256(evidence),
-                        _render_time(now),
-                    ),
+                        event_type="evidence.created",
+                        stage=RunStage.LITERATURE,
+                        payload={"evidence_id": item.id},
+                        created_at=now,
+                    )
+                self._append_event(
+                    connection,
+                    run_id,
+                    event_type="evidence.batch_created",
+                    stage=RunStage.LITERATURE,
+                    payload={"evidence_ids": [item.id for item in evidence]},
+                    created_at=now,
                 )
-            except sqlite3.IntegrityError as error:
-                raise ConflictError(f"evidence already exists: {evidence.id}") from error
-            self._append_event(
-                connection,
-                run_id,
-                event_type="evidence.created",
-                stage=RunStage.LITERATURE,
-                payload={"evidence_id": evidence.id},
-                created_at=now,
-            )
-        return self.get_evidence(evidence.id)
+        except sqlite3.IntegrityError as error:
+            raise ConflictError("evidence batch contains an existing identity") from error
+        return tuple(self.get_evidence(item.id) for item in evidence)
 
     def get_evidence(self, evidence_id: str) -> Evidence:
         _validate_id(evidence_id, field="evidence_id")
@@ -1369,9 +2050,7 @@ class RunStore:
     def list_plans(self, run_id: str) -> tuple[Plan, ...]:
         with self._lock:
             self._require_run_row(self._connection, run_id)
-            rows = self._connection.execute(
-                "SELECT * FROM plans WHERE run_id = ? ORDER BY created_at, id", (run_id,)
-            ).fetchall()
+            rows = self._plan_rows_in_event_order(self._connection, run_id)
             return tuple(self._plan_from_row(row) for row in rows)
 
     def add_adjudication(
@@ -1461,12 +2140,10 @@ class RunStore:
     def list_adjudications(self, run_id: str) -> tuple[Adjudication, ...]:
         with self._lock:
             self._require_run_row(self._connection, run_id)
-            rows = self._connection.execute(
-                """
-                SELECT * FROM adjudications WHERE run_id = ? ORDER BY created_at, id
-                """,
-                (run_id,),
-            ).fetchall()
+            rows = self._adjudication_rows_in_event_order(
+                self._connection,
+                run_id,
+            )
             return tuple(self._adjudication_from_row(row) for row in rows)
 
     def record_decision(
@@ -1474,7 +2151,7 @@ class RunStore:
         run_id: str,
         candidate_id: str,
         *,
-        require_citation: bool = False,
+        require_citation: bool | None = None,
         execution: ExecutionToken | None = None,
     ) -> CandidateDecision:
         _validate_id(run_id, field="run_id")
@@ -1499,8 +2176,23 @@ class RunStore:
                 (run_id, candidate_id),
             ).fetchall()
             reports = tuple(self._verification_from_row(row).report for row in report_rows)
+            evidence_ids = tuple(
+                str(evidence_row["id"])
+                for evidence_row in connection.execute(
+                    "SELECT id FROM evidence WHERE run_id = ? ORDER BY id",
+                    (run_id,),
+                ).fetchall()
+            )
+            citation_required = bool(evidence_ids)
+            if require_citation is not None and require_citation != citation_required:
+                raise ConflictError(
+                    "citation policy must be derived from the frozen evidence ledger"
+                )
             decision = decide_candidate(
-                candidate, reports, require_citation=require_citation
+                candidate,
+                reports,
+                require_citation=citation_required,
+                required_evidence_ids=evidence_ids,
             )
             rendered = canonical_json(decision)
             existing = connection.execute(
@@ -1634,6 +2326,109 @@ class RunStore:
             ).fetchall()
             return tuple(self._stage_output_from_row(row) for row in rows)
 
+    def put_turn_input(
+        self,
+        input_id: str,
+        *,
+        run_id: str,
+        role: str,
+        prompt_version: str,
+        output_schema_sha256: Sha256,
+        payload: dict[str, JsonValue],
+        payload_sha256: Sha256,
+        execution: ExecutionToken | None = None,
+    ) -> TurnInputRecord:
+        """Persist one frozen model input and audit every selection of it."""
+
+        _validate_id(input_id, field="input_id")
+        _validate_id(run_id, field="run_id")
+        _validate_nonempty(role, field="role")
+        _validate_nonempty(prompt_version, field="prompt_version")
+        _validate_sha256(output_schema_sha256, field="output_schema_sha256")
+        _validate_sha256(payload_sha256, field="payload_sha256")
+        if canonical_sha256(payload) != payload_sha256:
+            raise ValueError("payload_sha256 does not match turn input payload")
+        now = self._now()
+        rendered = canonical_json(payload)
+        with self._transaction() as connection:
+            run = self._require_run_row(connection, run_id)
+            self._authorize_execution(connection, run_id, execution)
+            existing = connection.execute(
+                "SELECT * FROM turn_inputs WHERE id = ?",
+                (input_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO turn_inputs (
+                        id, run_id, role, prompt_version, output_schema_sha256,
+                        payload_json, payload_sha256, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        input_id,
+                        run_id,
+                        role,
+                        prompt_version,
+                        output_schema_sha256,
+                        rendered,
+                        payload_sha256,
+                        _render_time(now),
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    run_id,
+                    event_type="runtime.turn_input_frozen",
+                    stage=RunStage(run["stage"]),
+                    payload={
+                        "turn_input_id": input_id,
+                        "role": role,
+                        "payload_sha256": payload_sha256,
+                        "output_schema_sha256": output_schema_sha256,
+                    },
+                    created_at=now,
+                )
+            elif (
+                existing["run_id"] != run_id
+                or existing["role"] != role
+                or existing["prompt_version"] != prompt_version
+                or existing["output_schema_sha256"] != output_schema_sha256
+                or existing["payload_json"] != rendered
+                or existing["payload_sha256"] != payload_sha256
+            ):
+                raise ConflictError("turn input identity is immutable")
+            self._append_event(
+                connection,
+                run_id,
+                event_type="runtime.turn_input_selected",
+                stage=RunStage(run["stage"]),
+                payload={"turn_input_id": input_id},
+                created_at=now,
+            )
+        return self.get_turn_input(input_id)
+
+    def get_turn_input(self, input_id: str) -> TurnInputRecord:
+        _validate_id(input_id, field="input_id")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM turn_inputs WHERE id = ?",
+                (input_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"turn input not found: {input_id}")
+            return self._turn_input_from_row(row)
+
+    def list_turn_inputs(self, run_id: str) -> tuple[TurnInputRecord, ...]:
+        _validate_id(run_id, field="run_id")
+        with self._lock:
+            self._require_run_row(self._connection, run_id)
+            rows = self._connection.execute(
+                "SELECT * FROM turn_inputs WHERE run_id = ? ORDER BY created_at, id",
+                (run_id,),
+            ).fetchall()
+            return tuple(self._turn_input_from_row(row) for row in rows)
+
     def add_thread(
         self,
         thread_id: str,
@@ -1645,6 +2440,7 @@ class RunStore:
         parent_thread_id: str | None = None,
         external_thread_id: str | None = None,
         execution: ExecutionToken | None = None,
+        runtime_lifecycle: bool = False,
     ) -> ThreadRecord:
         _validate_id(thread_id, field="thread_id")
         _validate_id(run_id, field="run_id")
@@ -1660,7 +2456,10 @@ class RunStore:
         try:
             with self._transaction() as connection:
                 run = self._require_run_row(connection, run_id)
-                self._authorize_execution(connection, run_id, execution)
+                if runtime_lifecycle:
+                    self._authorize_runtime_lifecycle(connection, run_id, execution)
+                else:
+                    self._authorize_execution(connection, run_id, execution)
                 if parent_thread_id is not None:
                     parent = self._require_thread_row(connection, parent_thread_id)
                     if parent["run_id"] != run_id:
@@ -1719,17 +2518,62 @@ class RunStore:
             ).fetchall()
             return tuple(self._thread_from_row(row) for row in rows)
 
+    def reserve_proof_attempt(
+        self,
+        run_id: str,
+        *,
+        execution: ExecutionToken | None = None,
+    ) -> int:
+        """Consume one durable proof-attempt slot before contacting a prover."""
+
+        _validate_id(run_id, field="run_id")
+        now = self._now()
+        with self._transaction() as connection:
+            run = self._require_run_row(connection, run_id)
+            self._authorize_execution(connection, run_id, execution)
+            if RunStage(run["stage"]) is not RunStage.PROVING:
+                raise InvalidTransitionError(
+                    "proof attempts may be reserved only in proving"
+                )
+            config = QEDConfig.model_validate_json(run["config_json"])
+            attempt = int(run["proof_attempt_count"]) + 1
+            if attempt > config.budgets.proof_attempts:
+                raise ConflictError("proof attempt budget exhausted")
+            connection.execute(
+                """
+                UPDATE runs
+                SET proof_attempt_count = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (attempt, _render_time(now), run_id),
+            )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="proof.attempt_reserved",
+                stage=RunStage.PROVING,
+                payload={"attempt": attempt},
+                created_at=now,
+            )
+        return attempt
+
     def transition_thread(
         self,
         thread_id: str,
         target: ThreadStatus,
         *,
         execution: ExecutionToken | None = None,
+        runtime_lifecycle: bool = False,
     ) -> ThreadRecord:
         now = self._now()
         with self._transaction() as connection:
             row = self._require_thread_row(connection, thread_id)
-            self._authorize_execution(connection, row["run_id"], execution)
+            if runtime_lifecycle:
+                self._authorize_runtime_lifecycle(
+                    connection, row["run_id"], execution
+                )
+            else:
+                self._authorize_execution(connection, row["run_id"], execution)
             current = ThreadStatus(row["status"])
             if target not in THREAD_TRANSITIONS[current]:
                 raise InvalidTransitionError(
@@ -1759,6 +2603,7 @@ class RunStore:
         candidate: ProofCandidate,
         *,
         thread_id: str | None = None,
+        sealed: bool = False,
         execution: ExecutionToken | None = None,
     ) -> CandidateRecord:
         _validate_id(candidate.id, field="candidate.id")
@@ -1784,6 +2629,8 @@ class RunStore:
                     or ThreadRole(thread["role"]) is not ThreadRole.PROVER
                 ):
                     raise ConflictError("candidate requires a prover thread from its run")
+                if sealed and ThreadStatus(thread["status"]) is not ThreadStatus.COMPLETED:
+                    raise ConflictError("sealed candidate requires a completed prover thread")
                 if candidate.provenance.source_id != thread_id:
                     raise ConflictError("candidate provenance must bind its prover thread")
                 plan = connection.execute(
@@ -1796,17 +2643,34 @@ class RunStore:
                 )
                 config = QEDConfig.model_validate_json(run["config_json"])
                 attempt_count = int(run["proof_attempt_count"])
-                if attempt_count >= config.budgets.proof_attempts:
+                auto_reserve = candidate.attempt == attempt_count + 1
+                if auto_reserve and candidate.attempt > config.budgets.proof_attempts:
                     raise ConflictError("proof attempt budget exhausted")
-                if candidate.attempt != attempt_count + 1:
-                    raise ConflictError("candidate attempt must be the next durable attempt")
+                if not auto_reserve and not 1 <= candidate.attempt <= attempt_count:
+                    raise ConflictError("candidate requires a reserved proof attempt")
+                if auto_reserve:
+                    connection.execute(
+                        """
+                        UPDATE runs SET proof_attempt_count = proof_attempt_count + 1,
+                            updated_at = ? WHERE id = ?
+                        """,
+                        (_render_time(now), candidate.run_id),
+                    )
+                    self._append_event(
+                        connection,
+                        candidate.run_id,
+                        event_type="proof.attempt_reserved",
+                        stage=RunStage.PROVING,
+                        payload={"attempt": candidate.attempt},
+                        created_at=now,
+                    )
                 connection.execute(
                     """
                     INSERT INTO candidates (
                         id, run_id, thread_id, plan_id, attempt, schema_version,
                         candidate_json, candidate_sha256, proof_sha256, provenance_json,
                         provenance_sha256, sealed_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         candidate.id,
@@ -1820,25 +2684,32 @@ class RunStore:
                         candidate.proof_sha256,
                         provenance_json,
                         canonical_sha256(candidate.provenance),
+                        _render_time(now) if sealed else None,
                         _render_time(now),
                         _render_time(now),
                     ),
-                )
-                connection.execute(
-                    """
-                    UPDATE runs SET proof_attempt_count = proof_attempt_count + 1,
-                        updated_at = ? WHERE id = ?
-                    """,
-                    (_render_time(now), candidate.run_id),
                 )
                 self._append_event(
                     connection,
                     candidate.run_id,
                     event_type="candidate.created",
                     stage=RunStage(run["stage"]),
-                    payload={"candidate_id": candidate.id, "sealed": False},
+                    payload={"candidate_id": candidate.id, "sealed": sealed},
                     created_at=now,
                 )
+                if sealed:
+                    self._append_event(
+                        connection,
+                        candidate.run_id,
+                        event_type="candidate.sealed",
+                        stage=RunStage(run["stage"]),
+                        payload={
+                            "candidate_id": candidate.id,
+                            "candidate_sha256": canonical_sha256(candidate),
+                            "proof_sha256": candidate.proof_sha256,
+                        },
+                        created_at=now,
+                    )
         except sqlite3.IntegrityError as error:
             raise ConflictError(f"candidate already exists: {candidate.id}") from error
         return self.get_candidate(candidate.id)
@@ -2011,6 +2882,36 @@ class RunStore:
                     report = report.model_copy(
                         update={"verifier_external_thread_id": external_thread_id}
                     )
+                evidence_ids = {
+                    str(evidence_row["id"])
+                    for evidence_row in connection.execute(
+                        "SELECT id FROM evidence WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchall()
+                }
+                referenced_evidence = {
+                    evidence_id
+                    for check in report.checks
+                    for evidence_id in check.evidence_ids
+                } | {
+                    evidence_id
+                    for finding in report.findings
+                    for evidence_id in finding.evidence_ids
+                }
+                unknown_evidence = referenced_evidence - evidence_ids
+                if unknown_evidence:
+                    names = ", ".join(sorted(unknown_evidence))
+                    raise ConflictError(
+                        f"verification references unknown evidence: {names}"
+                    )
+                if report.kind == "citation":
+                    missing_evidence = evidence_ids - referenced_evidence
+                    if missing_evidence:
+                        names = ", ".join(sorted(missing_evidence))
+                        raise ConflictError(
+                            "citation report does not cover the frozen evidence ledger: "
+                            f"{names}"
+                        )
                 report_json = canonical_json(report)
                 provenance_json = canonical_json(report.provenance)
                 connection.execute(
@@ -2215,6 +3116,10 @@ class RunStore:
                 "SELECT * FROM stage_outputs WHERE run_id = ? ORDER BY created_at, id",
                 (run_id,),
             ).fetchall()
+            turn_input_rows = connection.execute(
+                "SELECT * FROM turn_inputs WHERE run_id = ? ORDER BY created_at, id",
+                (run_id,),
+            ).fetchall()
             thread_rows = connection.execute(
                 "SELECT * FROM threads WHERE run_id = ? ORDER BY created_at, id", (run_id,)
             ).fetchall()
@@ -2236,18 +3141,21 @@ class RunStore:
                 """,
                 (run_id,),
             ).fetchall()
-            evidence_rows = connection.execute(
-                "SELECT * FROM evidence WHERE run_id = ? ORDER BY created_at, id", (run_id,)
-            ).fetchall()
-            plan_rows = connection.execute(
-                "SELECT * FROM plans WHERE run_id = ? ORDER BY created_at, id", (run_id,)
-            ).fetchall()
-            adjudication_rows = connection.execute(
+            resolution_rows = connection.execute(
                 """
-                SELECT * FROM adjudications WHERE run_id = ? ORDER BY created_at, id
+                SELECT * FROM runtime_resolutions
+                WHERE run_id = ? ORDER BY created_at, segment_id
                 """,
                 (run_id,),
             ).fetchall()
+            evidence_rows = connection.execute(
+                "SELECT * FROM evidence WHERE run_id = ? ORDER BY created_at, id", (run_id,)
+            ).fetchall()
+            plan_rows = self._plan_rows_in_event_order(connection, run_id)
+            adjudication_rows = self._adjudication_rows_in_event_order(
+                connection,
+                run_id,
+            )
             decision_rows = connection.execute(
                 """
                 SELECT * FROM candidate_decisions
@@ -2268,6 +3176,9 @@ class RunStore:
                 stage_outputs=tuple(
                     self._stage_output_from_row(row) for row in output_rows
                 ),
+                turn_inputs=tuple(
+                    self._turn_input_from_row(row) for row in turn_input_rows
+                ),
                 threads=tuple(self._thread_from_row(row) for row in thread_rows),
                 candidates=tuple(self._candidate_from_row(row) for row in candidate_rows),
                 verifications=tuple(
@@ -2276,6 +3187,10 @@ class RunStore:
                 artifacts=tuple(self._artifact_from_row(row) for row in artifact_rows),
                 execution_segments=tuple(
                     self._execution_from_row(row) for row in execution_rows
+                ),
+                runtime_resolutions=tuple(
+                    self._runtime_resolution_from_row(row)
+                    for row in resolution_rows
                 ),
                 evidence=tuple(self._evidence_from_row(row) for row in evidence_rows),
                 plans=tuple(self._plan_from_row(row) for row in plan_rows),
@@ -2296,7 +3211,10 @@ class RunStore:
     ) -> Event:
         with self._transaction() as connection:
             run = self._require_run_row(connection, run_id)
-            self._authorize_execution(connection, run_id, execution)
+            if event_type in RUNTIME_DRAIN_EVENTS:
+                self._authorize_runtime_lifecycle(connection, run_id, execution)
+            else:
+                self._authorize_execution(connection, run_id, execution)
             if RunStage(run["stage"]) is not stage:
                 raise InvalidTransitionError(
                     "event stage must equal the run's current stage"
@@ -2308,6 +3226,93 @@ class RunStore:
                 stage=stage,
                 payload=payload,
                 created_at=self._now(),
+            )
+
+    def record_turn_terminal_unconfirmed(
+        self,
+        run_id: str,
+        *,
+        payload: dict[str, JsonValue],
+        execution: ExecutionToken,
+    ) -> Event:
+        """Record the one audit event a fenced worker may append while cancelling."""
+
+        now = self._now()
+        with self._transaction() as connection:
+            run = self._require_run_row(connection, run_id)
+            segment = self._require_execution_row(connection, execution.segment_id)
+            self._validate_execution_identity(segment, execution)
+            if (
+                segment["run_id"] != run_id
+                or int(run["execution_version"]) != execution.version
+                or segment["released_at"] is not None
+            ):
+                raise ConflictError("stale execution token")
+            return self._append_event(
+                connection,
+                run_id,
+                event_type="runtime.turn_terminal_unconfirmed",
+                stage=RunStage(run["stage"]),
+                payload=payload,
+                created_at=now,
+            )
+
+    def record_turn_start_unconfirmed(
+        self,
+        run_id: str,
+        *,
+        payload: dict[str, JsonValue],
+        execution: ExecutionToken,
+    ) -> Event:
+        """Persist an ambiguous turn-start request after its runtime call began."""
+
+        now = self._now()
+        with self._transaction() as connection:
+            run = self._require_run_row(connection, run_id)
+            segment = self._require_execution_row(connection, execution.segment_id)
+            self._validate_execution_identity(segment, execution)
+            if (
+                segment["run_id"] != run_id
+                or int(run["execution_version"]) != execution.version
+                or segment["released_at"] is not None
+            ):
+                raise ConflictError("stale execution token")
+            return self._append_event(
+                connection,
+                run_id,
+                event_type="runtime.turn_start_unconfirmed",
+                stage=RunStage(run["stage"]),
+                payload=payload,
+                created_at=now,
+            )
+
+    def record_turn_completed(
+        self,
+        run_id: str,
+        *,
+        payload: dict[str, JsonValue],
+        execution: ExecutionToken,
+    ) -> Event:
+        """Persist runtime terminal evidence even after cancellation was requested."""
+
+        now = self._now()
+        with self._transaction() as connection:
+            run = self._require_run_row(connection, run_id)
+            segment = self._require_execution_row(connection, execution.segment_id)
+            self._validate_execution_identity(segment, execution)
+            if (
+                segment["run_id"] != run_id
+                or int(run["execution_version"]) != execution.version
+                or segment["released_at"] is not None
+            ):
+                raise ConflictError("stale execution token")
+            return self._append_event(
+                connection,
+                run_id,
+                event_type="runtime.turn_completed",
+                stage=RunStage(run["stage"]),
+                payload=payload,
+                created_at=now,
             )
 
     def list_events(self, run_id: str, *, after_seq: int = 0) -> tuple[Event, ...]:
@@ -2322,6 +3327,13 @@ class RunStore:
                 (run_id, after_seq),
             ).fetchall()
             return tuple(self._event_from_row(row) for row in rows)
+
+    def has_unconfirmed_runtime_turns(self, run_id: str) -> bool:
+        """Return whether a start attempt lacks a confirmed runtime terminal."""
+
+        with self._lock:
+            self._require_run_row(self._connection, run_id)
+            return bool(self._unconfirmed_runtime_turns(self._connection, run_id))
 
     def _append_event(
         self,
@@ -2500,20 +3512,270 @@ class RunStore:
         if row["run_id"] != run_id:
             raise ConflictError("stale execution token")
 
+    def _authorize_runtime_lifecycle(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        execution: ExecutionToken | None,
+    ) -> sqlite3.Row:
+        """Authorize only lifecycle drain writes from the current fenced owner."""
+
+        run = self._require_run_row(connection, run_id)
+        if execution is None:
+            raise ConflictError("an active execution token is required")
+        row = self._require_execution_row(connection, execution.segment_id)
+        self._validate_execution_identity(row, execution)
+        if (
+            row["run_id"] != run_id
+            or int(run["execution_version"]) != execution.version
+            or row["released_at"] is not None
+        ):
+            raise ConflictError("stale execution token")
+        return row
+
     @staticmethod
-    def _latest_adjudication_row(
-        connection: sqlite3.Connection, run_id: str
-    ) -> sqlite3.Row | None:
-        return cast(
-            sqlite3.Row | None,
-            connection.execute(
-                """
-                SELECT * FROM adjudications
-                WHERE run_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
-                """,
-                (run_id,),
-            ).fetchone(),
+    def _unconfirmed_runtime_turns(
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> set[tuple[str, ...]]:
+        pending: set[tuple[str, ...]] = set()
+        rows = connection.execute(
+            """
+            SELECT event_type, payload_json FROM events
+            WHERE run_id = ? AND event_type IN (
+                'runtime.turn_attempt_started',
+                'runtime.turn_not_started',
+                'runtime.turn_start_unconfirmed',
+                'runtime.turn_started',
+                'runtime.turn_terminal_unconfirmed',
+                'runtime.turn_completed'
+            )
+            ORDER BY seq
+            """,
+            (run_id,),
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if not isinstance(payload, dict):
+                raise StoreIntegrityError("runtime ownership event has invalid payload")
+            event_type = row["event_type"]
+            if event_type in {
+                "runtime.turn_attempt_started",
+                "runtime.turn_not_started",
+                "runtime.turn_start_unconfirmed",
+            }:
+                turn_input_id = payload.get("turn_input_id")
+                attempt = payload.get("attempt")
+                if (
+                    not isinstance(turn_input_id, str)
+                    or not turn_input_id
+                    or isinstance(attempt, bool)
+                    or not isinstance(attempt, int)
+                    or attempt < 1
+                ):
+                    raise StoreIntegrityError(
+                        "runtime turn attempt event has invalid identity"
+                    )
+                attempt_identity = ("attempt", turn_input_id, str(attempt))
+                if event_type == "runtime.turn_not_started":
+                    pending.discard(attempt_identity)
+                else:
+                    pending.add(attempt_identity)
+                continue
+
+            thread_id = payload.get("thread_id")
+            turn_id = payload.get("turn_id")
+            backend = payload.get("backend")
+            if (
+                not isinstance(thread_id, str)
+                or not thread_id
+                or not isinstance(turn_id, str)
+                or not turn_id
+                or not isinstance(backend, str)
+                or not backend
+            ):
+                raise StoreIntegrityError("runtime turn event has invalid identity")
+            identity = ("turn", backend, thread_id, turn_id)
+            if event_type == "runtime.turn_started":
+                turn_input_id = payload.get("turn_input_id")
+                attempt = payload.get("attempt")
+                if not isinstance(turn_input_id, str) or not turn_input_id:
+                    raise StoreIntegrityError(
+                        "runtime turn start event has invalid attempt identity"
+                    )
+                if attempt is None:
+                    matching_attempts = {
+                        item
+                        for item in pending
+                        if len(item) == 3
+                        and item[0] == "attempt"
+                        and item[1] == turn_input_id
+                    }
+                    if len(matching_attempts) > 1:
+                        raise StoreIntegrityError(
+                            "runtime turn start matches multiple pending attempts"
+                        )
+                    pending.difference_update(matching_attempts)
+                elif (
+                    isinstance(attempt, bool)
+                    or not isinstance(attempt, int)
+                    or attempt < 1
+                ):
+                    raise StoreIntegrityError(
+                        "runtime turn start event has invalid attempt identity"
+                    )
+                else:
+                    pending.discard(("attempt", turn_input_id, str(attempt)))
+                pending.add(identity)
+            elif event_type == "runtime.turn_terminal_unconfirmed":
+                pending.add(identity)
+            elif payload.get("status") in {"completed", "failed", "interrupted"}:
+                pending.discard(identity)
+        return pending
+
+    @staticmethod
+    def _latest_stage_entry_seq(
+        connection: sqlite3.Connection,
+        run_id: str,
+        stage: RunStage,
+    ) -> int:
+        row = connection.execute(
+            """
+            SELECT seq FROM events
+            WHERE run_id = ? AND event_type = 'run.stage_changed' AND stage = ?
+            ORDER BY seq DESC LIMIT 1
+            """,
+            (run_id, stage.value),
+        ).fetchone()
+        if row is None:
+            raise StoreIntegrityError(
+                f"run {run_id} has no entry event for stage {stage.value}"
+            )
+        return int(row["seq"])
+
+    @staticmethod
+    def _event_record_ids_after(
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        after_seq: int,
+        stage: RunStage,
+        event_type: str,
+        payload_key: str,
+    ) -> tuple[str, ...]:
+        rows = connection.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE run_id = ? AND seq > ? AND stage = ? AND event_type = ?
+            ORDER BY seq
+            """,
+            (run_id, after_seq, stage.value, event_type),
+        ).fetchall()
+        record_ids: list[str] = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            record_id = payload.get(payload_key)
+            if not isinstance(record_id, str):
+                raise StoreIntegrityError(
+                    f"{event_type} event has invalid {payload_key}"
+                )
+            record_ids.append(record_id)
+        return tuple(record_ids)
+
+    def _adjudication_rows_in_event_order(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        after_seq: int = 0,
+    ) -> tuple[sqlite3.Row, ...]:
+        adjudication_ids = self._event_record_ids_after(
+            connection,
+            run_id,
+            after_seq=after_seq,
+            stage=RunStage.ADJUDICATION,
+            event_type="adjudication.created",
+            payload_key="adjudication_id",
         )
+        rows: list[sqlite3.Row] = []
+        seen: set[str] = set()
+        for adjudication_id in adjudication_ids:
+            if adjudication_id in seen:
+                raise StoreIntegrityError(
+                    f"duplicate adjudication.created event: {adjudication_id}"
+                )
+            seen.add(adjudication_id)
+            row = connection.execute(
+                "SELECT * FROM adjudications WHERE id = ? AND run_id = ?",
+                (adjudication_id, run_id),
+            ).fetchone()
+            if row is None:
+                raise StoreIntegrityError(
+                    f"adjudication event references a missing row: {adjudication_id}"
+                )
+            rows.append(row)
+        if after_seq == 0:
+            count_row = connection.execute(
+                "SELECT COUNT(*) AS count FROM adjudications WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            assert count_row is not None
+            if int(count_row["count"]) != len(rows):
+                raise StoreIntegrityError(
+                    f"adjudication row is missing its creation event: {run_id}"
+                )
+        return tuple(rows)
+
+    def _plan_rows_in_event_order(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> tuple[sqlite3.Row, ...]:
+        plan_ids = self._event_record_ids_after(
+            connection,
+            run_id,
+            after_seq=0,
+            stage=RunStage.PLANNING,
+            event_type="plan.created",
+            payload_key="plan_id",
+        )
+        rows: list[sqlite3.Row] = []
+        seen: set[str] = set()
+        for plan_id in plan_ids:
+            if plan_id in seen:
+                raise StoreIntegrityError(f"duplicate plan.created event: {plan_id}")
+            seen.add(plan_id)
+            row = connection.execute(
+                "SELECT * FROM plans WHERE id = ? AND run_id = ?",
+                (plan_id, run_id),
+            ).fetchone()
+            if row is None:
+                raise StoreIntegrityError(
+                    f"plan event references a missing row: {plan_id}"
+                )
+            rows.append(row)
+        count_row = connection.execute(
+            "SELECT COUNT(*) AS count FROM plans WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        assert count_row is not None
+        if int(count_row["count"]) != len(rows):
+            raise StoreIntegrityError(f"plan row is missing its creation event: {run_id}")
+        return tuple(rows)
+
+    def _latest_adjudication_row(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        after_seq: int,
+    ) -> sqlite3.Row | None:
+        rows = self._adjudication_rows_in_event_order(
+            connection,
+            run_id,
+            after_seq=after_seq,
+        )
+        return rows[-1] if rows else None
 
     def _validate_stage_gate(
         self,
@@ -2535,39 +3797,91 @@ class RunStore:
             return
 
         if current is RunStage.LITERATURE and target is RunStage.PLANNING:
-            if connection.execute(
-                "SELECT 1 FROM evidence WHERE run_id = ? LIMIT 1", (run_id,)
-            ).fetchone() is None:
+            entry_seq = self._latest_stage_entry_seq(connection, run_id, current)
+            evidence_ids = self._event_record_ids_after(
+                connection,
+                run_id,
+                after_seq=entry_seq,
+                stage=current,
+                event_type="evidence.created",
+                payload_key="evidence_id",
+            )
+            if not any(
+                connection.execute(
+                    "SELECT 1 FROM evidence WHERE run_id = ? AND id = ?",
+                    (run_id, evidence_id),
+                ).fetchone()
+                is not None
+                for evidence_id in evidence_ids
+            ):
                 raise InvalidTransitionError("planning requires typed evidence")
             return
 
         if current is RunStage.PLANNING and target is RunStage.PROVING:
-            if connection.execute(
-                "SELECT 1 FROM plans WHERE run_id = ? LIMIT 1", (run_id,)
-            ).fetchone() is None:
+            entry_seq = self._latest_stage_entry_seq(connection, run_id, current)
+            plan_ids = self._event_record_ids_after(
+                connection,
+                run_id,
+                after_seq=entry_seq,
+                stage=current,
+                event_type="plan.created",
+                payload_key="plan_id",
+            )
+            if not any(
+                connection.execute(
+                    "SELECT 1 FROM plans WHERE run_id = ? AND id = ?",
+                    (run_id, plan_id),
+                ).fetchone()
+                is not None
+                for plan_id in plan_ids
+            ):
                 raise InvalidTransitionError("proving requires a typed plan")
             return
 
         if current is RunStage.PROVING and target is RunStage.VERIFICATION:
-            if connection.execute(
-                """
-                SELECT 1 FROM candidates
-                WHERE run_id = ? AND sealed_at IS NOT NULL LIMIT 1
-                """,
-                (run_id,),
-            ).fetchone() is None:
+            entry_seq = self._latest_stage_entry_seq(connection, run_id, current)
+            candidate_ids = self._event_record_ids_after(
+                connection,
+                run_id,
+                after_seq=entry_seq,
+                stage=current,
+                event_type="candidate.sealed",
+                payload_key="candidate_id",
+            )
+            if not any(
+                connection.execute(
+                    """
+                    SELECT 1 FROM candidates
+                    WHERE run_id = ? AND id = ? AND sealed_at IS NOT NULL
+                    """,
+                    (run_id, candidate_id),
+                ).fetchone()
+                is not None
+                for candidate_id in candidate_ids
+            ):
                 raise InvalidTransitionError("verification requires a sealed proof candidate")
             return
 
         if current is RunStage.VERIFICATION and target is RunStage.ADJUDICATION:
-            if not self._has_independently_verified_candidate(connection, run_id):
+            entry_seq = self._latest_stage_entry_seq(connection, run_id, current)
+            if not self._has_independently_verified_candidate(
+                connection,
+                run_id,
+                after_seq=entry_seq,
+            ):
                 raise InvalidTransitionError(
-                    "adjudication requires structural and detailed independent reports"
+                    "adjudication requires structural, detailed, and ledger-required "
+                    "citation reports from independent threads"
                 )
             return
 
         if current is RunStage.ADJUDICATION:
-            latest_row = self._latest_adjudication_row(connection, run_id)
+            entry_seq = self._latest_stage_entry_seq(connection, run_id, current)
+            latest_row = self._latest_adjudication_row(
+                connection,
+                run_id,
+                after_seq=entry_seq,
+            )
             if latest_row is None:
                 raise InvalidTransitionError("adjudication requires a typed adjudication")
             adjudication = self._adjudication_from_row(latest_row)
@@ -2643,31 +3957,70 @@ class RunStore:
             )
 
     def _has_independently_verified_candidate(
-        self, connection: sqlite3.Connection, run_id: str
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        after_seq: int,
     ) -> bool:
-        candidate_rows = connection.execute(
-            """
-            SELECT * FROM candidates WHERE run_id = ? AND sealed_at IS NOT NULL
-            """,
-            (run_id,),
-        ).fetchall()
-        for candidate_row in candidate_rows:
-            report_rows = connection.execute(
-                """
-                SELECT * FROM verifications WHERE candidate_id = ?
-                ORDER BY created_at, id
-                """,
-                (candidate_row["id"],),
-            ).fetchall()
-            reports = tuple(self._verification_from_row(row).report for row in report_rows)
+        verification_ids = self._event_record_ids_after(
+            connection,
+            run_id,
+            after_seq=after_seq,
+            stage=RunStage.VERIFICATION,
+            event_type="verification.created",
+            payload_key="verification_id",
+        )
+        report_rows = tuple(
+            self._require_verification_row(connection, verification_id)
+            for verification_id in verification_ids
+        )
+        proving_entry_seq = self._latest_stage_entry_seq(
+            connection,
+            run_id,
+            RunStage.PROVING,
+        )
+        current_candidate_ids = set(
+            self._event_record_ids_after(
+                connection,
+                run_id,
+                after_seq=proving_entry_seq,
+                stage=RunStage.PROVING,
+                event_type="candidate.sealed",
+                payload_key="candidate_id",
+            )
+        )
+        candidate_ids = {
+            str(row["candidate_id"])
+            for row in report_rows
+            if row["run_id"] == run_id
+            and str(row["candidate_id"]) in current_candidate_ids
+        }
+        citation_required = connection.execute(
+            "SELECT 1 FROM evidence WHERE run_id = ? LIMIT 1", (run_id,)
+        ).fetchone() is not None
+        required_kinds = (
+            {"structural", "detailed", "citation"}
+            if citation_required
+            else {"structural", "detailed"}
+        )
+        for candidate_id in candidate_ids:
+            candidate_row = self._require_candidate_row(connection, candidate_id)
+            if candidate_row["run_id"] != run_id or candidate_row["sealed_at"] is None:
+                continue
+            reports = tuple(
+                self._verification_from_row(row).report
+                for row in report_rows
+                if row["candidate_id"] == candidate_id
+            )
             kinds = {report.kind for report in reports}
             external_ids = {
                 report.verifier_external_thread_id
                 for report in reports
-                if report.kind in {"structural", "detailed"}
+                if report.kind in required_kinds
                 and report.verifier_external_thread_id is not None
             }
-            if {"structural", "detailed"}.issubset(kinds) and len(external_ids) >= 2:
+            if required_kinds.issubset(kinds) and len(external_ids) >= len(required_kinds):
                 return True
         return False
 
@@ -2839,6 +4192,25 @@ class RunStore:
         )
 
     @staticmethod
+    def _turn_input_from_row(row: sqlite3.Row) -> TurnInputRecord:
+        payload = json.loads(row["payload_json"])
+        _require_integrity(
+            isinstance(payload, dict)
+            and canonical_sha256(payload) == row["payload_sha256"],
+            f"turn input payload hash mismatch: {row['id']}",
+        )
+        return TurnInputRecord(
+            id=row["id"],
+            run_id=row["run_id"],
+            role=row["role"],
+            prompt_version=row["prompt_version"],
+            output_schema_sha256=row["output_schema_sha256"],
+            payload=cast(dict[str, JsonValue], payload),
+            payload_sha256=row["payload_sha256"],
+            created_at=_parse_time(row["created_at"]),
+        )
+
+    @staticmethod
     def _artifact_from_row(row: sqlite3.Row) -> ArtifactRecord:
         provenance = Provenance.model_validate_json(row["provenance_json"])
         _require_integrity(
@@ -2878,6 +4250,22 @@ class RunStore:
             released_at=_parse_time(row["released_at"]) if row["released_at"] else None,
             created_at=_parse_time(row["created_at"]),
             updated_at=_parse_time(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _runtime_resolution_from_row(row: sqlite3.Row) -> RuntimeResolutionRecord:
+        resolution = cast(JsonValue, json.loads(row["resolution_json"]))
+        _require_integrity(
+            canonical_sha256(resolution) == row["resolution_sha256"],
+            f"execution runtime resolution hash mismatch: {row['segment_id']}",
+        )
+        return RuntimeResolutionRecord(
+            segment_id=row["segment_id"],
+            run_id=row["run_id"],
+            schema_version=row["schema_version"],
+            resolution=resolution,
+            resolution_sha256=row["resolution_sha256"],
+            created_at=_parse_time(row["created_at"]),
         )
 
     @staticmethod

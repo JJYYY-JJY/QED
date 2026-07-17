@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, AsyncIterator
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -12,6 +13,7 @@ from qed.runtime import (
     ResumeThread,
     RunRequest,
     RuntimeBackend,
+    RuntimeProtocolError,
     SandboxMode,
     SdkRuntime,
     ThreadStarted,
@@ -103,6 +105,24 @@ def test_sdk_support_is_limited_to_published_typed_controls() -> None:
         )
         is False
     )
+
+
+def test_sdk_uses_the_same_resolved_executable_as_other_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[Any] = []
+
+    def build_client(config: Any) -> FakeSdkClient:
+        captured.append(config)
+        return FakeSdkClient(FakeThread(FakeHandle([])))
+
+    monkeypatch.setattr("qed.runtime.sdk.AsyncCodex", build_client)
+    executable = Path("/opt/codex/bin/codex")
+
+    SdkRuntime(executable=executable)
+
+    assert captured[0].codex_bin == str(executable)
+    assert captured[0].experimental_api is False
 
 
 @pytest.mark.parametrize(
@@ -212,3 +232,21 @@ async def test_sdk_interrupt_uses_the_live_handle() -> None:
 
     assert handle.interrupted is True
     await stream.aclose()
+
+
+async def test_sdk_protocol_error_keeps_handle_interruptible_until_runtime_close() -> None:
+    handle = FakeHandle([{"method": "item/completed", "params": "malformed"}])
+    client = FakeSdkClient(FakeThread(handle))
+    runtime = SdkRuntime(client)
+    stream = cast(AsyncGenerator[Any], runtime.stream(_request()))
+    assert isinstance(await anext(stream), ThreadStarted)
+    started = await anext(stream)
+    assert isinstance(started, TurnStarted)
+
+    with pytest.raises(RuntimeProtocolError, match="invalid method or payload"):
+        await anext(stream)
+
+    await runtime.interrupt(started.turn)
+    assert handle.interrupted is True
+    await runtime.close()
+    assert client.closed is True

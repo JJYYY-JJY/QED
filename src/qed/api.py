@@ -51,7 +51,7 @@ from qed.workflow import WorkflowExecutionError
 
 RunId = Annotated[
     str,
-    StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"),
+    StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"),
 ]
 CommandKey = Annotated[
     str,

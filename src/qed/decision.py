@@ -58,10 +58,12 @@ def decide_candidate(
     reports: tuple[VerificationReport, ...],
     *,
     require_citation: bool = False,
+    required_evidence_ids: tuple[str, ...] = (),
 ) -> CandidateDecision:
     """Compute PASS from frozen input and independent structured reports."""
 
     _check_integrity(candidate, reports)
+    require_citation = require_citation or bool(required_evidence_ids)
     required: tuple[RequiredReportKind, ...] = (
         ("structural", "detailed", "citation")
         if require_citation
@@ -78,6 +80,23 @@ def decide_candidate(
         for report in matching:
             if report.verdict is not VerificationVerdict.PASS:
                 reasons.append(f"non_pass:{kind}:{report.verdict.value}")
+
+    required_evidence = set(required_evidence_ids)
+    citation_reports = tuple(report for report in relevant if report.kind == "citation")
+    for report in citation_reports:
+        referenced_evidence = {
+            evidence_id
+            for check in report.checks
+            for evidence_id in check.evidence_ids
+        } | {
+            evidence_id
+            for finding in report.findings
+            for evidence_id in finding.evidence_ids
+        }
+        for evidence_id in sorted(referenced_evidence - required_evidence):
+            reasons.append(f"citation_unknown_evidence:{evidence_id}")
+        for evidence_id in sorted(required_evidence - referenced_evidence):
+            reasons.append(f"citation_missing_evidence:{evidence_id}")
 
     writer_thread = candidate.provenance.source_id
     if writer_thread is not None:

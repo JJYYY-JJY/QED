@@ -33,12 +33,20 @@ class RuntimeProtocolError(RuntimeError):
     pass
 
 
+class _NotificationStream(Protocol):
+    def __aiter__(self) -> AsyncIterator[dict[str, Any]]: ...
+
+    async def __anext__(self) -> dict[str, Any]: ...
+
+    async def aclose(self) -> None: ...
+
+
 class AppServerTransport(Protocol):
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]: ...
 
     async def notify(self, method: str, params: dict[str, Any]) -> None: ...
 
-    def notifications(self) -> AsyncIterator[dict[str, Any]]: ...
+    def notifications(self) -> _NotificationStream: ...
 
     async def close(self) -> None: ...
 
@@ -145,6 +153,8 @@ class _ErrorDetail(_WireModel):
 class _ErrorParams(_WireModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
+    thread_id: str = Field(alias="threadId", min_length=1)
+    turn_id: str = Field(alias="turnId", min_length=1)
     error: _ErrorDetail
     will_retry: bool = Field(default=False, alias="willRetry")
 
@@ -199,97 +209,111 @@ class AppServerRuntime:
                 raise RuntimeProtocolError(f"{method} repeated pagination cursor {cursor!r}")
             seen.add(cursor)
 
-    async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
+    def preflight(self, request: RunRequest) -> None:
         if request.effort == "auto":
             raise ValueError("AppServerRuntime requires a capability-resolved effort")
 
+    async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
+        self.preflight(request)
+
         notifications = self._transport.notifications()
-        thread_method, thread_params = self._thread_request(request)
-        thread_raw = await self._transport.request(thread_method, thread_params)
-        thread_id = _ThreadResponse.model_validate(thread_raw).thread.id
-        yield ThreadStarted(thread_id=thread_id, backend=RuntimeBackend.APP_SERVER)
+        try:
+            thread_method, thread_params = self._thread_request(request)
+            thread_raw = await self._transport.request(thread_method, thread_params)
+            thread_id = _ThreadResponse.model_validate(thread_raw).thread.id
+            yield ThreadStarted(thread_id=thread_id, backend=RuntimeBackend.APP_SERVER)
 
-        turn_params = self._turn_request(request, thread_id)
-        turn_raw = await self._transport.request("turn/start", turn_params)
-        turn_id = _TurnResponse.model_validate(turn_raw).turn.id
-        turn_ref = TurnRef(
-            thread_id=thread_id,
-            turn_id=turn_id,
-            backend=RuntimeBackend.APP_SERVER,
-        )
-        yield TurnStarted(turn=turn_ref)
+            turn_params = self._turn_request(request, thread_id)
+            turn_raw = await self._transport.request("turn/start", turn_params)
+            turn_id = _TurnResponse.model_validate(turn_raw).turn.id
+            turn_ref = TurnRef(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                backend=RuntimeBackend.APP_SERVER,
+            )
+            yield TurnStarted(turn=turn_ref)
 
-        final_output: str | None = None
-        fallback_output: str | None = None
-        async for notification in notifications:
-            method, params = self._notification_shape(notification)
-            if self._targets_other_turn(params, turn_ref):
-                continue
-            if method == "turn/started":
-                started = _TurnParams.model_validate(params)
-                self._require_turn(started.thread_id, started.turn, turn_ref)
-                continue
-            if method == "item/completed":
-                completed = _ItemParams.model_validate(params)
-                if completed.thread_id != thread_id or completed.turn_id != turn_id:
+            final_output: str | None = None
+            fallback_output: str | None = None
+            async for notification in notifications:
+                method, params = self._notification_shape(notification)
+                if self._targets_other_turn(params, turn_ref):
                     continue
-                item_id = completed.item.get("id")
-                item_type = completed.item.get("type")
-                if not isinstance(item_id, str) or not isinstance(item_type, str):
-                    raise RuntimeProtocolError("item/completed omitted string id or type")
-                text = completed.item.get("text")
-                if item_type == "agentMessage" and isinstance(text, str):
-                    phase = completed.item.get("phase")
-                    if phase == "final_answer":
-                        final_output = text
-                    elif phase is None:
-                        fallback_output = text
-                yield ItemCompleted(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    item_id=item_id,
-                    item_type=item_type,
-                    payload=completed.item,
-                )
-                continue
-            if method == "thread/tokenUsage/updated":
-                usage = _UsageParams.model_validate(params)
-                if usage.thread_id != thread_id or usage.turn_id != turn_id:
+                if method == "turn/started":
+                    started = _TurnParams.model_validate(params)
+                    self._require_turn(started.thread_id, started.turn, turn_ref)
                     continue
-                last = usage.token_usage.last
-                yield TokenUsageUpdated(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    usage=TokenUsage(
-                        input_tokens=last.input_tokens,
-                        output_tokens=last.output_tokens,
-                        cached_input_tokens=last.cached_input_tokens,
-                        reasoning_output_tokens=last.reasoning_output_tokens,
-                    ),
-                )
-                continue
-            if method == "error":
-                error = _ErrorParams.model_validate(params)
-                yield RuntimeErrorEvent(
-                    message=error.error.message,
-                    retryable=error.will_retry,
-                )
-                continue
-            if method == "turn/completed":
-                completed_turn = _TurnParams.model_validate(params)
-                self._require_turn(completed_turn.thread_id, completed_turn.turn, turn_ref)
-                status = completed_turn.turn.get("status")
-                if status not in {"completed", "failed", "interrupted"}:
-                    raise RuntimeProtocolError(f"unsupported terminal turn status {status!r}")
-                yield TurnCompleted(
-                    turn=turn_ref,
-                    status=status,
-                    output=final_output if final_output is not None else fallback_output,
-                )
-                return
-            yield UnknownNotification(method=method, payload=params)
+                if method == "item/completed":
+                    completed = _ItemParams.model_validate(params)
+                    if completed.thread_id != thread_id or completed.turn_id != turn_id:
+                        continue
+                    item_id = completed.item.get("id")
+                    item_type = completed.item.get("type")
+                    if not isinstance(item_id, str) or not isinstance(item_type, str):
+                        raise RuntimeProtocolError("item/completed omitted string id or type")
+                    text = completed.item.get("text")
+                    if item_type == "agentMessage" and isinstance(text, str):
+                        phase = completed.item.get("phase")
+                        if phase == "final_answer":
+                            final_output = text
+                        elif phase is None:
+                            fallback_output = text
+                    yield ItemCompleted(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        item_id=item_id,
+                        item_type=item_type,
+                        payload=completed.item,
+                    )
+                    continue
+                if method == "thread/tokenUsage/updated":
+                    usage = _UsageParams.model_validate(params)
+                    if usage.thread_id != thread_id or usage.turn_id != turn_id:
+                        continue
+                    last = usage.token_usage.last
+                    yield TokenUsageUpdated(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        usage=TokenUsage(
+                            input_tokens=last.input_tokens,
+                            output_tokens=last.output_tokens,
+                            cached_input_tokens=last.cached_input_tokens,
+                            reasoning_output_tokens=last.reasoning_output_tokens,
+                        ),
+                    )
+                    continue
+                if method == "error":
+                    error = _ErrorParams.model_validate(params)
+                    if error.thread_id != thread_id or error.turn_id != turn_id:
+                        raise RuntimeProtocolError("received error for an unexpected turn")
+                    yield RuntimeErrorEvent(
+                        message=error.error.message,
+                        retryable=error.will_retry,
+                    )
+                    continue
+                if method == "turn/completed":
+                    completed_turn = _TurnParams.model_validate(params)
+                    self._require_turn(
+                        completed_turn.thread_id, completed_turn.turn, turn_ref
+                    )
+                    status = completed_turn.turn.get("status")
+                    if status not in {"completed", "failed", "interrupted"}:
+                        raise RuntimeProtocolError(
+                            f"unsupported terminal turn status {status!r}"
+                        )
+                    yield TurnCompleted(
+                        turn=turn_ref,
+                        status=status,
+                        output=final_output if final_output is not None else fallback_output,
+                    )
+                    return
+                yield UnknownNotification(method=method, payload=params)
 
-        raise RuntimeProtocolError("App Server notification stream ended before turn/completed")
+            raise RuntimeProtocolError(
+                "App Server notification stream ended before turn/completed"
+            )
+        finally:
+            await notifications.aclose()
 
     def _thread_request(self, request: RunRequest) -> tuple[str, dict[str, Any]]:
         params: dict[str, Any] = {

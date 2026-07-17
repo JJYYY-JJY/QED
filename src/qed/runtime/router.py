@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from .app_server import AppServerRuntime
 from .exec import ExecRuntime
@@ -17,14 +17,28 @@ from .models import (
     TurnRef,
 )
 from .sdk import SdkRuntime
-from .stdio import StdioAppServerTransport, resolve_codex_executable
+from .stdio import (
+    StdioAppServerTransport,
+    probe_codex_version,
+    resolve_codex_executable,
+)
 
 
 class _CapabilityRuntime(Protocol):
     async def probe(self, request: CapabilityRequest) -> RuntimeCapabilities: ...
 
 
+class _ClosableEventStream(Protocol):
+    def __aiter__(self) -> AsyncIterator[RuntimeEvent]: ...
+
+    async def __anext__(self) -> RuntimeEvent: ...
+
+    async def aclose(self) -> None: ...
+
+
 class _TurnRuntime(Protocol):
+    def preflight(self, request: RunRequest) -> None: ...
+
     def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]: ...
 
     async def interrupt(self, turn: TurnRef) -> None: ...
@@ -45,14 +59,25 @@ class RoutedCodexRuntime:
         sdk: _SelectableRuntime,
         app_server: _TurnRuntime,
         exec_runtime: _SelectableRuntime,
+        *,
+        runtime_version: str,
     ) -> None:
         self._capability_runtime = capability_runtime
         self._sdk = sdk
         self._app_server = app_server
         self._exec = exec_runtime
+        self.runtime_version = runtime_version
 
     async def probe(self, request: CapabilityRequest) -> RuntimeCapabilities:
         return await self._capability_runtime.probe(request)
+
+    def preflight(self, request: RunRequest) -> None:
+        if request.effort == "auto":
+            raise ValueError("runtime preflight requires capability-resolved effort")
+        runtime = self._select(request)
+        selected_preflight = getattr(runtime, "preflight", None)
+        if selected_preflight is not None:
+            selected_preflight(request)
 
     async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
         resolved = request
@@ -65,9 +90,14 @@ class RoutedCodexRuntime:
                 )
             )
             resolved = request.model_copy(update={"effort": capability.selected_effort})
+        self.preflight(resolved)
         runtime = self._select(resolved)
-        async for event in runtime.stream(resolved):
-            yield event
+        events = cast(_ClosableEventStream, runtime.stream(resolved))
+        try:
+            async for event in events:
+                yield event
+        finally:
+            await events.aclose()
 
     def _select(self, request: RunRequest) -> _TurnRuntime:
         if request.runtime is RuntimePreference.AUTO:
@@ -102,7 +132,14 @@ class RoutedCodexRuntime:
 
 def create_codex_runtime(executable: str | Path | None = None) -> RoutedCodexRuntime:
     resolved = resolve_codex_executable(executable)
+    runtime_version = probe_codex_version(resolved)
     app_server = AppServerRuntime(StdioAppServerTransport(resolved))
-    sdk = SdkRuntime(capability_runtime=app_server)
+    sdk = SdkRuntime(capability_runtime=app_server, executable=resolved)
     exec_runtime = ExecRuntime(resolved, capability_runtime=app_server)
-    return RoutedCodexRuntime(app_server, sdk, app_server, exec_runtime)
+    return RoutedCodexRuntime(
+        app_server,
+        sdk,
+        app_server,
+        exec_runtime,
+        runtime_version=runtime_version,
+    )

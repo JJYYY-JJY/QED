@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -27,27 +26,52 @@ from qed.runtime import (
 )
 
 
+class FakeNotificationStream:
+    def __init__(self, values: list[dict[str, Any]]) -> None:
+        self._values = iter(values)
+        self.closed = False
+
+    def __aiter__(self) -> FakeNotificationStream:
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        if self.closed:
+            raise StopAsyncIteration
+        try:
+            return next(self._values)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 class FakeTransport:
     def __init__(
         self,
-        responses: dict[str, list[dict[str, Any]]],
+        responses: dict[str, list[dict[str, Any] | BaseException]],
         notifications: list[dict[str, Any]] | None = None,
     ) -> None:
         self.responses = {method: list(pages) for method, pages in responses.items()}
         self.notification_values = notifications or []
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.notifications_sent: list[tuple[str, dict[str, Any]]] = []
+        self.notification_streams: list[FakeNotificationStream] = []
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.requests.append((method, params))
-        return self.responses[method].pop(0)
+        response = self.responses[method].pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     async def notify(self, method: str, params: dict[str, Any]) -> None:
         self.notifications_sent.append((method, params))
 
-    async def notifications(self) -> AsyncIterator[dict[str, Any]]:
-        for notification in self.notification_values:
-            yield notification
+    def notifications(self) -> FakeNotificationStream:
+        stream = FakeNotificationStream(self.notification_values)
+        self.notification_streams.append(stream)
+        return stream
 
     async def close(self) -> None:
         return None
@@ -124,6 +148,47 @@ async def test_probe_pages_models_and_features_without_reordering_efforts() -> N
         ("experimentalFeature/list", {"cursor": None, "limit": 100}),
         ("experimentalFeature/list", {"cursor": "features-2", "limit": 100}),
     ]
+
+
+async def test_stream_closes_notifications_when_thread_start_fails() -> None:
+    transport = FakeTransport({"thread/start": [RuntimeError("thread failed")]})
+    runtime = AppServerRuntime(transport)
+    request = RunRequest(
+        model="gpt-5.6-sol",
+        effort="high",
+        prompt="Return the verdict.",
+        output_schema={"type": "object", "additionalProperties": False},
+    )
+
+    with pytest.raises(RuntimeError, match="thread failed"):
+        await anext(runtime.stream(request))
+
+    assert transport.notification_streams[0].closed
+
+
+async def test_stream_closes_notifications_when_turn_start_fails() -> None:
+    transport = FakeTransport(
+        {
+            "thread/start": [{"thread": {"id": "thread-1"}}],
+            "turn/start": [RuntimeError("turn failed")],
+        }
+    )
+    runtime = AppServerRuntime(transport)
+    request = RunRequest(
+        model="gpt-5.6-sol",
+        effort="high",
+        prompt="Return the verdict.",
+        output_schema={"type": "object", "additionalProperties": False},
+    )
+    events = runtime.stream(request)
+
+    assert await anext(events) == ThreadStarted(
+        thread_id="thread-1", backend=RuntimeBackend.APP_SERVER
+    )
+    with pytest.raises(RuntimeError, match="turn failed"):
+        await anext(events)
+
+    assert transport.notification_streams[0].closed
 
 
 @pytest.mark.parametrize(

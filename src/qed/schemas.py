@@ -319,19 +319,119 @@ class ManifestArtifact(StrictModel):
     relative_path: NonEmptyStr | None = None
 
 
+class ManifestRecord(StrictModel):
+    id: NonEmptyStr
+    sha256: Sha256
+
+
+class ManifestRuntimeResolution(StrictModel):
+    segment_id: NonEmptyStr
+    sha256: Sha256
+    resolution: JsonValue
+
+    @model_validator(mode="after")
+    def validate_resolution_hash(self) -> Self:
+        if canonical_sha256(self.resolution) != self.sha256:
+            raise ValueError("runtime resolution hash does not match resolution")
+        return self
+
+
+class ManifestExecutionSegment(StrictModel):
+    id: NonEmptyStr
+    version: Annotated[int, Field(ge=1)]
+    runtime_version: NonEmptyStr
+    runtime_resolution_sha256: Sha256 | None = None
+    started_at: datetime
+    observed_until: datetime
+    duration_seconds: Annotated[float, Field(ge=0)]
+
+
+class ManifestUsage(StrictModel):
+    input_tokens: Annotated[int, Field(ge=0)] = 0
+    output_tokens: Annotated[int, Field(ge=0)] = 0
+    cached_input_tokens: Annotated[int, Field(ge=0)] = 0
+    reasoning_output_tokens: Annotated[int, Field(ge=0)] = 0
+    turns: Annotated[int, Field(ge=0)] = 0
+    search_queries: Annotated[int, Field(ge=0)] = 0
+    execution_seconds: Annotated[float, Field(ge=0)] = 0
+
+
+class ManifestTurnInput(StrictModel):
+    id: NonEmptyStr
+    role: NonEmptyStr
+    prompt_version: NonEmptyStr
+    output_schema_sha256: Sha256
+    payload_sha256: Sha256
+    payload: dict[str, JsonValue]
+
+    @model_validator(mode="after")
+    def validate_payload_hash(self) -> Self:
+        if canonical_sha256(self.payload) != self.payload_sha256:
+            raise ValueError("turn input payload hash does not match payload")
+        return self
+
+
+class ManifestTurn(StrictModel):
+    thread_id: NonEmptyStr
+    turn_id: NonEmptyStr
+    backend: NonEmptyStr
+    turn_input_id: NonEmptyStr
+
+
+class ManifestThread(StrictModel):
+    id: NonEmptyStr
+    role: NonEmptyStr
+    parent_thread_id: NonEmptyStr | None = None
+    external_thread_id: NonEmptyStr | None = None
+    status: NonEmptyStr
+    provenance: Provenance
+    provenance_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_provenance_hash(self) -> Self:
+        if canonical_sha256(self.provenance) != self.provenance_sha256:
+            raise ValueError("thread provenance hash does not match provenance")
+        return self
+
+
+class ManifestFinding(StrictModel):
+    id: NonEmptyStr
+    report_id: NonEmptyStr
+    finding_id: NonEmptyStr
+    sha256: Sha256
+    severity: NonEmptyStr
+    proof_span: NonEmptyStr | None = None
+    evidence_ids: tuple[NonEmptyStr, ...] = ()
+
+
 class Manifest(StrictModel):
     schema_version: Literal[1] = 1
     run_id: NonEmptyStr
     run_status: RunStatus
+    code_verdict: Literal["PASS"] | None = None
     input_sha256: Sha256
     config_sha256: Sha256
     runtime_version: NonEmptyStr
     prompt_versions: dict[NonEmptyStr, NonEmptyStr] = Field(default_factory=dict)
+    evidence_records: tuple[ManifestRecord, ...] = ()
+    plan_records: tuple[ManifestRecord, ...] = ()
+    candidate_records: tuple[ManifestRecord, ...] = ()
+    verification_records: tuple[ManifestRecord, ...] = ()
+    adjudication_records: tuple[ManifestRecord, ...] = ()
+    decision_records: tuple[ManifestRecord, ...] = ()
+    runtime_resolutions: tuple[ManifestRuntimeResolution, ...] = ()
+    execution_segments: tuple[ManifestExecutionSegment, ...] = ()
+    turn_inputs: tuple[ManifestTurnInput, ...] = ()
+    turns: tuple[ManifestTurn, ...] = ()
+    threads: tuple[ManifestThread, ...] = ()
+    findings: tuple[ManifestFinding, ...] = ()
+    usage: ManifestUsage = Field(default_factory=ManifestUsage)
     candidate_hashes: tuple[Sha256, ...] = ()
     verification_hashes: tuple[Sha256, ...] = ()
     artifacts: tuple[ManifestArtifact, ...] = ()
     first_event_seq: Annotated[int, Field(ge=1)] | None = None
     last_event_seq: Annotated[int, Field(ge=1)] | None = None
+    event_chain_sha256: Sha256 | None = None
     generated_at: datetime
 
     @model_validator(mode="after")

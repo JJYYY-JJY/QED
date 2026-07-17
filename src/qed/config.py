@@ -26,7 +26,7 @@ class ParallelismPolicy(ConfigModel):
     runs: Annotated[int, Field(ge=1, le=32)] = 1
     proof_candidates: Annotated[int, Field(ge=1, le=64)] = 4
     verifiers: Annotated[int, Field(ge=1, le=64)] = 2
-    subagents: Annotated[int, Field(ge=1, le=64)] = 4
+    proactive_multi_agent: bool = True
 
 
 class BudgetPolicy(ConfigModel):

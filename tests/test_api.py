@@ -178,6 +178,12 @@ def test_api_maps_not_found_and_validation_errors_to_safe_envelopes(tmp_path: Pa
     assert invalid.json()["error"]["code"] == "invalid_request"
     assert invalid.json()["error"]["message"] == "Request validation failed."
     assert invalid.json()["error"]["diagnostic_id"].startswith("diag-")
+
+    colon = client.post(
+        "/api/v1/runs",
+        json={"run_id": "bad:run", "run_input": {"problem": "Prove P."}},
+    )
+    assert colon.status_code == 422
     assert invalid_command.status_code == 422
     assert invalid_command.json()["error"]["code"] == "invalid_request"
 

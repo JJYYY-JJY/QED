@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
 from qed.runtime import (
+    RuntimeProtocolError,
     RuntimeRequestTimeout,
     StdioAppServerTransport,
     build_app_server_argv,
+    probe_codex_version,
 )
 
 
@@ -81,6 +84,45 @@ class FakeStdin:
         return None
 
 
+class DelayedInitializeStdin(FakeStdin):
+    def __init__(self, process: FakeProcess) -> None:
+        super().__init__(process)
+        self.initialize_written = asyncio.Event()
+        self._initialize_id: object = None
+
+    def write(self, data: bytes) -> None:
+        message = json.loads(data)
+        if message.get("method") != "initialize":
+            super().write(data)
+            return
+        self.messages.append(message)
+        self._initialize_id = message.get("id")
+        self.initialize_written.set()
+
+    def release(self) -> None:
+        self._reply(self._initialize_id, {"userAgent": "fake"})
+
+
+class StubbornStdin(FakeStdin):
+    def close(self) -> None:
+        return None
+
+
+class StubbornProcess(FakeProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stdin = StubbornStdin(self)
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.finish(-9)
+
+
 def test_app_server_argv_is_absolute_strict_stdio_and_has_no_escape_flags() -> None:
     argv = build_app_server_argv(Path("/opt/codex/bin/codex"))
 
@@ -95,6 +137,22 @@ def test_app_server_argv_is_absolute_strict_stdio_and_has_no_escape_flags() -> N
     assert "danger" not in rendered
     assert "bypass" not in rendered
     assert "full-auto" not in rendered
+
+
+def test_runtime_version_comes_from_the_resolved_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = Path("/opt/codex/bin/codex")
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="codex-cli 1.2.3\n", stderr="")
+
+    monkeypatch.setattr("qed.runtime.stdio.subprocess.run", run)
+
+    assert probe_codex_version(executable) == "codex-cli 1.2.3"
+    assert calls == [(str(executable), "--version")]
 
 
 async def test_stdio_transport_initializes_once_and_broadcasts_notifications() -> None:
@@ -124,6 +182,76 @@ async def test_stdio_transport_initializes_once_and_broadcasts_notifications() -
         "capabilities": {"experimentalApi": False},
     }
     assert await anext(notifications) == {"method": "server/ready", "params": {}}
+
+    await notifications.aclose()
+    await transport.close()
+
+
+async def test_unstarted_notification_stream_aclose_unregisters_subscriber() -> None:
+    transport = StdioAppServerTransport(Path("/opt/codex/bin/codex"))
+    notifications = transport.notifications()
+
+    assert len(transport._subscribers) == 1
+
+    await notifications.aclose()
+
+    assert not transport._subscribers
+
+
+async def test_concurrent_first_requests_wait_for_initialization() -> None:
+    process = FakeProcess()
+    delayed = DelayedInitializeStdin(process)
+    process.stdin = delayed
+
+    async def spawn(argv: tuple[str, ...]) -> FakeProcess:
+        return process
+
+    transport = StdioAppServerTransport(
+        Path("/opt/codex/bin/codex"), process_factory=cast(Any, spawn)
+    )
+    first = asyncio.create_task(transport.request("fast", {}))
+    second = asyncio.create_task(
+        transport.request("model/list", {"cursor": None, "limit": 100})
+    )
+    await delayed.initialize_written.wait()
+    await asyncio.sleep(0)
+
+    assert [message["method"] for message in delayed.messages] == ["initialize"]
+
+    delayed.release()
+    assert await asyncio.gather(first, second) == [
+        {"ok": True},
+        {"data": [], "nextCursor": None},
+    ]
+    assert [message["method"] for message in delayed.messages] == [
+        "initialize",
+        "initialized",
+        "fast",
+        "model/list",
+    ]
+    await transport.close()
+
+
+async def test_notification_subscriber_fails_closed_on_queue_overflow() -> None:
+    process = FakeProcess()
+
+    async def spawn(argv: tuple[str, ...]) -> FakeProcess:
+        return process
+
+    transport = StdioAppServerTransport(
+        Path("/opt/codex/bin/codex"),
+        process_factory=cast(Any, spawn),
+        notification_queue_size=1,
+    )
+    notifications = transport.notifications()
+    await transport.request("model/list", {"cursor": None, "limit": 100})
+    process.stdout.lines.put_nowait(
+        b'{"method":"server/second","params":{}}\n'
+    )
+    await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeProtocolError, match="bounded queue"):
+        await anext(notifications)
 
     await notifications.aclose()
     await transport.close()
@@ -178,3 +306,23 @@ async def test_timed_out_request_late_response_does_not_poison_transport() -> No
 
     assert await transport.request("fast", {}) == {"ok": True}
     await transport.close()
+
+
+async def test_close_escalates_from_terminate_to_kill_with_bounded_waits() -> None:
+    process = StubbornProcess()
+
+    async def spawn(argv: tuple[str, ...]) -> StubbornProcess:
+        return process
+
+    transport = StdioAppServerTransport(
+        Path("/opt/codex/bin/codex"),
+        process_factory=cast(Any, spawn),
+        shutdown_timeout_seconds=0.01,
+    )
+    assert await transport.request("fast", {}) == {"ok": True}
+
+    await asyncio.wait_for(transport.close(), timeout=0.2)
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.returncode == -9

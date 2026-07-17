@@ -44,6 +44,7 @@ def report(
     status: CheckStatus,
     thread_id: str,
     external_thread_id: str | None = None,
+    evidence_ids: tuple[str, ...] = (),
 ) -> VerificationReport:
     check_id = f"check-{kind}-{thread_id}"
     findings = (
@@ -70,6 +71,7 @@ def report(
                 category="correctness",
                 status=status,
                 summary="Independent structured check.",
+                evidence_ids=evidence_ids,
             ),
         ),
         findings=findings,
@@ -258,3 +260,66 @@ def test_citation_report_can_be_required_by_policy() -> None:
 
     assert decision.passed is False
     assert decision.reasons == ("missing:citation",)
+
+
+def test_citation_pass_requires_exact_frozen_evidence_coverage() -> None:
+    proof = candidate()
+    base = (
+        report(
+            proof,
+            kind="structural",
+            status=CheckStatus.PASS,
+            thread_id="structural-thread",
+        ),
+        report(
+            proof,
+            kind="detailed",
+            status=CheckStatus.PASS,
+            thread_id="detailed-thread",
+        ),
+    )
+    missing = decide_candidate(
+        proof,
+        base
+        + (
+            report(
+                proof,
+                kind="citation",
+                status=CheckStatus.PASS,
+                thread_id="citation-thread-missing",
+            ),
+        ),
+        required_evidence_ids=("evidence-1",),
+    )
+    unknown = decide_candidate(
+        proof,
+        base
+        + (
+            report(
+                proof,
+                kind="citation",
+                status=CheckStatus.PASS,
+                thread_id="citation-thread-unknown",
+                evidence_ids=("evidence-1", "evidence-unknown"),
+            ),
+        ),
+        required_evidence_ids=("evidence-1",),
+    )
+    passed = decide_candidate(
+        proof,
+        base
+        + (
+            report(
+                proof,
+                kind="citation",
+                status=CheckStatus.PASS,
+                thread_id="citation-thread-pass",
+                evidence_ids=("evidence-1",),
+            ),
+        ),
+        required_evidence_ids=("evidence-1",),
+    )
+
+    assert "citation_missing_evidence:evidence-1" in missing.reasons
+    assert "citation_unknown_evidence:evidence-unknown" in unknown.reasons
+    assert passed.passed is True

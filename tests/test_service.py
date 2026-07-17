@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from qed.config import QEDConfig
+from qed.config import BudgetPolicy, QEDConfig
 from qed.inputs import RunInput
 from qed.runtime import (
     CapabilityRequest,
@@ -27,7 +27,7 @@ from qed.service import (
     build_service,
 )
 from qed.service_settings import ServiceSettings
-from qed.store import RunStatus, RunStore
+from qed.store import ExecutionToken, RunRecord, RunStatus, RunStore
 from qed.workflow import ResearchWorkflow
 
 
@@ -96,6 +96,69 @@ class ClosingRuntime(BlockingRuntime):
         await super().close()
 
 
+class LateCloseRuntime(BlockingRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.terminal_emitted = asyncio.Event()
+
+    async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
+        self.requests.append(request)
+        turn = TurnRef(
+            thread_id="late-close-thread",
+            turn_id="late-close-turn",
+            backend=RuntimeBackend.MOCK,
+        )
+        self._turn = turn
+        yield ThreadStarted(thread_id=turn.thread_id, backend=RuntimeBackend.MOCK)
+        yield TurnStarted(turn=turn)
+        self.turn_started.set()
+        await self.release.wait()
+        await asyncio.sleep(1.1)
+        self.terminal_emitted.set()
+        yield TurnCompleted(turn=turn, status="interrupted")
+
+
+class BoundedWorkflow:
+    def __init__(self, store: RunStore, delegate: ResearchWorkflow) -> None:
+        self._store = store
+        self._delegate = delegate
+        self.started: list[str] = []
+        self.active = 0
+        self.max_active = 0
+        self.two_started = asyncio.Event()
+        self.three_started = asyncio.Event()
+        self.release: asyncio.Queue[None] = asyncio.Queue()
+
+    def create_run(
+        self,
+        run_input: RunInput,
+        config: QEDConfig,
+        *,
+        run_id: str,
+    ) -> RunRecord:
+        return self._delegate.create_run(run_input, config, run_id=run_id)
+
+    async def execute(self, run_id: str) -> RunRecord:
+        self.started.append(run_id)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if len(self.started) >= 2:
+            self.two_started.set()
+        if len(self.started) >= 3:
+            self.three_started.set()
+        try:
+            await self.release.get()
+            return self._store.get_run(run_id)
+        finally:
+            self.active -= 1
+
+    async def cancel(self, run_id: str) -> RunRecord:
+        return self._store.get_run(run_id)
+
+    async def resume(self, run_id: str, *, idempotency_key: str) -> RunRecord:
+        return await self.execute(run_id)
+
+
 async def test_created_run_is_available_in_list_and_snapshot(tmp_path: Path) -> None:
     runtime = _mock_runtime()
     store = RunStore(tmp_path / "qed.sqlite3")
@@ -113,6 +176,159 @@ async def test_created_run_is_available_in_list_and_snapshot(tmp_path: Path) -> 
     assert service.snapshot(created.id).run == created
 
     await service.close()
+
+
+async def test_configured_run_parallelism_bounds_concurrent_workers(
+    tmp_path: Path,
+) -> None:
+    runtime = _mock_runtime()
+    store = RunStore(tmp_path / "qed.sqlite3")
+    delegate = ResearchWorkflow(store, runtime, runtime_version="test-runtime")
+    workflow = BoundedWorkflow(store, delegate)
+    service = ApplicationService(store=store, workflow=workflow, runtime=runtime)
+    default_config = QEDConfig()
+    config = default_config.model_copy(
+        update={
+            "parallelism": default_config.parallelism.model_copy(
+                update={"runs": 2}
+            )
+        }
+    )
+    runs = tuple(
+        service.create_run(
+            RunInput(problem=f"Prove P{index}."),
+            config,
+            run_id=f"run-bounded-{index}",
+        )
+        for index in range(3)
+    )
+
+    for index, run in enumerate(runs):
+        await service.start_run(run.id, idempotency_key=f"start-bounded-{index}")
+
+    await asyncio.wait_for(workflow.two_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert len(workflow.started) == 2
+    assert workflow.max_active == 2
+
+    workflow.release.put_nowait(None)
+    await asyncio.wait_for(workflow.three_started.wait(), timeout=1)
+    workflow.release.put_nowait(None)
+    workflow.release.put_nowait(None)
+    await asyncio.gather(*(service.wait(run.id) for run in runs))
+
+    assert workflow.max_active == 2
+
+    await service.close()
+
+
+async def test_cancelled_queued_run_never_waits_for_capacity(tmp_path: Path) -> None:
+    runtime = BlockingRuntime()
+    store = RunStore(tmp_path / "qed.sqlite3")
+    workflow = ResearchWorkflow(store, runtime, runtime_version="test-runtime")
+    service = ApplicationService(store=store, workflow=workflow, runtime=runtime)
+    active = service.create_run(
+        RunInput(problem="Prove active P."),
+        QEDConfig(),
+        run_id="run-active",
+    )
+    queued = service.create_run(
+        RunInput(problem="Prove queued Q."),
+        QEDConfig(),
+        run_id="run-queued",
+    )
+
+    await service.start_run(active.id, idempotency_key="start-active")
+    await asyncio.wait_for(runtime.turn_started.wait(), timeout=1)
+    await service.start_run(queued.id, idempotency_key="start-queued")
+
+    receipt = await asyncio.wait_for(
+        service.cancel_run(queued.id, idempotency_key="cancel-queued"),
+        timeout=1,
+    )
+    stopped = await asyncio.wait_for(service.wait(queued.id), timeout=1)
+
+    assert receipt.status is RunStatus.CANCELLED
+    assert stopped.status is RunStatus.CANCELLED
+    assert len(runtime.requests) == 1
+
+    await service.cancel_run(active.id, idempotency_key="cancel-active")
+    await service.close()
+
+
+async def test_service_shutdown_pauses_claimed_run_that_was_still_queued(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "qed.sqlite3"
+    runtime = BlockingRuntime()
+    store = RunStore(database)
+    workflow = ResearchWorkflow(store, runtime, runtime_version="test-runtime")
+    service = ApplicationService(store=store, workflow=workflow, runtime=runtime)
+    active = service.create_run(
+        RunInput(problem="Prove active P."),
+        QEDConfig(),
+        run_id="run-shutdown-active",
+    )
+    queued = service.create_run(
+        RunInput(problem="Prove queued Q."),
+        QEDConfig(),
+        run_id="run-shutdown-queued",
+    )
+    await service.start_run(active.id, idempotency_key="start-shutdown-active")
+    await asyncio.wait_for(runtime.turn_started.wait(), timeout=1)
+    await service.start_run(queued.id, idempotency_key="start-shutdown-queued")
+
+    await service.close()
+
+    with RunStore(database) as reopened:
+        assert reopened.get_run(queued.id).status is RunStatus.PAUSED
+        assert reopened.get_run(queued.id).resumable is True
+
+
+async def test_service_shutdown_pauses_queued_resume_with_execution_history(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "qed.sqlite3"
+    runtime = BlockingRuntime()
+    store = RunStore(database)
+    workflow = ResearchWorkflow(store, runtime, runtime_version="test-runtime")
+    service = ApplicationService(store=store, workflow=workflow, runtime=runtime)
+    active = service.create_run(
+        RunInput(problem="Prove active P."),
+        QEDConfig(),
+        run_id="run-resume-active",
+    )
+    queued = service.create_run(
+        RunInput(problem="Prove queued Q."),
+        QEDConfig(),
+        run_id="run-resume-queued",
+    )
+    store.transition_run(queued.id, RunStatus.RUNNING)
+    lease = store.acquire_execution(
+        queued.id,
+        segment_id="segment-resume-history",
+        worker_id="historical-worker",
+        lease_token="historical-secret",
+    )
+    token = ExecutionToken(
+        segment_id=lease.id,
+        version=lease.version,
+        lease_token="historical-secret",
+    )
+    store.transition_run(queued.id, RunStatus.FAILED, execution=token)
+    store.release_execution(token)
+
+    await service.start_run(active.id, idempotency_key="start-resume-active")
+    await asyncio.wait_for(runtime.turn_started.wait(), timeout=1)
+    await service.resume_run(queued.id, idempotency_key="resume-queued")
+
+    await service.close()
+
+    with RunStore(database) as reopened:
+        paused = reopened.get_run(queued.id)
+        assert paused.status is RunStatus.PAUSED
+        assert paused.resumable is True
 
 
 async def test_service_uses_only_the_explicit_runtime_factory_and_closes_once(
@@ -138,6 +354,27 @@ async def test_service_uses_only_the_explicit_runtime_factory_and_closes_once(
 
     assert calls == 1
     assert runtime.close_count == 1
+
+
+async def test_service_close_drains_late_terminal_before_closing_store(
+    tmp_path: Path,
+) -> None:
+    runtime = LateCloseRuntime()
+    store = RunStore(tmp_path / "qed.sqlite3")
+    workflow = ResearchWorkflow(store, runtime, runtime_version="test-runtime")
+    service = ApplicationService(store=store, workflow=workflow, runtime=runtime)
+    limited = QEDConfig(budgets=BudgetPolicy(stage_seconds=1))
+    run = service.create_run(
+        RunInput(problem="Prove P."),
+        limited,
+        run_id="run-late-close",
+    )
+    await service.start_run(run.id, idempotency_key="start-late-close")
+    await asyncio.wait_for(runtime.turn_started.wait(), timeout=1)
+
+    await service.close()
+
+    assert runtime.terminal_emitted.is_set()
 
 
 async def test_start_is_idempotent_for_one_key_and_rejects_a_second_worker(
@@ -206,6 +443,90 @@ async def test_failed_run_resume_is_scheduled_once_and_increments_durable_count(
     assert failed_again.status is RunStatus.FAILED
     assert failed_again.resume_count == 1
 
+    await service.close()
+
+
+async def test_resume_receipt_replays_from_sqlite_before_state_precondition(
+    tmp_path: Path,
+) -> None:
+    runtime = _mock_runtime()
+    store = RunStore(tmp_path / "qed.sqlite3")
+    workflow = ResearchWorkflow(store, runtime, runtime_version="test-runtime")
+    workflow.create_run(
+        RunInput(problem="Prove P."),
+        QEDConfig(),
+        run_id="run-durable-resume",
+    )
+    store.transition_run("run-durable-resume", RunStatus.RUNNING)
+    store.transition_run("run-durable-resume", RunStatus.FAILED)
+    command = store.resume_run_command(
+        "run-durable-resume",
+        idempotency_key="resume-durable-1",
+    )
+    store.transition_run("run-durable-resume", RunStatus.FAILED)
+    service = ApplicationService(store=store, workflow=workflow, runtime=runtime)
+
+    receipt = await service.resume_run(
+        "run-durable-resume",
+        idempotency_key="resume-durable-1",
+    )
+
+    assert command.accepted_status is RunStatus.FAILED
+    assert receipt.status is RunStatus.FAILED
+    assert service.get_run("run-durable-resume").resume_count == 1
+    assert await service.wait("run-durable-resume") == service.get_run(
+        "run-durable-resume"
+    )
+
+    await service.close()
+
+
+async def test_replayed_cancel_key_cannot_cancel_a_later_execution(
+    tmp_path: Path,
+) -> None:
+    runtime = _mock_runtime()
+    store = RunStore(tmp_path / "qed.sqlite3")
+    workflow = ResearchWorkflow(store, runtime, runtime_version="test-runtime")
+    workflow.create_run(
+        RunInput(problem="Prove P."),
+        QEDConfig(),
+        run_id="run-cancel-replay",
+    )
+    original = store.cancel_run_command(
+        "run-cancel-replay",
+        idempotency_key="cancel-stable-1",
+    )
+    store.acknowledge_cancel("run-cancel-replay")
+    store.resume_run_command(
+        "run-cancel-replay",
+        idempotency_key="resume-after-cancel-1",
+    )
+    execution = store.acquire_execution(
+        "run-cancel-replay",
+        segment_id="segment-later",
+        worker_id="worker-later",
+        lease_token="later-secret",
+        lease_seconds=60,
+        runtime_version="test-runtime",
+    )
+    service = ApplicationService(store=store, workflow=workflow, runtime=runtime)
+
+    receipt = await service.cancel_run(
+        "run-cancel-replay",
+        idempotency_key="cancel-stable-1",
+    )
+
+    assert original.accepted_status is RunStatus.CREATED
+    assert receipt.status is RunStatus.CANCELLED
+    assert service.get_run("run-cancel-replay").status is RunStatus.RUNNING
+
+    store.release_execution(
+        ExecutionToken(
+            segment_id=execution.id,
+            version=execution.version,
+            lease_token="later-secret",
+        )
+    )
     await service.close()
 
 

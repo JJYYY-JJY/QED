@@ -173,7 +173,9 @@ def _snapshot(
 
         reports: list[VerificationReport] = []
         report_kinds: tuple[VerificationKind, ...] = (
-            ("structural", "detailed", "citation") if evidence_ids else ("structural", "detailed")
+            "structural",
+            "detailed",
+            "citation",
         )
         for kind in report_kinds:
             thread_id = f"thread-{kind}"
@@ -210,11 +212,7 @@ def _snapshot(
                 created_at=NOW,
             ),
         )
-        store.record_decision(
-            "run-1",
-            "candidate-1",
-            require_citation=bool(evidence_ids),
-        )
+        store.record_decision("run-1", "candidate-1")
         store.transition_stage("run-1", RunStage.EXPORT)
         if complete:
             for kind in ("proof", "report", "manifest"):
@@ -265,12 +263,13 @@ def test_builds_a_deterministic_verified_bundle(tmp_path) -> None:
     assert snapshot.run.status is RunStatus.RUNNING
     assert manifest["run_id"] == "run-1"
     assert manifest["run_status"] == "completed"
+    assert manifest["code_verdict"] == "PASS"
     assert manifest["input_sha256"] == snapshot.run_input.sha256
     assert manifest["config_sha256"] == QEDConfig().sha256
     assert manifest["runtime_version"] == "0.144.5"
     assert manifest["generated_at"] == "2026-07-16T13:00:00Z"
     assert manifest["first_event_seq"] == 1
-    assert manifest["last_event_seq"] == 27
+    assert manifest["last_event_seq"] == 29
     assert manifest["prompt_versions"] == {
         "adjudication:adjudication-1": "adjudication-v1",
         "candidate:candidate-1": "proof-v2",
@@ -289,6 +288,47 @@ def test_builds_a_deterministic_verified_bundle(tmp_path) -> None:
             key=lambda record: (record.kind, record.id),
         )
     ]
+    assert manifest["evidence_records"] == [
+        {"id": "evidence-1", "sha256": canonical_sha256(snapshot.evidence[0])}
+    ]
+    assert manifest["plan_records"] == [
+        {"id": "plan-1", "sha256": canonical_sha256(snapshot.plans[0])}
+    ]
+    assert manifest["candidate_records"] == [
+        {
+            "id": "candidate-1",
+            "sha256": snapshot.candidates[0].candidate_sha256,
+        }
+    ]
+    assert [item["id"] for item in manifest["verification_records"]] == [
+        "report-citation",
+        "report-detailed",
+        "report-structural",
+    ]
+    assert manifest["adjudication_records"] == [
+        {
+            "id": "adjudication-1",
+            "sha256": canonical_sha256(snapshot.adjudications[0]),
+        }
+    ]
+    assert manifest["decision_records"] == [
+        {
+            "id": "candidate-1",
+            "sha256": canonical_sha256(snapshot.decisions[0]),
+        }
+    ]
+    assert manifest["runtime_resolutions"] == []
+    assert manifest["execution_segments"] == []
+    assert manifest["usage"] == {
+        "cached_input_tokens": 0,
+        "execution_seconds": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "search_queries": 0,
+        "turns": 0,
+    }
+    assert len(manifest["event_chain_sha256"]) == 64
     assert [artifact["relative_path"] for artifact in manifest["artifacts"]] == [
         "proof.md",
         "report.md",
@@ -356,17 +396,19 @@ def test_refuses_missing_or_failed_required_reports(tmp_path) -> None:
         )
 
 
-def test_requires_citation_exactly_when_candidate_uses_evidence(tmp_path) -> None:
-    no_evidence = _snapshot(tmp_path, evidence_ids=())
+def test_requires_citation_from_frozen_ledger_when_candidate_omits_evidence_ids(
+    tmp_path,
+) -> None:
+    omitted_ids = _snapshot(tmp_path, evidence_ids=())
 
     bundle = build_export_bundle(
-        no_evidence,
+        omitted_ids,
         candidate_id="candidate-1",
         generated_at=GENERATED_AT,
     )
 
-    assert "Required reports: `structural`, `detailed`" in bundle.report_md
-    assert "## Citation" not in bundle.report_md
+    assert "Required reports: `structural`, `detailed`, `citation`" in bundle.report_md
+    assert "## Citation" in bundle.report_md
 
 
 def test_refuses_an_unsealed_candidate(tmp_path) -> None:
@@ -488,7 +530,8 @@ def test_completed_run_can_rebuild_its_terminal_manifest(tmp_path) -> None:
     assert snapshot.run.stage is RunStage.COMPLETE
     assert snapshot.run.status is RunStatus.COMPLETED
     assert bundle.manifest.run_status == "completed"
-    assert bundle.manifest.last_event_seq == 32
+    assert bundle.manifest.code_verdict == "PASS"
+    assert bundle.manifest.last_event_seq == 34
 
 
 def test_refuses_missing_reused_or_writer_external_verifier_identities(tmp_path) -> None:

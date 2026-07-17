@@ -72,7 +72,7 @@ class RestrictedNetworkPolicy(_FrozenModel):
     @classmethod
     def validate_restricted_domains(cls, domains: tuple[str, ...]) -> tuple[str, ...]:
         domain_pattern = re.compile(
-            r"(?:\*\.)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
+            r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
             r"[a-zA-Z]{2,63}"
         )
         if any(domain == "*" or domain_pattern.fullmatch(domain) is None for domain in domains):
@@ -96,13 +96,16 @@ class RunRequest(_FrozenModel):
 
     @model_validator(mode="after")
     def validate_network_controls(self) -> Self:
-        if self.role is WorkRole.VERIFIER and (
+        if self.role in {WorkRole.VERIFIER, WorkRole.CITATION} and (
             not isinstance(self.thread, FreshThread)
             or self.sandbox is not SandboxMode.READ_ONLY
-            or self.web_search is not WebSearchMode.DISABLED
+        ):
+            raise ValueError("verification turns must be fresh and read-only")
+        if self.role is WorkRole.VERIFIER and (
+            self.web_search is not WebSearchMode.DISABLED
             or self.command_network is not None
         ):
-            raise ValueError("verifier turns must be fresh, read-only, and offline")
+            raise ValueError("structural and detailed verifiers must be offline")
         network_roles = {WorkRole.LITERATURE, WorkRole.CITATION}
         if self.web_search is not WebSearchMode.DISABLED and self.role not in network_roles:
             raise ValueError("web search is limited to literature and citation turns")
@@ -151,15 +154,18 @@ def resolve_capability(
     if request.model != model.model:
         raise ValueError(f"model catalog returned {model.model!r}, expected {request.model!r}")
 
-    proactive = request.proactive and multi_agent
+    proactive_available = (
+        request.proactive and multi_agent and "ultra" in model.advertised_efforts
+    )
     if request.effort == "auto":
-        selected = model.advertised_efforts[-1] if proactive else model.default_effort
+        selected = "ultra" if proactive_available else model.default_effort
     elif request.effort in model.advertised_efforts:
         selected = request.effort
     else:
         raise ValueError(
             f"effort {request.effort!r} is not advertised for model {request.model!r}"
         )
+    proactive = proactive_available and selected == "ultra"
 
     return RuntimeCapabilities(
         model=model.model,

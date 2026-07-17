@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "run_id": "sample-odd-square",
+  "run_input": {
+    "schema_version": 1,
+    "problem": "Prove that the square of every odd integer is congruent to 1 modulo 8.",
+    "prove_guidance": "Use an explicit integer parameterization of an odd integer.",
+    "verification_rules": [
+      "Check every divisibility claim."
+    ]
+  },
+  "config": {
+    "schema_version": 1,
+    "model": "gpt-5.6-sol",
+    "effort": "auto",
+    "backend": "auto",
+    "parallelism": {
+      "runs": 1,
+      "proof_candidates": 4,
+      "verifiers": 2,
+      "proactive_multi_agent": true
+    },
+    "budgets": {
+      "run_seconds": 7200,
+      "stage_seconds": 1800,
+      "max_tokens": 250000,
+      "proof_attempts": 8,
+      "plan_revisions": 2,
+      "strategy_rewrites": 2,
+      "turn_retries": 2
+    },
+    "search": {
+      "enabled": true,
+      "allowed_roles": [
+        "literature",
+        "citation"
+      ],
+      "max_queries_per_stage": 20
+    },
+    "sandbox": {
+      "literature": "read-only",
+      "planner": "read-only",
+      "prover": "read-only",
+      "verifier": "read-only",
+      "adjudicator": "read-only",
+      "approval": "never"
+    }
+  }
+}

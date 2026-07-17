@@ -39,6 +39,7 @@ from .stdio import (
     RuntimeRequestTimeout,
     StdioAppServerTransport,
     build_app_server_argv,
+    probe_codex_version,
     resolve_codex_executable,
 )
 
@@ -78,6 +79,7 @@ __all__ = [
     "WebSearchMode",
     "WorkRole",
     "build_app_server_argv",
+    "probe_codex_version",
     "build_exec_argv",
     "create_codex_runtime",
     "resolve_capability",

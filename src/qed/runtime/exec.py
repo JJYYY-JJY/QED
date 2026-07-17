@@ -165,9 +165,14 @@ class ExecRuntime:
             raise RuntimeError("codex exec does not expose the required paged capability probe")
         return await self._capability_runtime.probe(request)
 
-    async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
+    def preflight(self, request: RunRequest) -> None:
         if not self.supports(request):
-            raise ValueError("requested controls are not representable by codex exec fallback")
+            raise ValueError(
+                "requested controls are not representable by codex exec fallback"
+            )
+
+    async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
+        self.preflight(request)
         cwd = request.cwd if request.cwd is not None else Path.cwd()
         final_output: str | None = None
         turn: TurnRef | None = None

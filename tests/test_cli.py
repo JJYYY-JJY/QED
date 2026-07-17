@@ -63,7 +63,7 @@ def test_init_creates_managed_sqlite_store(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["journal_mode"] == "wal"
     assert (data_root / "qed.sqlite3").is_file()
 
@@ -103,14 +103,29 @@ def test_help_exposes_required_operational_commands() -> None:
         assert command in result.stdout
 
 
-def test_mock_run_is_explicit_and_returns_execution_failure(tmp_path: Path) -> None:
+def test_mock_run_completes_and_exports_a_reproducible_bundle(tmp_path: Path) -> None:
     result = _RUNNER.invoke(
         app,
-        ["run", "Prove P.", "--runtime", "mock", "--data-root", str(tmp_path)],
+        [
+            "run",
+            "Prove P.",
+            "--run-id",
+            "run-mock-e2e",
+            "--runtime",
+            "mock",
+            "--data-root",
+            str(tmp_path),
+        ],
     )
 
-    assert result.exit_code == 5, result.output
-    assert json.loads(result.stdout)["run"]["status"] == "failed"
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["run"]["status"] == "completed"
+    exported = tuple((tmp_path / "exports" / "run-mock-e2e").glob("*/*"))
+    assert {path.name for path in exported} == {
+        "manifest.json",
+        "proof.md",
+        "report.md",
+    }
 
 
 def test_cancel_and_resume_commands_share_durable_service_state(tmp_path: Path) -> None:
@@ -129,8 +144,10 @@ def test_cancel_and_resume_commands_share_durable_service_state(tmp_path: Path) 
 
     assert cancelled.exit_code == 0, cancelled.output
     assert json.loads(cancelled.stdout)["status"] == "cancelled"
-    assert resumed.exit_code == 5, resumed.output
-    assert json.loads(resumed.stdout)["run"]["resume_count"] == 1
+    assert resumed.exit_code == 0, resumed.output
+    resumed_run = json.loads(resumed.stdout)["run"]
+    assert resumed_run["resume_count"] == 1
+    assert resumed_run["status"] == "completed"
 
 
 def test_serve_rejects_non_loopback_bind_without_bearer_token(tmp_path: Path) -> None:

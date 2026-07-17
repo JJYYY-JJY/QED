@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import re
 import stat
@@ -15,17 +16,28 @@ from types import MappingProxyType
 
 from qed.decision import CandidateDecision, CandidateIntegrityError, decide_candidate
 from qed.schemas import (
+    Event,
     Manifest,
     ManifestArtifact,
+    ManifestExecutionSegment,
+    ManifestFinding,
+    ManifestRecord,
+    ManifestRuntimeResolution,
+    ManifestThread,
+    ManifestTurn,
+    ManifestTurnInput,
+    ManifestUsage,
     canonical_json,
     canonical_sha256,
     sha256_text,
 )
 from qed.store import (
     CandidateRecord,
+    ExecutionLease,
     RunSnapshot,
     RunStage,
     RunStatus,
+    RuntimeResolutionRecord,
     ThreadRole,
     ThreadStatus,
     VerificationRecord,
@@ -340,6 +352,35 @@ def _verify_snapshot(
     if snapshot.events[-1].stage != run.stage.value:
         raise ExportIntegrityError("terminal event stage does not match run stage")
 
+    resolutions = {item.segment_id: item for item in snapshot.runtime_resolutions}
+    if len(resolutions) != len(snapshot.runtime_resolutions):
+        raise ExportIntegrityError("snapshot contains duplicate runtime resolutions")
+    for segment in snapshot.execution_segments:
+        if segment.runtime_version is None:
+            raise ExportIntegrityError(
+                f"execution segment has no runtime version: {segment.id}"
+            )
+        resolution = resolutions.get(segment.id)
+        if segment.runtime_resolution_sha256 is None:
+            if resolution is not None:
+                raise ExportIntegrityError(
+                    f"unresolved execution has a runtime resolution: {segment.id}"
+                )
+            continue
+        if resolution is None or resolution.run_id != run.id or (
+            resolution.resolution_sha256 != segment.runtime_resolution_sha256
+        ):
+            raise ExportIntegrityError(
+                f"execution runtime resolution is missing or mismatched: {segment.id}"
+            )
+    resolved_segment_ids = {
+        segment.id
+        for segment in snapshot.execution_segments
+        if segment.runtime_resolution_sha256 is not None
+    }
+    if set(resolutions) != resolved_segment_ids:
+        raise ExportIntegrityError("runtime resolution references an unknown execution")
+
 
 def _render_proof(candidate: CandidateRecord) -> str:
     frozen = candidate.candidate
@@ -360,7 +401,7 @@ def _render_report(
     frozen = candidate.candidate
     required = (
         ("structural", "detailed", "citation")
-        if frozen.evidence_ids
+        if snapshot.evidence
         else (
             "structural",
             "detailed",
@@ -407,6 +448,10 @@ def _render_report(
                     f"- **{finding.severity.upper()}** `{finding.id}`: "
                     f"{finding.summary} — {finding.detail}"
                 )
+                if finding.proof_span is not None:
+                    lines.append(f"  - Proof span: {finding.proof_span}")
+                if finding.evidence_ids:
+                    lines.append("  - Evidence: " + ", ".join(finding.evidence_ids))
     return "\n".join(lines) + "\n"
 
 
@@ -420,30 +465,221 @@ def _prompt_versions(
     if run_version is not None:
         versions[f"run:{snapshot.run.id}"] = run_version
 
-    plan = next(plan for plan in snapshot.plans if plan.id == candidate.plan_id)
-    plan_version = plan.provenance.prompt_version
-    if plan_version is not None:
-        versions[f"plan:{plan.id}"] = plan_version
-    evidence_ids = {evidence_id for step in plan.steps for evidence_id in step.evidence_ids} | set(
-        candidate.candidate.evidence_ids
-    )
+    for plan in snapshot.plans:
+        version = plan.provenance.prompt_version
+        if version is not None:
+            versions[f"plan:{plan.id}"] = version
     for evidence in snapshot.evidence:
         version = evidence.provenance.prompt_version
-        if evidence.id in evidence_ids and version is not None:
+        if version is not None:
             versions[f"evidence:{evidence.id}"] = version
 
-    candidate_version = candidate.candidate.provenance.prompt_version
-    if candidate_version is not None:
-        versions[f"candidate:{candidate.id}"] = candidate_version
-    for record in reports:
-        version = record.report.provenance.prompt_version
+    for candidate_record in snapshot.candidates:
+        version = candidate_record.candidate.provenance.prompt_version
         if version is not None:
-            versions[f"verification:{record.id}"] = version
-    adjudication = snapshot.adjudications[-1]
-    adjudication_version = adjudication.provenance.prompt_version
-    if adjudication_version is not None:
-        versions[f"adjudication:{adjudication.id}"] = adjudication_version
+            versions[f"candidate:{candidate_record.id}"] = version
+    for verification_record in snapshot.verifications:
+        version = verification_record.report.provenance.prompt_version
+        if version is not None:
+            versions[f"verification:{verification_record.id}"] = version
+    for adjudication in snapshot.adjudications:
+        version = adjudication.provenance.prompt_version
+        if version is not None:
+            versions[f"adjudication:{adjudication.id}"] = version
     return versions
+
+
+def _manifest_window(
+    snapshot: RunSnapshot,
+    generated_at: datetime,
+) -> tuple[
+    tuple[Event, ...],
+    tuple[ExecutionLease, ...],
+    tuple[RuntimeResolutionRecord, ...],
+    datetime,
+]:
+    intents = tuple(
+        output
+        for output in snapshot.stage_outputs
+        if output.kind == "export_intent"
+        and isinstance(output.content, dict)
+        and output.content.get("generated_at") == generated_at.isoformat()
+    )
+    if not intents:
+        return (
+            snapshot.events,
+            snapshot.execution_segments,
+            snapshot.runtime_resolutions,
+            generated_at,
+        )
+    intent = intents[-1]
+    marker = next(
+        (
+            event
+            for event in snapshot.events
+            if event.event_type == "stage.output_created"
+            and event.payload.get("output_id") == intent.id
+        ),
+        None,
+    )
+    if marker is None:
+        raise ExportIntegrityError("export intent has no durable event marker")
+    events = tuple(event for event in snapshot.events if event.seq <= marker.seq)
+    segments = tuple(
+        segment
+        for segment in snapshot.execution_segments
+        if segment.created_at <= intent.created_at
+    )
+    segment_ids = {segment.id for segment in segments}
+    resolutions = tuple(
+        item
+        for item in snapshot.runtime_resolutions
+        if item.segment_id in segment_ids
+    )
+    return events, segments, resolutions, intent.created_at
+
+
+def _event_chain_sha256(events: tuple[Event, ...]) -> str:
+    digest = hashlib.sha256()
+    for event in events:
+        digest.update(canonical_json(event).encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _manifest_usage(
+    events: tuple[Event, ...],
+    segments: tuple[ExecutionLease, ...],
+    observed_at: datetime,
+) -> ManifestUsage:
+    usage_by_turn: dict[tuple[str, str], tuple[int, int, int, int]] = {}
+    search_queries = 0
+    for event in events:
+        if event.event_type == "runtime.token_usage":
+            thread_id = event.payload.get("thread_id")
+            turn_id = event.payload.get("turn_id")
+            usage = event.payload.get("usage")
+            input_tokens = usage.get("input_tokens") if isinstance(usage, dict) else None
+            output_tokens = (
+                usage.get("output_tokens") if isinstance(usage, dict) else None
+            )
+            cached_input_tokens = (
+                usage.get("cached_input_tokens") if isinstance(usage, dict) else None
+            )
+            reasoning_output_tokens = (
+                usage.get("reasoning_output_tokens")
+                if isinstance(usage, dict)
+                else None
+            )
+            if (
+                not isinstance(thread_id, str)
+                or not isinstance(turn_id, str)
+                or not isinstance(usage, dict)
+                or type(input_tokens) is not int
+                or type(output_tokens) is not int
+                or type(cached_input_tokens) is not int
+                or type(reasoning_output_tokens) is not int
+                or input_tokens < 0
+                or output_tokens < 0
+                or cached_input_tokens < 0
+                or reasoning_output_tokens < 0
+            ):
+                raise ExportIntegrityError("runtime token usage event is malformed")
+            usage_by_turn[(thread_id, turn_id)] = (
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                reasoning_output_tokens,
+            )
+        if (
+            event.event_type == "runtime.item_completed"
+            and event.payload.get("counts_as_search_query") is True
+        ):
+            search_queries += 1
+
+    execution_seconds = 0.0
+    for segment in segments:
+        observed_until = min(
+            segment.released_at or observed_at,
+            segment.lease_expires_at,
+            observed_at,
+        )
+        duration = (observed_until - segment.created_at).total_seconds()
+        if duration < 0:
+            raise ExportIntegrityError(
+                f"execution segment has an invalid duration: {segment.id}"
+            )
+        execution_seconds += duration
+    return ManifestUsage(
+        input_tokens=sum(item[0] for item in usage_by_turn.values()),
+        output_tokens=sum(item[1] for item in usage_by_turn.values()),
+        cached_input_tokens=sum(item[2] for item in usage_by_turn.values()),
+        reasoning_output_tokens=sum(item[3] for item in usage_by_turn.values()),
+        turns=len(usage_by_turn),
+        search_queries=search_queries,
+        execution_seconds=execution_seconds,
+    )
+
+
+def _manifest_execution_segments(
+    segments: tuple[ExecutionLease, ...],
+    observed_at: datetime,
+) -> tuple[ManifestExecutionSegment, ...]:
+    records: list[ManifestExecutionSegment] = []
+    for segment in segments:
+        if segment.runtime_version is None:
+            raise ExportIntegrityError(
+                f"execution segment has no runtime version: {segment.id}"
+            )
+        observed_until = min(
+            segment.released_at or observed_at,
+            segment.lease_expires_at,
+            observed_at,
+        )
+        duration = (observed_until - segment.created_at).total_seconds()
+        if duration < 0:
+            raise ExportIntegrityError(
+                f"execution segment has an invalid duration: {segment.id}"
+            )
+        records.append(
+            ManifestExecutionSegment(
+                id=segment.id,
+                version=segment.version,
+                runtime_version=segment.runtime_version,
+                runtime_resolution_sha256=segment.runtime_resolution_sha256,
+                started_at=segment.created_at,
+                observed_until=observed_until,
+                duration_seconds=duration,
+            )
+        )
+    return tuple(records)
+
+
+def _manifest_turns(events: tuple[Event, ...]) -> tuple[ManifestTurn, ...]:
+    turns: list[ManifestTurn] = []
+    for event in events:
+        if event.event_type != "runtime.turn_started":
+            continue
+        thread_id = event.payload.get("thread_id")
+        turn_id = event.payload.get("turn_id")
+        backend = event.payload.get("backend")
+        turn_input_id = event.payload.get("turn_input_id")
+        if (
+            not isinstance(thread_id, str)
+            or not isinstance(turn_id, str)
+            or not isinstance(backend, str)
+            or not isinstance(turn_input_id, str)
+        ):
+            raise ExportIntegrityError("runtime turn event has incomplete provenance")
+        turns.append(
+            ManifestTurn(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                backend=backend,
+                turn_input_id=turn_input_id,
+            )
+        )
+    return tuple(turns)
 
 
 def _verify_acceptance(
@@ -503,7 +739,8 @@ def build_export_bundle(
         decision = decide_candidate(
             candidate.candidate,
             tuple(record.report for record in reports),
-            require_citation=bool(candidate.candidate.evidence_ids),
+            require_citation=bool(snapshot.evidence),
+            required_evidence_ids=tuple(item.id for item in snapshot.evidence),
         )
     except CandidateIntegrityError as error:
         raise ExportIntegrityError(str(error)) from error
@@ -514,15 +751,116 @@ def build_export_bundle(
 
     proof_md = _render_proof(candidate)
     report_md = _render_report(snapshot, candidate, reports)
+    manifest_events, manifest_segments, manifest_resolutions, observed_at = (
+        _manifest_window(snapshot, generated_at)
+    )
+    manifest_turns = _manifest_turns(manifest_events)
+    selected_turn_inputs = {turn.turn_input_id for turn in manifest_turns}
     manifest = Manifest(
         run_id=snapshot.run.id,
-        run_status="completed",
+        run_status=RunStatus.COMPLETED.value,
+        code_verdict="PASS",
         input_sha256=snapshot.run.input_sha256,
         config_sha256=snapshot.run.config_sha256,
         runtime_version=snapshot.run.runtime_version,
         prompt_versions=_prompt_versions(snapshot, candidate, reports),
-        candidate_hashes=(candidate.candidate_sha256,),
-        verification_hashes=tuple(record.report_sha256 for record in reports),
+        evidence_records=tuple(
+            ManifestRecord(id=item.id, sha256=canonical_sha256(item))
+            for item in sorted(snapshot.evidence, key=lambda item: item.id)
+        ),
+        plan_records=tuple(
+            ManifestRecord(id=item.id, sha256=canonical_sha256(item))
+            for item in sorted(snapshot.plans, key=lambda item: item.id)
+        ),
+        candidate_records=tuple(
+            ManifestRecord(id=item.id, sha256=item.candidate_sha256)
+            for item in sorted(snapshot.candidates, key=lambda item: (item.attempt, item.id))
+        ),
+        verification_records=tuple(
+            ManifestRecord(id=item.id, sha256=item.report_sha256)
+            for item in sorted(
+                snapshot.verifications,
+                key=lambda item: (item.candidate_id, item.kind, item.id),
+            )
+        ),
+        adjudication_records=tuple(
+            ManifestRecord(id=item.id, sha256=canonical_sha256(item))
+            for item in sorted(snapshot.adjudications, key=lambda item: item.id)
+        ),
+        decision_records=tuple(
+            ManifestRecord(id=item.candidate_id, sha256=canonical_sha256(item))
+            for item in sorted(snapshot.decisions, key=lambda item: item.candidate_id)
+        ),
+        runtime_resolutions=tuple(
+            ManifestRuntimeResolution(
+                segment_id=item.segment_id,
+                sha256=item.resolution_sha256,
+                resolution=item.resolution,
+            )
+            for item in sorted(
+                manifest_resolutions,
+                key=lambda item: (item.created_at, item.segment_id),
+            )
+        ),
+        execution_segments=_manifest_execution_segments(
+            manifest_segments,
+            observed_at,
+        ),
+        turn_inputs=tuple(
+            ManifestTurnInput(
+                id=item.id,
+                role=item.role,
+                prompt_version=item.prompt_version,
+                output_schema_sha256=item.output_schema_sha256,
+                payload_sha256=item.payload_sha256,
+                payload=item.payload,
+            )
+            for item in sorted(snapshot.turn_inputs, key=lambda item: item.id)
+            if item.id in selected_turn_inputs
+        ),
+        turns=manifest_turns,
+        threads=tuple(
+            ManifestThread(
+                id=item.id,
+                role=item.role.value,
+                parent_thread_id=item.parent_thread_id,
+                external_thread_id=item.external_thread_id,
+                status=item.status.value,
+                provenance=item.provenance,
+                provenance_sha256=item.provenance_sha256,
+            )
+            for item in sorted(snapshot.threads, key=lambda item: item.id)
+            if item.created_at <= observed_at
+        ),
+        findings=tuple(
+            ManifestFinding(
+                id=f"{record.id}:{finding.id}",
+                report_id=record.id,
+                finding_id=finding.id,
+                sha256=canonical_sha256(finding),
+                severity=finding.severity,
+                proof_span=finding.proof_span,
+                evidence_ids=finding.evidence_ids,
+            )
+            for record in sorted(snapshot.verifications, key=lambda item: item.id)
+            for finding in sorted(record.report.findings, key=lambda item: item.id)
+        ),
+        usage=_manifest_usage(
+            manifest_events,
+            manifest_segments,
+            observed_at,
+        ),
+        candidate_hashes=tuple(
+            item.candidate_sha256
+            for item in sorted(snapshot.candidates, key=lambda item: (item.attempt, item.id))
+        ),
+        verification_hashes=tuple(
+            item.report_sha256
+            for item in sorted(
+                snapshot.verifications,
+                key=lambda item: (item.candidate_id, item.kind, item.id),
+            )
+        ),
         artifacts=(
             ManifestArtifact(
                 id="proof",
@@ -539,8 +877,9 @@ def build_export_bundle(
                 relative_path="report.md",
             ),
         ),
-        first_event_seq=snapshot.events[0].seq,
-        last_event_seq=snapshot.events[-1].seq,
+        first_event_seq=manifest_events[0].seq,
+        last_event_seq=manifest_events[-1].seq,
+        event_chain_sha256=_event_chain_sha256(manifest_events),
         generated_at=generated_at,
     )
     manifest_json = f"{canonical_json(manifest)}\n"

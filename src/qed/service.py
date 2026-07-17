@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import suppress
 from datetime import UTC, datetime
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,7 +21,7 @@ from qed.runtime import CodexRuntime, MockRuntime, RuntimeCapabilities
 from qed.schemas import Event
 from qed.service_settings import ServiceSettings
 from qed.store import (
-    InvalidTransitionError,
+    ConflictError,
     RunRecord,
     RunSnapshot,
     RunStatus,
@@ -53,19 +53,30 @@ class WorkflowService(Protocol):
     async def resume(self, run_id: str, *, idempotency_key: str) -> RunRecord: ...
 
 
-def _published_runtime_version() -> str:
-    try:
-        sdk_version = version("openai-codex")
-    except PackageNotFoundError:
-        sdk_version = "unknown"
-    try:
-        cli_version = version("openai-codex-cli-bin")
-    except PackageNotFoundError:
-        cli_version = "unknown"
-    return f"openai-codex/{sdk_version};codex-cli/{cli_version}"
-
-
 def _default_mock_runtime() -> MockRuntime:
+    def verification_response(request: Any) -> dict[str, Any]:
+        evidence_ids: list[str] = []
+        if request.role.value == "citation":
+            start = request.prompt.index('<frozen-input encoding="canonical-json">')
+            start = request.prompt.index("\n", start) + 1
+            end = request.prompt.index("\n</frozen-input>", start)
+            payload = json.loads(request.prompt[start:end])
+            evidence_ids = [item["id"] for item in payload["evidence"]]
+        return {
+            "schema_version": 1,
+            "checks": [
+                {
+                    "id": "mock-check",
+                    "category": "fixture-integrity",
+                    "status": "pass",
+                    "summary": (
+                        "The deterministic mock fixture is internally consistent."
+                    ),
+                    "evidence_ids": evidence_ids,
+                }
+            ],
+        }
+
     return MockRuntime(
         capabilities=RuntimeCapabilities(
             model="gpt-5.6-sol",
@@ -74,7 +85,41 @@ def _default_mock_runtime() -> MockRuntime:
             selected_effort="high",
             multi_agent=False,
             proactive_multi_agent=False,
-        )
+        ),
+        responses={
+            "EvidenceBatch": {
+                "schema_version": 1,
+                "items": [
+                    {
+                        "kind": "note",
+                        "title": "Mock evidence",
+                        "content": "A deterministic fixture for local workflow validation.",
+                    }
+                ],
+            },
+            "PlanDraft": {
+                "schema_version": 1,
+                "strategy": "Apply the deterministic mock argument.",
+                "steps": [
+                    {
+                        "id": "mock-step",
+                        "statement": "Establish the requested conclusion.",
+                        "rationale": "This fixture exercises orchestration, not mathematics.",
+                        "success_criteria": ["The conclusion is stated."],
+                    }
+                ],
+            },
+            "ProofDraft": {
+                "schema_version": 1,
+                "proof": "Deterministic mock proof for end-to-end system validation.",
+            },
+            "VerificationDraft": verification_response,
+            "AdjudicationDraft": {
+                "schema_version": 1,
+                "outcome": "accept",
+                "rationale": "Every required mock verification report passed.",
+            },
+        },
     )
 
 
@@ -91,7 +136,14 @@ def build_service(
         selected_version = runtime_version or "mock-runtime/1"
     else:
         runtime = runtime_factory()
-        selected_version = runtime_version or _published_runtime_version()
+        observed_version = getattr(runtime, "runtime_version", None)
+        if runtime_version is None and (
+            not isinstance(observed_version, str) or not observed_version.strip()
+        ):
+            raise ValueError(
+                "a non-mock runtime must report its observed runtime_version"
+            )
+        selected_version = cast(str, runtime_version or observed_version)
     store = RunStore(settings.database_path)
     workflow = ResearchWorkflow(
         store,
@@ -152,6 +204,9 @@ class ApplicationService:
         self._workers: dict[str, asyncio.Task[RunRecord]] = {}
         self._receipts: dict[tuple[str, str, str], CommandReceipt] = {}
         self._run_locks: dict[str, asyncio.Lock] = {}
+        self._run_capacity = asyncio.Condition()
+        self._executing_run_limits: dict[str, int] = {}
+        self._queued_runs: set[str] = set()
 
     def create_run(
         self,
@@ -250,13 +305,36 @@ class ApplicationService:
             existing = self._receipts.get(key)
             if existing is not None:
                 return existing
-            cancelled = await self._workflow.cancel(run_id)
+            claim = self._store.cancel_run_command(
+                run_id,
+                idempotency_key=idempotency_key,
+            )
             receipt = CommandReceipt(
                 run_id=run_id,
                 command="cancel",
                 idempotency_key=idempotency_key,
-                status=cancelled.status,
+                status=RunStatus.CANCELLED,
             )
+            if claim.replayed and (
+                claim.run.status is not RunStatus.CANCELLING
+                or claim.run.execution_version != claim.accepted_execution_version
+            ):
+                self._receipts[key] = receipt
+                return receipt
+            queued = self._workers.get(run_id)
+            if (
+                queued is not None
+                and not queued.done()
+                and run_id in self._queued_runs
+            ):
+                self._queued_runs.discard(run_id)
+                queued.cancel()
+                await asyncio.gather(queued, return_exceptions=True)
+            cancelled = await self._workflow.cancel(run_id)
+            if cancelled.status is not RunStatus.CANCELLED:
+                raise RuntimeError(
+                    f"cancel command did not reach cancelled state: {cancelled.status.value}"
+                )
             self._receipts[key] = receipt
             _LOGGER.info("run.command_accepted", run_id=run_id, command="cancel")
             return receipt
@@ -268,10 +346,7 @@ class ApplicationService:
             run_id,
             command="resume",
             idempotency_key=idempotency_key,
-            operation_factory=lambda: self._workflow.resume(
-                run_id,
-                idempotency_key=idempotency_key,
-            ),
+            operation_factory=lambda: self._workflow.execute(run_id),
         )
 
     async def wait(self, run_id: str) -> RunRecord:
@@ -303,31 +378,38 @@ class ApplicationService:
             if active is not None and not active.done():
                 raise RunAlreadyActiveError(f"run already has an active worker: {run_id}")
 
-            run = self._store.get_run(run_id)
-            if command == "start" and run.status not in {
-                RunStatus.CREATED,
-                RunStatus.RUNNING,
-            }:
-                raise InvalidTransitionError(
-                    f"run cannot start while it is {run.status.value}"
+            claim = (
+                self._store.start_run_command(
+                    run_id,
+                    idempotency_key=idempotency_key,
                 )
-            if command == "resume" and not run.resumable:
-                raise InvalidTransitionError(
-                    f"run cannot resume while it is {run.status.value}"
+                if command == "start"
+                else self._store.resume_run_command(
+                    run_id,
+                    idempotency_key=idempotency_key,
                 )
-
-            task = asyncio.create_task(
-                operation_factory(),
-                name=f"qed-{command}-{run_id}",
             )
-            self._workers[run_id] = task
+            run = claim.run
             receipt = CommandReceipt(
                 run_id=run_id,
                 command=command,
                 idempotency_key=idempotency_key,
-                status=run.status,
+                status=claim.accepted_status,
             )
             self._receipts[key] = receipt
+            if claim.replayed and run.status is not RunStatus.RUNNING:
+                return receipt
+
+            self._queued_runs.add(run_id)
+            task = asyncio.create_task(
+                self._run_with_capacity(
+                    run_id,
+                    limit=run.config.parallelism.runs,
+                    operation_factory=operation_factory,
+                ),
+                name=f"qed-{command}-{run_id}",
+            )
+            self._workers[run_id] = task
             task.add_done_callback(lambda completed: self._worker_done(run_id, completed))
             _LOGGER.info(
                 "run.command_accepted",
@@ -336,10 +418,47 @@ class ApplicationService:
             )
             return receipt
 
+    async def _run_with_capacity(
+        self,
+        run_id: str,
+        *,
+        limit: int,
+        operation_factory: Callable[[], Coroutine[Any, Any, RunRecord]],
+    ) -> RunRecord:
+        acquired_capacity = False
+        try:
+            async with self._run_capacity:
+                await self._run_capacity.wait_for(lambda: self._has_run_capacity(limit))
+                self._queued_runs.discard(run_id)
+                self._executing_run_limits[run_id] = limit
+                acquired_capacity = True
+            try:
+                return await operation_factory()
+            finally:
+                async with self._run_capacity:
+                    self._executing_run_limits.pop(run_id, None)
+                    self._run_capacity.notify_all()
+        except asyncio.CancelledError:
+            if not acquired_capacity:
+                run = self._store.get_run(run_id)
+                if run.status is RunStatus.RUNNING:
+                    self._store.pause_unleased_run(run_id)
+            raise
+        finally:
+            self._queued_runs.discard(run_id)
+
+    def _has_run_capacity(self, requested_limit: int) -> bool:
+        proposed_count = len(self._executing_run_limits) + 1
+        return proposed_count <= requested_limit and all(
+            proposed_count <= active_limit
+            for active_limit in self._executing_run_limits.values()
+        )
+
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         return self._run_locks.setdefault(run_id, asyncio.Lock())
 
     def _worker_done(self, run_id: str, task: asyncio.Task[RunRecord]) -> None:
+        self._queued_runs.discard(run_id)
         if self._workers.get(run_id) is task:
             del self._workers[run_id]
         if task.cancelled():
@@ -359,15 +478,25 @@ class ApplicationService:
         if self._closed:
             return
         self._closed = True
+        for run_id in tuple(self._queued_runs):
+            if self._store.get_run(run_id).status is RunStatus.RUNNING:
+                with suppress(ConflictError):
+                    self._store.pause_unleased_run(run_id)
         tasks = tuple(self._workers.values())
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._workers.clear()
+        self._queued_runs.clear()
         self._run_locks.clear()
         try:
-            await self._runtime.close()
+            workflow_close = getattr(self._workflow, "close", None)
+            if workflow_close is not None:
+                await workflow_close()
         finally:
-            self._store.close()
+            try:
+                await self._runtime.close()
+            finally:
+                self._store.close()
         _LOGGER.info("service.closed")

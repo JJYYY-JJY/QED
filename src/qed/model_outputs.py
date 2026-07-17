@@ -112,7 +112,13 @@ def materialize_evidence(
 
     return tuple(
         Evidence(
-            id=_stable_id("evidence", item),
+            id=_stable_id(
+                "evidence",
+                {
+                    "draft": item.model_dump(mode="json"),
+                    "provenance_source_id": provenance.source_id,
+                },
+            ),
             kind=item.kind,
             title=item.title,
             content=item.content,
@@ -137,6 +143,7 @@ def materialize_plan(
     identity: dict[str, JsonValue] = {
         "problem_sha256": problem_sha256,
         "draft": draft.model_dump(mode="json"),
+        "provenance_source_id": provenance.source_id,
     }
     return Plan(
         id=_stable_id("plan", identity),
@@ -197,12 +204,14 @@ def materialize_report(
     candidate: ProofCandidate,
     kind: VerificationKind,
     verifier_thread_id: str,
+    verifier_external_thread_id: str | None = None,
     provenance: Provenance,
     created_at: datetime,
 ) -> VerificationReport:
     """Attach a verifier draft to the exact candidate bytes it reviewed."""
 
     identity: dict[str, JsonValue] = {
+        "candidate_id": candidate.id,
         "candidate_sha256": candidate.proof_sha256,
         "kind": kind,
         "draft": draft.model_dump(mode="json"),
@@ -236,6 +245,7 @@ def materialize_report(
             for finding in draft.findings
         ),
         verifier_thread_id=verifier_thread_id,
+        verifier_external_thread_id=verifier_external_thread_id,
         provenance=provenance,
         created_at=created_at,
     )
