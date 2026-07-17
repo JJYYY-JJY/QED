@@ -234,21 +234,47 @@ class VerificationReport(StrictModel):
     checks: tuple[VerificationCheck, ...] = Field(min_length=1)
     findings: tuple[Finding, ...] = ()
     verifier_thread_id: NonEmptyStr
+    verifier_external_thread_id: NonEmptyStr | None = None
     provenance: Provenance
     created_at: datetime
 
     @model_validator(mode="after")
     def validate_findings(self) -> Self:
-        check_ids = {check.id for check in self.checks}
-        unknown = {finding.check_id for finding in self.findings} - check_ids
+        check_ids = [check.id for check in self.checks]
+        if len(set(check_ids)) != len(check_ids):
+            raise ValueError("verification check ids must be unique")
+        finding_ids = [finding.id for finding in self.findings]
+        if len(set(finding_ids)) != len(finding_ids):
+            raise ValueError("verification finding ids must be unique")
+        checks_by_id = {check.id: check for check in self.checks}
+        unknown = {finding.check_id for finding in self.findings} - set(check_ids)
         if unknown:
             names = ", ".join(sorted(unknown))
             raise ValueError(f"findings reference unknown checks: {names}")
+        for finding in self.findings:
+            if (
+                finding.severity in {"major", "critical"}
+                and checks_by_id[finding.check_id].status is not CheckStatus.FAIL
+            ):
+                raise ValueError(
+                    f"{finding.severity} findings must reference a failed check"
+                )
+        findings_by_check = {finding.check_id for finding in self.findings}
+        missing = {
+            check.id
+            for check in self.checks
+            if check.status is CheckStatus.FAIL and check.id not in findings_by_check
+        }
+        if missing:
+            names = ", ".join(sorted(missing))
+            raise ValueError(f"failed checks require findings: {names}")
         return self
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def verdict(self) -> VerificationVerdict:
+        if any(finding.severity in {"major", "critical"} for finding in self.findings):
+            return VerificationVerdict.FAIL
         statuses = {check.status for check in self.checks}
         if CheckStatus.FAIL in statuses:
             return VerificationVerdict.FAIL

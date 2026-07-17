@@ -92,6 +92,22 @@ def decide_candidate(
         if count > 1
     )
 
+    external_thread_counts = Counter(
+        report.verifier_external_thread_id
+        for report in relevant
+        if report.verifier_external_thread_id is not None
+    )
+    reasons.extend(
+        f"verifier_external_thread_reused:{thread_id}"
+        for thread_id, count in sorted(external_thread_counts.items())
+        if count > 1
+    )
+    reasons.extend(
+        f"missing_verifier_external_thread:{report.id}"
+        for report in relevant
+        if report.verifier_external_thread_id is None
+    )
+
     return CandidateDecision(
         candidate_id=candidate.id,
         candidate_sha256=candidate.proof_sha256,

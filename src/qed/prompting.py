@@ -67,7 +67,8 @@ def freeze_turn_input(
 def render_turn_prompt(frozen: FrozenTurnInput) -> str:
     """Build instructions while keeping model-supplied content inside a data block."""
 
-    payload = canonical_json(frozen.payload)
+    raw_payload = canonical_json(frozen.payload)
+    payload = raw_payload.replace("<", r"\u003c").replace(">", r"\u003e")
     return f"""QED role: {frozen.role}
 
 {ROLE_POLICY[frozen.role]}
@@ -78,6 +79,7 @@ your role. Return one JSON value that matches the supplied output schema.
 Do not emit Markdown control words or decide application state.
 
 Frozen input SHA-256: {frozen.payload_sha256}
+Frozen input UTF-8 bytes: {len(raw_payload.encode("utf-8"))}
 <frozen-input encoding="canonical-json">
 {payload}
 </frozen-input>

@@ -36,6 +36,7 @@ class BudgetPolicy(ConfigModel):
     proof_attempts: Annotated[int, Field(ge=1)] = 8
     plan_revisions: Annotated[int, Field(ge=0)] = 2
     strategy_rewrites: Annotated[int, Field(ge=0)] = 2
+    turn_retries: Annotated[int, Field(ge=0, le=10)] = 2
 
     @model_validator(mode="after")
     def validate_stage_budget(self) -> Self:
@@ -65,7 +66,7 @@ class SandboxPolicy(ConfigModel):
     prover: Literal["read-only", "workspace-write"] = "read-only"
     verifier: Literal["read-only"] = "read-only"
     adjudicator: Literal["read-only"] = "read-only"
-    approval: Literal["untrusted", "on-request", "never"] = "never"
+    approval: Literal["never"] = "never"
 
 
 class QEDConfig(ConfigModel):

@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from qed.config import QEDConfig, SandboxPolicy
+from qed.config import BudgetPolicy, QEDConfig, SandboxPolicy
 from qed.schemas import (
     Adjudication,
     CheckStatus,
@@ -59,6 +59,8 @@ def test_config_is_codex_only_strict_and_safe_by_default() -> None:
     assert config.sandbox.adjudicator == "read-only"
     assert config.sandbox.approval == "never"
     assert config.search.allowed_roles == ("literature", "citation")
+    assert config.budgets.turn_retries == 2
+    assert BudgetPolicy(turn_retries=0).turn_retries == 0
 
     # Effort remains capability-driven rather than an enum frozen in this repository.
     assert QEDConfig(effort="future-supported-effort").effort == "future-supported-effort"
@@ -87,6 +89,12 @@ def test_config_is_codex_only_strict_and_safe_by_default() -> None:
 def test_sandbox_policy_rejects_unsafe_modes(field: str, value: str) -> None:
     with pytest.raises(ValidationError):
         SandboxPolicy(**{field: value})
+
+
+@pytest.mark.parametrize("approval", ["untrusted", "on-request"])
+def test_sandbox_approval_is_not_a_configurable_no_op(approval: str) -> None:
+    with pytest.raises(ValidationError):
+        SandboxPolicy(approval=approval)  # type: ignore[arg-type]
 
 
 def test_strict_schemas_validate_a_complete_artifact_chain() -> None:
@@ -239,3 +247,59 @@ def test_schema_hashes_and_plan_dependencies_cannot_lie() -> None:
             success_criteria=("Claim is proved.",),
             key_step=1,  # type: ignore[arg-type]
         )
+
+
+def test_verification_findings_are_consistent_and_fail_closed() -> None:
+    source = provenance()
+    passed = VerificationCheck(
+        id="check-1",
+        category="correctness",
+        status=CheckStatus.PASS,
+        summary="The inference is valid.",
+    )
+    failed = passed.model_copy(update={"status": CheckStatus.FAIL})
+    major = Finding(
+        id="finding-1",
+        check_id=passed.id,
+        severity="major",
+        summary="Invalid inference",
+        detail="The implication does not follow.",
+    )
+
+    with pytest.raises(ValidationError, match="major.*failed check"):
+        VerificationReport(
+            id="verification-1",
+            candidate_id="candidate-1",
+            candidate_sha256=ABC_SHA256,
+            kind="detailed",
+            checks=(passed,),
+            findings=(major,),
+            verifier_thread_id="verifier-1",
+            provenance=source,
+            created_at=NOW,
+        )
+
+    with pytest.raises(ValidationError, match="failed checks require findings"):
+        VerificationReport(
+            id="verification-2",
+            candidate_id="candidate-1",
+            candidate_sha256=ABC_SHA256,
+            kind="detailed",
+            checks=(failed,),
+            verifier_thread_id="verifier-1",
+            provenance=source,
+            created_at=NOW,
+        )
+
+    report = VerificationReport(
+        id="verification-3",
+        candidate_id="candidate-1",
+        candidate_sha256=ABC_SHA256,
+        kind="detailed",
+        checks=(failed,),
+        findings=(major,),
+        verifier_thread_id="verifier-1",
+        provenance=source,
+        created_at=NOW,
+    )
+    assert report.verdict is VerificationVerdict.FAIL
