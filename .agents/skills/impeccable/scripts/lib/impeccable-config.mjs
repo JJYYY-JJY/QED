@@ -16,8 +16,11 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
-import { join, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { join, dirname, isAbsolute, relative, resolve } from 'node:path';
 import { readContainedFile, writeContainedFile } from './safe-fs.mjs';
+import { createGlobMatcher, matchesAnyGlob } from './safe-glob.mjs';
+
+export { matchesAnyGlob };
 
 export function getConfigPath(root) {
   return join(root, '.impeccable', 'config.json');
@@ -373,71 +376,24 @@ function ignoreValueFilesKey(files) {
   return Array.isArray(files) && files.length > 0 ? files.join('\x1f') : '';
 }
 
-// Glob -> RegExp. Supports `**`, `*`, `?`, and `{a,b}` alternation.
-function globToRegex(glob) {
-  let re = '^';
-  let i = 0;
-  while (i < glob.length) {
-    const c = glob[i];
-    if (c === '*') {
-      if (glob[i + 1] === '*') {
-        re += '.*';
-        i += 2;
-        if (glob[i] === '/') i += 1;
-      } else {
-        re += '[^/]*';
-        i += 1;
-      }
-    } else if (c === '?') {
-      re += '[^/]';
-      i += 1;
-    } else if (c === '{') {
-      const end = glob.indexOf('}', i);
-      if (end === -1) { re += '\\{'; i += 1; continue; }
-      const parts = glob.slice(i + 1, end).split(',').map((p) => p.replace(/[.+^$()|[\]\\]/g, '\\$&'));
-      re += `(?:${parts.join('|')})`;
-      i = end + 1;
-    } else if (/[.+^$()|[\]\\]/.test(c)) {
-      re += `\\${c}`;
-      i += 1;
-    } else {
-      re += c;
-      i += 1;
-    }
-  }
-  re += '$';
-  return new RegExp(re);
-}
-
-export function matchesAnyGlob(filePath, globs) {
-  if (!Array.isArray(globs) || globs.length === 0) return false;
-  const normalized = String(filePath || '').split(sep).join('/');
-  for (const glob of globs) {
-    try {
-      const re = globToRegex(String(glob));
-      if (re.test(normalized)) return true;
-      const base = normalized.split('/').pop();
-      if (re.test(base)) return true;
-    } catch {
-      /* malformed glob, skip */
-    }
-  }
-  return false;
-}
-
-export function shouldIgnoreDetectionFile(filePath, root, config) {
+export function shouldIgnoreDetectionFile(
+  filePath,
+  root,
+  config,
+  matchGlob = createGlobMatcher({ exhaustedResult: true }),
+) {
   const globs = config?.ignoreFiles || [];
   if (!Array.isArray(globs) || globs.length === 0) return false;
   const raw = String(filePath || '').trim();
   if (!raw) return false;
-  if (matchesAnyGlob(raw, globs)) return true;
+  if (matchGlob(raw, globs)) return true;
 
   try {
     const abs = isAbsolute(raw) ? raw : resolve(root, raw);
-    if (matchesAnyGlob(abs, globs)) return true;
+    if (matchGlob(abs, globs)) return true;
     const rel = relative(root, abs);
     if (rel && !rel.startsWith('..') && !isAbsolute(rel)) {
-      return matchesAnyGlob(rel, globs);
+      return matchGlob(rel, globs);
     }
   } catch {
     /* ignore */
@@ -445,19 +401,19 @@ export function shouldIgnoreDetectionFile(filePath, root, config) {
   return false;
 }
 
-export function filterDetectionFindings(findings, config) {
+export function filterDetectionFindings(findings, config, matchGlob = createGlobMatcher()) {
   if (!Array.isArray(findings) || findings.length === 0) return [];
   const ignoreRules = new Set((config?.ignoreRules || []).map((rule) => normalizeIgnoreRule(rule)));
   const ignoreValues = normalizeIgnoreValueEntries(config?.ignoreValues || []);
   return findings.filter((finding) => {
     if (!finding || typeof finding !== 'object') return false;
     if (ignoreRules.has(normalizeIgnoreRule(finding.antipattern))) return false;
-    if (isIgnoredFindingValue(finding, ignoreValues)) return false;
+    if (isIgnoredFindingValue(finding, ignoreValues, matchGlob)) return false;
     return true;
   });
 }
 
-function isIgnoredFindingValue(finding, ignoreValues) {
+function isIgnoredFindingValue(finding, ignoreValues, matchGlob) {
   if (!Array.isArray(ignoreValues) || ignoreValues.length === 0) return false;
   const rule = normalizeIgnoreRule(finding.antipattern);
   if (!rule) return false;
@@ -468,22 +424,14 @@ function isIgnoredFindingValue(finding, ignoreValues) {
     const wildcardValue = entry.value === '*';
     if (!wildcardValue && (!value || !ignoreValueMatches(rule, entry.value, value))) return false;
     if (!Array.isArray(entry.files) || entry.files.length === 0) return !wildcardValue;
-    return findingMatchesScopedIgnoreFile(finding, entry.files);
+    return findingMatchesScopedIgnoreFile(finding, entry.files, matchGlob);
   });
 }
 
-function findingMatchesScopedIgnoreFile(finding, globs) {
+function findingMatchesScopedIgnoreFile(finding, globs, matchGlob) {
   const filePath = String(finding?.file || '').trim();
   if (!filePath) return false;
-  if (matchesAnyGlob(filePath, globs)) return true;
-
-  const normalized = filePath.split(sep).join('/');
-  const parts = normalized.split('/').filter(Boolean);
-  for (let i = 0; i < parts.length; i++) {
-    const suffix = parts.slice(i).join('/');
-    if (matchesAnyGlob(suffix, globs)) return true;
-  }
-  return false;
+  return matchGlob(filePath, globs, { matchSuffixes: true });
 }
 
 export function extractFindingIgnoreValue(finding) {

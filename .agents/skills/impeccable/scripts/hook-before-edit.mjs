@@ -25,7 +25,6 @@ import {
   isNativePlatform,
   loadDetector,
   matchConfiguredExtension,
-  matchesAnyGlob,
   persistCache,
   readCache,
   readConfig,
@@ -37,6 +36,7 @@ import {
   writeAuditLog,
 } from './hook-lib.mjs';
 import { readContainedFile } from './lib/safe-fs.mjs';
+import { createGlobMatcher } from './lib/safe-glob.mjs';
 
 const MAX_HOOK_FILE_BYTES = 1024 * 1024;
 
@@ -453,8 +453,13 @@ async function main() {
     return allow({ ...audit, skipped: 'native-platform', platform, durationMs: Date.now() - started });
   }
 
+  const matchIgnoredFile = createGlobMatcher({ exhaustedResult: true });
+  const matchIgnoredFinding = createGlobMatcher();
   const rel = relativePath(filePath, cwd);
-  if (matchesAnyGlob(rel, config.ignoreFiles) || matchesAnyGlob(filePath, config.ignoreFiles)) {
+  if (
+    matchIgnoredFile(rel, config.ignoreFiles)
+    || matchIgnoredFile(filePath, config.ignoreFiles)
+  ) {
     return allow({ ...audit, skipped: 'config-ignore-file', durationMs: Date.now() - started });
   }
 
@@ -478,7 +483,13 @@ async function main() {
     return allow({ ...audit, error: 'detector-threw', durationMs: Date.now() - started });
   }
 
-  const filtered = filterFindings(findings || [], content, ext, config);
+  const filtered = filterFindings(
+    findings || [],
+    content,
+    ext,
+    config,
+    matchIgnoredFinding,
+  );
   if (filtered.length === 0) {
     return allow({
       ...audit,

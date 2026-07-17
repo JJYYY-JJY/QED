@@ -43,6 +43,9 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { extractPlatform, loadContext } from './context.mjs';
 import { IMPECCABLE_COMMAND } from './lib/provider.mjs';
 import { appendContainedFile, readContainedFile, writeContainedFile } from './lib/safe-fs.mjs';
+import { createGlobMatcher, matchesAnyGlob } from './lib/safe-glob.mjs';
+
+export { matchesAnyGlob };
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -670,73 +673,19 @@ export function suppressionNotice(filePath) {
   return `${ENVELOPE_PREFIX} Suppressing further design hints on ${formatContextValue(filePath)}. More than ${EDIT_COUNT_THRESHOLD} edits in this session reached. Run ${IMPECCABLE_COMMAND} audit to revisit.`;
 }
 
-// Glob → RegExp. Supports `**`, `*`, `?`, and `{a,b}` alternation.
-function globToRegex(glob) {
-  let re = '^';
-  let i = 0;
-  while (i < glob.length) {
-    const c = glob[i];
-    if (c === '*') {
-      if (glob[i + 1] === '*') {
-        re += '.*';
-        i += 2;
-        if (glob[i] === '/') i += 1;
-      } else {
-        re += '[^/]*';
-        i += 1;
-      }
-    } else if (c === '?') {
-      re += '[^/]';
-      i += 1;
-    } else if (c === '{') {
-      const end = glob.indexOf('}', i);
-      if (end === -1) { re += '\\{'; i += 1; continue; }
-      const parts = glob.slice(i + 1, end).split(',').map((p) => p.replace(/[.+^$()|[\]\\]/g, '\\$&'));
-      re += `(?:${parts.join('|')})`;
-      i = end + 1;
-    } else if (/[.+^$()|[\]\\]/.test(c)) {
-      re += `\\${c}`;
-      i += 1;
-    } else {
-      re += c;
-      i += 1;
-    }
-  }
-  re += '$';
-  return new RegExp(re);
-}
-
-export function matchesAnyGlob(filePath, globs) {
-  if (!Array.isArray(globs) || globs.length === 0) return false;
-  const normalized = filePath.split(path.sep).join('/');
-  for (const glob of globs) {
-    try {
-      const re = globToRegex(String(glob));
-      if (re.test(normalized)) return true;
-      // Match against basename too for convenience: `*.generated.tsx` should
-      // catch `src/foo.generated.tsx` without requiring `**/`.
-      const base = normalized.split('/').pop();
-      if (re.test(base)) return true;
-    } catch {
-      /* malformed glob, skip */
-    }
-  }
-  return false;
-}
-
-export function filterFindings(findings, _content, _ext, config) {
+export function filterFindings(findings, _content, _ext, config, matchGlob = createGlobMatcher()) {
   if (!Array.isArray(findings) || findings.length === 0) return [];
   const ignoreRules = new Set((config.ignoreRules || []).map((rule) => normalizeIgnoreRule(rule)));
   const ignoreValues = normalizeIgnoreValueEntries(config.ignoreValues || []);
   return findings.filter((f) => {
     if (!f || typeof f !== 'object') return false;
     if (ignoreRules.has(normalizeIgnoreRule(f.antipattern))) return false;
-    if (isIgnoredFindingValue(f, ignoreValues)) return false;
+    if (isIgnoredFindingValue(f, ignoreValues, matchGlob)) return false;
     return true;
   });
 }
 
-function isIgnoredFindingValue(finding, ignoreValues) {
+function isIgnoredFindingValue(finding, ignoreValues, matchGlob) {
   if (!Array.isArray(ignoreValues) || ignoreValues.length === 0) return false;
   const rule = normalizeIgnoreRule(finding.antipattern);
   if (!rule) return false;
@@ -747,22 +696,14 @@ function isIgnoredFindingValue(finding, ignoreValues) {
     const wildcardValue = entry.value === '*';
     if (!wildcardValue && (!value || !ignoreValueMatches(rule, entry.value, value))) return false;
     if (!Array.isArray(entry.files) || entry.files.length === 0) return !wildcardValue;
-    return findingMatchesScopedIgnoreFile(finding, entry.files);
+    return findingMatchesScopedIgnoreFile(finding, entry.files, matchGlob);
   });
 }
 
-function findingMatchesScopedIgnoreFile(finding, globs) {
+function findingMatchesScopedIgnoreFile(finding, globs, matchGlob) {
   const filePath = String(finding?.file || '').trim();
   if (!filePath) return false;
-  if (matchesAnyGlob(filePath, globs)) return true;
-
-  const normalized = filePath.split(path.sep).join('/');
-  const parts = normalized.split('/').filter(Boolean);
-  for (let i = 0; i < parts.length; i++) {
-    const suffix = parts.slice(i).join('/');
-    if (matchesAnyGlob(suffix, globs)) return true;
-  }
-  return false;
+  return matchGlob(filePath, globs, { matchSuffixes: true });
 }
 
 export function extractFindingIgnoreValue(finding) {
@@ -1582,6 +1523,9 @@ export async function runHook({ stdinJson, env = {}, cwd = process.cwd(), now = 
       return result({ skipped: 'native-platform', platform, durationMs: Date.now() - started });
     }
 
+    const matchIgnoredFile = createGlobMatcher({ exhaustedResult: true });
+    const matchIgnoredFinding = createGlobMatcher();
+
     const cache = readCache(projectCwd);
     const sessionId = event.session_id || 'unknown';
     const det = detector || await loadDetector();
@@ -1621,7 +1565,10 @@ export async function runHook({ stdinJson, env = {}, cwd = process.cwd(), now = 
       }
 
       const relForMatch = relativize(filePath, projectCwd);
-      if (matchesAnyGlob(relForMatch, config.ignoreFiles) || matchesAnyGlob(filePath, config.ignoreFiles)) {
+      if (
+        matchIgnoredFile(relForMatch, config.ignoreFiles)
+        || matchIgnoredFile(filePath, config.ignoreFiles)
+      ) {
         lastSkip = 'config-ignore-file';
         continue;
       }
@@ -1665,7 +1612,13 @@ export async function runHook({ stdinJson, env = {}, cwd = process.cwd(), now = 
         try { findings = await det.detectText(content, filePath, scanOptions); } catch { findings = []; detectorThrew = true; }
       }
 
-      const filtered = filterFindings(findings || [], content, ext, config);
+      const filtered = filterFindings(
+        findings || [],
+        content,
+        ext,
+        config,
+        matchIgnoredFinding,
+      );
       const fresh = dedupeAgainstCache(filtered, cache, sessionId, filePath);
       audit.findings = (findings || []).length;
       audit.freshFindings = fresh.length;

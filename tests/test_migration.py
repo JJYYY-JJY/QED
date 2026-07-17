@@ -94,6 +94,17 @@ def test_legacy_import_accepts_an_ordinary_relative_source(
     assert inspected.source_root == str(source)
 
 
+def test_legacy_import_rejects_parent_segments_in_source_path(tmp_path: Path) -> None:
+    controlled = tmp_path / "controlled"
+    (controlled / "pivot").mkdir(parents=True)
+    source = controlled / "old-run"
+    source.mkdir()
+    (source / "proof.md").write_text("proof", encoding="utf-8")
+
+    with pytest.raises(LegacyImportError, match="parent path segments"):
+        inspect_legacy_run(controlled / "pivot" / ".." / "old-run")
+
+
 def test_legacy_import_rejects_a_parent_swapped_to_a_symlink_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

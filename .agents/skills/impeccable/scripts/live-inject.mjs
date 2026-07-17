@@ -18,6 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveLiveConfigPath } from './lib/impeccable-paths.mjs';
 import { readContainedFile, resolveContainedPath, writeContainedFile } from './lib/safe-fs.mjs';
+import { createGlobMatcher } from './lib/safe-glob.mjs';
 import { assertLiveBootstrapPort } from './live/browser-script-parts.mjs';
 import {
   applySvelteKitLiveAdapter,
@@ -257,9 +258,18 @@ export function resolveFiles(rootDir, config) {
   const patterns = config.files;
   const userExcludes = Array.isArray(config.exclude) ? config.exclude : [];
   const allExcludes = [...HARD_EXCLUDES, ...userExcludes];
-  const excludeRegexes = allExcludes.map(globToRegex);
-
-  const isExcluded = (relPath) => excludeRegexes.some((re) => re.test(relPath));
+  const matchHardExclude = createGlobMatcher({ exhaustedResult: true });
+  const matchExclude = createGlobMatcher({ exhaustedResult: true });
+  const isHardExcluded = (relPath) => matchHardExclude(
+    relPath.toLowerCase(),
+    HARD_EXCLUDES,
+    { matchBasename: false, matchBraces: false },
+  );
+  const isExcluded = (relPath) => matchExclude(
+    relPath,
+    allExcludes,
+    { matchBasename: false, matchBraces: false },
+  );
   const isGlob = (s) => /[*?[]/.test(s);
 
   const seen = new Set();
@@ -270,10 +280,11 @@ export function resolveFiles(rootDir, config) {
     }
     if (!isGlob(pat)) {
       // Literal path — include even if it doesn't exist yet; the caller
-      // reports file_not_found per-entry. Exclude list doesn't apply to
-      // explicit literal entries (user named it on purpose).
+      // reports file_not_found per-entry. The user exclude list doesn't apply
+      // to explicit literals, but hard exclusions remain mandatory.
       const absolute = resolveContainedPath(rootDir, pat, { allowMissing: true });
       const relative = path.relative(rootDir, absolute).split(path.sep).join('/');
+      if (isHardExcluded(relative)) continue;
       if (!seen.has(relative)) {
         seen.add(relative);
         out.push(relative);
@@ -291,54 +302,13 @@ export function resolveFiles(rootDir, config) {
       const abs = path.join(ent.parentPath || ent.path || rootDir, ent.name);
       resolveContainedPath(rootDir, abs, { allowMissing: false, type: 'file' });
       const rel = path.relative(rootDir, abs).split(path.sep).join('/');
-      if (isExcluded(rel)) continue;
+      if (isHardExcluded(rel) || isExcluded(rel)) continue;
       if (seen.has(rel)) continue;
       seen.add(rel);
       out.push(rel);
     }
   }
   return out;
-}
-
-/**
- * Convert a glob pattern to a RegExp. Supports:
- *   **  → any number of path segments (including zero)
- *   *   → any chars except `/`
- *   ?   → any single char except `/`
- * Paths are normalized to forward slashes before matching.
- */
-function globToRegex(pattern) {
-  let re = '';
-  let i = 0;
-  while (i < pattern.length) {
-    const c = pattern[i];
-    if (c === '*') {
-      if (pattern[i + 1] === '*') {
-        // ** — any number of segments, including zero. Handle the common
-        // **/ and /** forms so `a/**/b` matches `a/b` as well as `a/x/y/b`.
-        if (pattern[i + 2] === '/') {
-          re += '(?:.*/)?';
-          i += 3;
-        } else {
-          re += '.*';
-          i += 2;
-        }
-      } else {
-        re += '[^/]*';
-        i += 1;
-      }
-    } else if (c === '?') {
-      re += '[^/]';
-      i += 1;
-    } else if (/[.+^${}()|[\]\\]/.test(c)) {
-      re += '\\' + c;
-      i += 1;
-    } else {
-      re += c;
-      i += 1;
-    }
-  }
-  return new RegExp('^' + re + '$');
 }
 
 // ---------------------------------------------------------------------------

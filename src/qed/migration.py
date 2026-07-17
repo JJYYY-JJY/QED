@@ -103,6 +103,10 @@ def _open_directory_at(
 def _pinned_directory(path: Path) -> Iterator[tuple[int, Path]]:
     descriptor: int | None = None
     try:
+        if ".." in path.parts:
+            raise LegacyImportError(
+                "legacy source path cannot contain parent path segments"
+            )
         absolute_path = path.absolute()
         descriptor = os.open(
             absolute_path.anchor,

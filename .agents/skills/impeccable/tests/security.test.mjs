@@ -321,6 +321,60 @@ test('live drift scan rejects a symlinked page root', (t) => {
   assert.equal(liveModule.scanForDrift(root, [], {}), null);
 });
 
+test('live exclusion glob matching stays bounded', (t) => {
+  const root = fixture(t);
+  const relativeFile = `src/${'a'.repeat(64)}.html`;
+  fs.mkdirSync(path.join(root, 'src'));
+  fs.writeFileSync(path.join(root, relativeFile), '<main>proof</main>\n');
+  const config = {
+    files: ['src/*.html'],
+    exclude: [`src/${'*a'.repeat(12)}Z`],
+  };
+
+  const resolveStarted = performance.now();
+  assert.deepEqual(resolveFiles(root, config), [relativeFile]);
+  assert.ok(performance.now() - resolveStarted < 250);
+
+  const driftStarted = performance.now();
+  assert.deepEqual(liveModule.scanForDrift(root, [], config)?.orphans, [relativeFile]);
+  assert.ok(performance.now() - driftStarted < 250);
+});
+
+test('live hard exclusions apply to explicitly named files', (t) => {
+  const root = fixture(t);
+  fs.mkdirSync(path.join(root, 'node_modules', 'vendor'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'node_modules', 'vendor', 'index.html'), '<main>vendor</main>\n');
+  fs.mkdirSync(path.join(root, 'Node_Modules', 'vendor'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'Node_Modules', 'vendor', 'case.html'), '<main>vendor</main>\n');
+  fs.mkdirSync(path.join(root, 'src'));
+  fs.writeFileSync(path.join(root, 'src', 'index.html'), '<main>project</main>\n');
+
+  assert.deepEqual(resolveFiles(root, {
+    files: ['node_modules/vendor/index.html'],
+    exclude: [],
+  }), []);
+  assert.deepEqual(resolveFiles(root, {
+    files: ['Node_Modules/vendor/case.html'],
+    exclude: [],
+  }), []);
+  assert.deepEqual(resolveFiles(root, {
+    files: ['src/index.html'],
+    exclude: ['src/**'],
+  }), ['src/index.html']);
+});
+
+test('live exclusion braces remain literal', (t) => {
+  const root = fixture(t);
+  fs.mkdirSync(path.join(root, 'src'));
+  fs.writeFileSync(path.join(root, 'src', '{draft}.html'), '<main>literal</main>\n');
+  fs.writeFileSync(path.join(root, 'src', 'draft.html'), '<main>draft</main>\n');
+
+  assert.deepEqual(resolveFiles(root, {
+    files: ['src/*.html'],
+    exclude: ['src/{draft}.html'],
+  }), ['src/draft.html']);
+});
+
 test('session and hook state cannot escape through symlinks or config paths', (t) => {
   const root = fixture(t);
   const outside = fixture(t);

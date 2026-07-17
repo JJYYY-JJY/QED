@@ -4,13 +4,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { loadContext, resolveProjectRoot } from '../scripts/context.mjs';
 import { loadDesignSystemForCwd } from '../scripts/detector/design-system.mjs';
 import { collectStaticCssText } from '../scripts/detector/engines/static-html/css-cascade.mjs';
 import { detectFrameworkConfig } from '../scripts/detector/node/file-system.mjs';
 import {
+  filterFindings,
+  matchesAnyGlob as matchesHookGlob,
   payload,
   renderCleanAck,
   renderPendingAck,
@@ -18,6 +20,12 @@ import {
   runHook,
   suppressionNotice,
 } from '../scripts/hook-lib.mjs';
+import {
+  filterDetectionFindings,
+  matchesAnyGlob as matchesDetectorGlob,
+  shouldIgnoreDetectionFile,
+} from '../scripts/lib/impeccable-config.mjs';
+import { createGlobMatcher } from '../scripts/lib/safe-glob.mjs';
 import * as safeFs from '../scripts/lib/safe-fs.mjs';
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -487,6 +495,176 @@ test('exact ignore-file guidance never widens special filenames into globs', () 
     );
     assert.match(rendered, /hooks ignore-file <path>/u);
   }
+});
+
+test('ignore glob matching stays bounded for adversarial wildcard patterns', () => {
+  const filePath = 'a'.repeat(80);
+  const patterns = [
+    `${'*'.repeat(12)}Z`,
+    `${'*a'.repeat(12)}Z`,
+  ];
+
+  for (const matcher of [matchesHookGlob, matchesDetectorGlob]) {
+    const started = performance.now();
+    assert.equal(matcher(filePath, patterns), false);
+    assert.ok(performance.now() - started < 250);
+    assert.equal(matcher('src/example.tsx', ['**/*.tsx']), true);
+    assert.equal(matcher('src/example.tsx', ['src/*.{tsx,jsx}']), true);
+  }
+});
+
+test('noncanonical star runs preserve their path separator requirement', () => {
+  for (const matcher of [matchesHookGlob, matchesDetectorGlob]) {
+    assert.equal(matcher('root.tsx', ['***/*']), false);
+    assert.equal(matcher('src/root.tsx', ['***/*']), true);
+  }
+});
+
+test('finding filters share one glob budget across suffixes and findings', () => {
+  const file = Array(32).fill('a'.repeat(60)).join('/');
+  const findings = Array.from({ length: 100 }, () => ({
+    antipattern: 'side-tab',
+    file,
+  }));
+  const config = {
+    ignoreRules: [],
+    ignoreValues: [{
+      rule: 'side-tab',
+      value: '*',
+      files: [`${'*a'.repeat(200)}Z`],
+    }],
+  };
+
+  for (const filter of [
+    () => filterFindings(findings, '', '', config),
+    () => filterDetectionFindings(findings, config),
+  ]) {
+    const started = performance.now();
+    assert.equal(filter().length, findings.length);
+    assert.ok(performance.now() - started < 250);
+  }
+});
+
+test('detection file ignores share one glob budget across a scan', () => {
+  const matchGlob = createGlobMatcher();
+  const config = {
+    ignoreFiles: [`${'*a'.repeat(200)}Z`],
+  };
+  const started = performance.now();
+
+  for (let index = 0; index < 1000; index += 1) {
+    const file = `src/${'a'.repeat(200)}-${index}.tsx`;
+    assert.equal(shouldIgnoreDetectionFile(file, '/project', config, matchGlob), false);
+  }
+
+  assert.ok(performance.now() - started < 250);
+});
+
+test('fail-safe glob matching treats every resource limit as excluded', () => {
+  const matchGlob = createGlobMatcher({ exhaustedResult: true });
+  const pathName = 'src/hit.html';
+
+  assert.equal(matchGlob(pathName, [
+    ...Array.from({ length: 128 }, (_, index) => `miss-${index}`),
+    'src/**',
+  ], { matchBasename: false }), true);
+  assert.equal(matchGlob(pathName, ['a'.repeat(513)], { matchBasename: false }), true);
+  assert.equal(matchGlob(pathName, [
+    `{${Array.from({ length: 33 }, (_, index) => `v${index}`).join(',')}}`,
+  ], { matchBasename: false }), true);
+  assert.equal(matchGlob('a'.repeat(8193), ['miss'], { matchBasename: false }), true);
+});
+
+test('glob resource limits take precedence over an earlier match', () => {
+  const pathName = 'src/hit.html';
+  const limitedPatternSets = [
+    ['**', ...Array.from({ length: 128 }, (_, index) => `miss-${index}`)],
+    ['**', 'a'.repeat(513)],
+    ['**', `{${Array.from({ length: 33 }, (_, index) => `v${index}`).join(',')}}`],
+  ];
+
+  for (const patterns of limitedPatternSets) {
+    assert.equal(createGlobMatcher()(pathName, patterns), false);
+    assert.equal(createGlobMatcher({ exhaustedResult: true })(pathName, patterns), true);
+  }
+});
+
+test('invalid glob compilation is cached across an operation', () => {
+  const patterns = [
+    ...Array.from({ length: 127 }, (_, index) => `${index}-${'a'.repeat(508)}`),
+    `{${Array.from({ length: 33 }, (_, index) => `v${index}`).join(',')}}`,
+  ];
+  const matchGlob = createGlobMatcher({ exhaustedResult: true });
+  const started = performance.now();
+
+  for (let index = 0; index < 1000; index += 1) {
+    assert.equal(matchGlob(`src/file-${index}.tsx`, patterns), true);
+  }
+
+  assert.ok(performance.now() - started < 250);
+});
+
+test('glob result caching stays bounded across unique paths', () => {
+  const moduleUrl = pathToFileURL(
+    path.join(SKILL_DIR, 'scripts', 'lib', 'safe-glob.mjs'),
+  ).href;
+  const script = `
+    const { createGlobMatcher } = await import(${JSON.stringify(moduleUrl)});
+    const originalSet = Map.prototype.set;
+    let setCalls = 0;
+    Map.prototype.set = function (...args) {
+      setCalls += 1;
+      return Reflect.apply(originalSet, this, args);
+    };
+
+    const pattern = '*a'.repeat(200) + 'Z';
+    const globs = [pattern];
+    const matcher = createGlobMatcher();
+    for (let index = 0; index < 4; index += 1) {
+      matcher('a'.repeat(7990) + index, globs);
+    }
+    setCalls = 0;
+    for (let index = 0; index < 10000; index += 1) {
+      matcher(\`src/file-\${index}.tsx\`, globs);
+    }
+    const exhaustedSets = setCalls;
+
+    const cheapMatcher = createGlobMatcher();
+    const cheapGlobs = ['**'];
+    setCalls = 0;
+    for (let index = 0; index < 10000; index += 1) {
+      cheapMatcher(\`src/cheap-\${index}.tsx\`, cheapGlobs);
+    }
+    process.stdout.write(JSON.stringify({ exhaustedSets, normalSets: setCalls }));
+  `;
+  const cacheSets = JSON.parse(execFileSync(
+    process.execPath,
+    ['--input-type=module', '--eval', script],
+    { encoding: 'utf-8' },
+  ));
+
+  assert.equal(cacheSets.exhaustedSets, 0);
+  assert.ok(cacheSets.normalSets <= 4097);
+});
+
+test('glob exhaustion keeps file exclusions and finding suppressions separate', () => {
+  const limitedPatterns = Array.from({ length: 129 }, (_, index) => `miss-${index}`);
+  assert.equal(shouldIgnoreDetectionFile(
+    'src/target.tsx',
+    '/project',
+    { ignoreFiles: limitedPatterns },
+  ), true);
+  assert.equal(filterDetectionFindings([{
+    antipattern: 'side-tab',
+    file: 'src/target.tsx',
+  }], {
+    ignoreRules: [],
+    ignoreValues: [{
+      rule: 'side-tab',
+      value: '*',
+      files: limitedPatterns,
+    }],
+  }).length, 1);
 });
 
 test('framework config detection rejects symlinks and unsafe ports', (t) => {

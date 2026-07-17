@@ -16,6 +16,7 @@ import {
   resolveContainedPath,
   walkContainedFiles,
 } from '../../lib/safe-fs.mjs';
+import { createGlobMatcher } from '../../lib/safe-glob.mjs';
 import {
   HTML_EXTENSIONS,
   SCANNABLE_EXTENSIONS,
@@ -201,6 +202,8 @@ async function detectCli() {
   const detectionConfig = configEnabled
     ? readDetectionConfig(projectRoot)
     : { ignoreRules: [], ignoreFiles: [], ignoreValues: [] };
+  const matchIgnoredFile = createGlobMatcher({ exhaustedResult: true });
+  const matchIgnoredFinding = createGlobMatcher();
   const providers = [];
   if (args.includes('--gpt')) providers.push('gpt');
   if (args.includes('--gemini')) providers.push('gemini');
@@ -316,7 +319,12 @@ async function detectCli() {
               skipDirectories: [...SKIP_DIRS, ...EXTRA_SKIP_DIRS],
               includeExtensions: SCANNABLE_EXTENSIONS,
             })
-              .filter(file => !shouldIgnoreDetectionFile(file, projectRoot, detectionConfig));
+              .filter(file => !shouldIgnoreDetectionFile(
+                file,
+                projectRoot,
+                detectionConfig,
+                matchIgnoredFile,
+              ));
           } catch {
             process.stderr.write(`Warning: cannot safely scan ${sanitizeTerminalValue(target)}\n`);
             scanIncomplete = true;
@@ -393,7 +401,12 @@ async function detectCli() {
             allFindings.push(...fileFindings);
           }
         } else if (stat.isFile()) {
-          if (shouldIgnoreDetectionFile(resolved, projectRoot, detectionConfig)) continue;
+          if (shouldIgnoreDetectionFile(
+            resolved,
+            projectRoot,
+            detectionConfig,
+            matchIgnoredFile,
+          )) continue;
           const ext = path.extname(resolved).toLowerCase();
           if (HTML_EXTENSIONS.has(ext)) {
             try {
@@ -421,7 +434,11 @@ async function detectCli() {
     }
   }
 
-  allFindings = filterDetectionFindings(allFindings, detectionConfig);
+  allFindings = filterDetectionFindings(
+    allFindings,
+    detectionConfig,
+    matchIgnoredFinding,
+  );
   allFindings = filterByScopes(allFindings, scopes);
 
   if (allFindings.length > 0) {
