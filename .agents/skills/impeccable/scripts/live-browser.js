@@ -10777,14 +10777,18 @@ void main() {
 
       const hero = document.createElement('div');
       hero.className = 'c-hero';
-      hero.style.background = cssSafe(c.value || '');
+      hero.style.backgroundColor = validatedCssColor(c.value);
       tile.appendChild(hero);
 
       const ramp = synthesizeRamp(c);
       if (ramp.length) {
         const r = document.createElement('div');
         r.className = 'c-ramp';
-        r.innerHTML = ramp.map((v) => `<span style="background:${cssSafe(v)}"></span>`).join('');
+        for (const value of ramp) {
+          const swatch = document.createElement('span');
+          swatch.style.backgroundColor = validatedCssColor(value);
+          r.appendChild(swatch);
+        }
         tile.appendChild(r);
       }
 
@@ -11103,10 +11107,12 @@ void main() {
     return wrap;
   }
 
-  function cssSafe(v) {
-    // Strip anything outside valid CSS value chars to prevent injection via
-    // .impeccable/design.json values rendered into inline style strings.
-    return String(v).replace(/[<>"'`\n]/g, '');
+  function validatedCssColor(v) {
+    const value = typeof v === 'string' ? v.trim() : '';
+    if (!value || /[;{}]/.test(value)) return '';
+    const probe = document.createElement('span');
+    probe.style.backgroundColor = value;
+    return probe.style.backgroundColor ? value : '';
   }
 
   function normalizeCssColor(v) {

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,6 +13,11 @@ import vm from 'node:vm';
 
 import { buildTagBlock } from '../scripts/live-inject.mjs';
 import { assembleLiveBrowserScript } from '../scripts/live/browser-script-parts.mjs';
+import {
+  readBoundedBody,
+  readBoundedJsonBody,
+  RequestBodyTooLargeError,
+} from '../scripts/live/bounded-body.mjs';
 import { fetchServerStatus as fetchAgentServerStatus } from '../scripts/live-poll.mjs';
 import { buildSvelteLiveRootComponent } from '../scripts/live/sveltekit-adapter.mjs';
 
@@ -35,6 +42,29 @@ async function reservePort() {
       server.close((error) => error ? reject(error) : resolve(port));
     });
   });
+}
+
+async function startPreviewServer(t, livePort, previewPort = 0) {
+  const server = http.createServer((req, res) => {
+    const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
+    if (pathname !== '/') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(`<!doctype html>
+      <html>
+        <body><main>Preview</main></body>
+        <script src="http://localhost:${livePort}/live.js"></script>
+      </html>`);
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(previewPort, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  return `http://127.0.0.1:${server.address().port}`;
 }
 
 async function waitFor(predicate, timeoutMs = 8_000) {
@@ -115,6 +145,60 @@ async function authorizeBrowser(info, previewOrigin = 'http://127.0.0.1:4173') {
     },
   };
 }
+
+test('bounded body readers copy high-cardinality chunks into bounded storage', async () => {
+  const req = new EventEmitter();
+  const bodyPromise = readBoundedBody(req, { maxBytes: 60_000 });
+  const chunk = Buffer.alloc(1);
+  const sequence = Buffer.from('abc');
+
+  for (let index = 0; index < 20_000; index += 1) {
+    for (const value of sequence) {
+      chunk[0] = value;
+      req.emit('data', chunk);
+    }
+  }
+  req.emit('end');
+
+  const body = await bodyPromise;
+  assert.equal(body.length, 60_000);
+  assert.equal(body.slice(0, 9), 'abcabcabc');
+  assert.equal(body.slice(-9), 'abcabcabc');
+});
+
+test('bounded body readers do not reserve the full limit for tiny pending bodies', async () => {
+  const requests = [];
+  const bodies = [];
+  const before = process.memoryUsage().arrayBuffers;
+
+  for (let index = 0; index < 64; index += 1) {
+    const req = new EventEmitter();
+    requests.push(req);
+    bodies.push(readBoundedBody(req, { maxBytes: 512 * 1024 }));
+    req.emit('data', Buffer.from('x'));
+  }
+
+  const reserved = process.memoryUsage().arrayBuffers - before;
+  assert.ok(reserved < 4 * 1024 * 1024, `tiny bodies reserved ${reserved} bytes`);
+
+  for (const req of requests) req.emit('end');
+  assert.deepEqual(await Promise.all(bodies), Array(64).fill('x'));
+});
+
+test('bounded JSON reader preserves split UTF-8 and too-large errors', async () => {
+  const validReq = new EventEmitter();
+  const validPromise = readBoundedJsonBody(validReq, { maxBytes: 64 });
+  const encoded = Buffer.from('{"proof":"∎"}');
+  validReq.emit('data', encoded.subarray(0, 12));
+  validReq.emit('data', encoded.subarray(12));
+  validReq.emit('end');
+  assert.deepEqual(await validPromise, { proof: '∎' });
+
+  const oversizedReq = new EventEmitter();
+  const oversizedPromise = readBoundedBody(oversizedReq, { maxBytes: 3 });
+  oversizedReq.emit('data', Buffer.from('four'));
+  await assert.rejects(oversizedPromise, RequestBodyTooLargeError);
+});
 
 test('live bootstrap URL is tokenless and browser credentials stay in lexical scope', () => {
   const browserCapability = crypto.randomUUID();
@@ -512,4 +596,75 @@ test('design sidecar components render in scriptless CSP-sandboxed iframes', () 
   assert.match(renderer, /pointer-events:none/);
   assert.match(renderer, /\.srcdoc\s*=/);
   assert.doesNotMatch(renderer, /attachShadow|innerHTML\s*=\s*c\.html/);
+});
+
+test('design color tiles render CSS colors without URL or declaration sinks', async (t) => {
+  const root = fixture(t);
+  const previewPort = await reservePort();
+  const previewOrigin = `http://127.0.0.1:${previewPort}`;
+  const requestPaths = [];
+
+  fs.mkdirSync(path.join(root, '.impeccable'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'DESIGN.md'), `---
+colors:
+  safe: "#123456"
+  unsafe: "url(${previewOrigin}/base-color)"
+---
+# Design
+`);
+  fs.writeFileSync(path.join(root, '.impeccable', 'design.json'), JSON.stringify({
+    schemaVersion: 2,
+    extensions: {
+      colorMeta: {
+        safe: {
+          tonalRamp: [
+            '#abcdef',
+            `red; background-image: url(${previewOrigin}/ramp-color)`,
+          ],
+        },
+      },
+    },
+  }));
+  const info = await startLiveServer(t, root);
+  await startPreviewServer(t, info.port, previewPort);
+  await authorizeBrowser(info, previewOrigin);
+
+  const { chromium } = await import('@playwright/test');
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (url.origin === previewOrigin) requestPaths.push(url.pathname);
+  });
+  await page.goto(previewOrigin);
+  await page.locator('#impeccable-live-design-toggle').click();
+  await page.waitForFunction(() => {
+    const host = document.querySelector('#impeccable-live-design-host');
+    return host?.shadowRoot?.querySelectorAll('.c-hero').length === 2;
+  });
+  await page.waitForTimeout(100);
+
+  const colors = await page.evaluate(() => {
+    const shadow = document.querySelector('#impeccable-live-design-host').shadowRoot;
+    return {
+      heroes: [...shadow.querySelectorAll('.c-hero')].map((node) => ({
+        backgroundColor: node.style.backgroundColor,
+        backgroundImage: node.style.backgroundImage,
+      })),
+      ramp: [...shadow.querySelectorAll('.c-ramp > span')].map((node) => ({
+        backgroundColor: node.style.backgroundColor,
+        backgroundImage: node.style.backgroundImage,
+      })),
+    };
+  });
+
+  assert.equal(colors.heroes[0].backgroundColor, 'rgb(18, 52, 86)');
+  assert.equal(colors.heroes[1].backgroundColor, '');
+  assert.equal(colors.heroes[1].backgroundImage, '');
+  assert.equal(colors.ramp[0].backgroundColor, 'rgb(171, 205, 239)');
+  assert.equal(colors.ramp[1].backgroundColor, '');
+  assert.equal(colors.ramp[1].backgroundImage, '');
+  assert.equal(requestPaths.includes('/base-color'), false);
+  assert.equal(requestPaths.includes('/ramp-color'), false);
 });

@@ -22,7 +22,6 @@ import {
   SKIP_DIRS,
   buildImportGraph,
   detectFrameworkConfig,
-  isPortListening,
 } from '../node/file-system.mjs';
 
 const MAX_SCAN_FILE_BYTES = 1024 * 1024;
@@ -297,28 +296,14 @@ async function detectCli() {
           if (!jsonMode && !quietMode) {
             const fwConfig = detectFrameworkConfig(resolved);
             if (fwConfig) {
-              const probe = await isPortListening(fwConfig.port, fwConfig.fingerprint);
               const frameworkName = sanitizeTerminalValue(fwConfig.name);
               const frameworkPort = sanitizeTerminalValue(fwConfig.port);
               const configName = sanitizeTerminalValue(path.basename(fwConfig.configPath));
-              if (probe.listening && probe.matched) {
-                process.stderr.write(
-                  `\n${frameworkName} dev server detected on localhost:${frameworkPort}.\n` +
-                  `For more accurate results, scan the running site:\n` +
-                  `  npx impeccable detect http://localhost:${frameworkPort}\n\n`
-                );
-              } else if (probe.listening && !probe.matched) {
-                process.stderr.write(
-                  `\n${frameworkName} project detected (${configName}).\n` +
-                  `Port ${frameworkPort} is in use by another service. Start the ${frameworkName} dev server and scan via URL for best results.\n\n`
-                );
-              } else {
-                process.stderr.write(
-                  `\n${frameworkName} project detected (${configName}).\n` +
-                  `Start the dev server and scan via URL for best results:\n` +
-                  `  npx impeccable detect http://localhost:${frameworkPort}\n\n`
-                );
-              }
+              process.stderr.write(
+                `\n${frameworkName} project detected (${configName}).\n` +
+                `Start the dev server and scan via URL for best results:\n` +
+                `  npx impeccable detect http://localhost:${frameworkPort}\n\n`
+              );
             }
           }
 

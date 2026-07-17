@@ -40,7 +40,6 @@ export {
   buildImportGraph,
   resolveImport,
   detectFrameworkConfig,
-  isPortListening,
   FRAMEWORK_CONFIGS,
 } from './node/file-system.mjs';
 export { formatFindings, detectCli } from './cli/main.mjs';

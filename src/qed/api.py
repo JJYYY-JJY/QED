@@ -24,6 +24,7 @@ from pydantic import (
     field_validator,
 )
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from qed.config import QEDConfig
 from qed.inputs import RunInput
@@ -58,6 +59,7 @@ CommandKey = Annotated[
     StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"),
 ]
 _SSE_EVENT_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+_MAX_REQUEST_BODY_BYTES = 1024 * 1024
 _LOGGER = get_logger(__name__)
 
 
@@ -199,6 +201,73 @@ def _error_response(
     )
 
 
+def _declared_content_length(scope: Scope) -> int | None:
+    for name, value in scope.get("headers", ()):
+        if name.lower() != b"content-length":
+            continue
+        try:
+            length = int(value)
+        except ValueError:
+            return None
+        return length if length >= 0 else None
+    return None
+
+
+class _RequestBodyLimitMiddleware:
+    def __init__(self, app: ASGIApp, *, max_body_bytes: int) -> None:
+        self._app = app
+        self._max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        declared_length = _declared_content_length(scope)
+        if declared_length is not None and declared_length > self._max_body_bytes:
+            await self._reject(scope, receive, send)
+            return
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                first_message = message
+                break
+            chunk = message.get("body", b"")
+            if len(chunk) > self._max_body_bytes - len(body):
+                await self._reject(scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                first_message = {
+                    "type": "http.request",
+                    "body": bytes(body),
+                    "more_body": False,
+                }
+                break
+
+        delivered = False
+
+        async def replay_body() -> Message:
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return first_message
+            return await receive()
+
+        await self._app(scope, replay_body, send)
+
+    @staticmethod
+    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+        response = _error_response(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            code="request_too_large",
+            message="The request body is too large.",
+        )
+        await response(scope, receive, send)
+
+
 def _event_envelope(event: Event) -> RunEventEnvelope:
     return RunEventEnvelope(
         run_id=event.run_id,
@@ -249,6 +318,10 @@ def create_app(
     )
     app.state.application_service = selected_service
     app.state.service_settings = settings
+    app.add_middleware(
+        _RequestBodyLimitMiddleware,
+        max_body_bytes=_MAX_REQUEST_BODY_BYTES,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.allowed_origins),

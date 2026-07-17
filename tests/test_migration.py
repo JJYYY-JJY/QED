@@ -58,6 +58,42 @@ def test_legacy_import_rejects_symlinks(tmp_path: Path) -> None:
         inspect_legacy_run(source)
 
 
+@pytest.mark.parametrize("operation", ("inspect", "import"))
+def test_legacy_import_rejects_symlinked_source_ancestors(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    actual_parent = tmp_path / "actual-parent"
+    source = actual_parent / "old-run"
+    source.mkdir(parents=True)
+    (source / "proof.md").write_text("outside proof", encoding="utf-8")
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(actual_parent, target_is_directory=True)
+    linked_source = linked_parent / "old-run"
+
+    with pytest.raises(LegacyImportError, match="symbolic link"):
+        if operation == "inspect":
+            inspect_legacy_run(linked_source)
+        else:
+            import_legacy_run(linked_source, tmp_path / "managed")
+
+
+def test_legacy_import_accepts_an_ordinary_relative_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "old-run"
+    source.mkdir()
+    (source / "proof.md").write_text("proof", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    inspected = inspect_legacy_run(Path("old-run"))
+    imported = import_legacy_run(Path("old-run"), Path("managed"))
+
+    assert imported.manifest == inspected
+    assert inspected.source_root == str(source)
+
+
 def test_legacy_import_rejects_a_parent_swapped_to_a_symlink_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

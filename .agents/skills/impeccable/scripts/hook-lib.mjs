@@ -87,6 +87,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   limits: { maxFindings: 5, maxChars: 8000 },
 });
 
+const CONTEXT_BUDGET_FALLBACK = `${ENVELOPE_PREFIX} Design hook findings exceeded the configured context budget. Run ${IMPECCABLE_COMMAND} audit, then fix real design problems or explicitly classify intentional findings before finalizing.`;
+
 export const HOOK_LOCAL_IGNORE_PATTERNS = Object.freeze([
   '.impeccable/hook.cache.json',
   '.impeccable/hook.pending.json',
@@ -665,7 +667,7 @@ export function bumpEditCount(cache, sessionId, filePath) {
 }
 
 export function suppressionNotice(filePath) {
-  return `${ENVELOPE_PREFIX} Suppressing further design hints on ${filePath}. More than ${EDIT_COUNT_THRESHOLD} edits in this session reached. Run ${IMPECCABLE_COMMAND} audit to revisit.`;
+  return `${ENVELOPE_PREFIX} Suppressing further design hints on ${formatContextValue(filePath)}. More than ${EDIT_COUNT_THRESHOLD} edits in this session reached. Run ${IMPECCABLE_COMMAND} audit to revisit.`;
 }
 
 // Glob → RegExp. Supports `**`, `*`, `?`, and `{a,b}` alternation.
@@ -878,7 +880,7 @@ export function renderTemplate(findings, filePath, config, opts = {}) {
   const shown = findings.slice(0, cap);
   const remaining = total - shown.length;
 
-  const header = `${ENVELOPE_PREFIX} Design hook findings requiring review in ${display} (${total} issue(s)):`;
+  const header = `${ENVELOPE_PREFIX} Design hook findings requiring review in ${formatContextValue(display)} (${total} issue(s)):`;
   const lines = shown.map((f) => formatFindingLine(f));
   const more = remaining > 0
     ? `... and ${remaining} more (see ${IMPECCABLE_COMMAND} audit).`
@@ -916,7 +918,8 @@ function renderGroupedTemplate(groups, config, opts = {}) {
 
   for (const group of realGroups) {
     const display = relativize(group.filePath, cwd);
-    lines.push(`${display} (${group.findings.length} issue(s)):`);
+    const contextDisplay = formatContextValue(display);
+    lines.push(`${contextDisplay} (${group.findings.length} issue(s)):`);
     const remainingCap = Math.max(0, cap - shownCount);
     const shown = group.findings.slice(0, remainingCap);
     for (const finding of shown) {
@@ -925,7 +928,7 @@ function renderGroupedTemplate(groups, config, opts = {}) {
     shownCount += shown.length;
     const hidden = group.findings.length - shown.length;
     if (hidden > 0) {
-      lines.push(`- ... ${hidden} more in ${display} (see ${IMPECCABLE_COMMAND} audit).`);
+      lines.push(`- ... ${hidden} more in ${contextDisplay} (see ${IMPECCABLE_COMMAND} audit).`);
     }
   }
 
@@ -949,13 +952,13 @@ function clampGroupedToBudget(header, lines, footer, maxChars) {
   let working = lines.slice();
   let omitted = false;
   let assembled = assemble(working, omitted);
-  while (assembled.length > maxChars && working.length > 1) {
+  while (assembled.length > maxChars && working.length > 0) {
     working.pop();
     omitted = true;
     assembled = assemble(working, omitted);
   }
   if (assembled.length > maxChars) {
-    assembled = `${assembled.slice(0, maxChars - 1)}…`;
+    assembled = CONTEXT_BUDGET_FALLBACK;
   }
   return assembled;
 }
@@ -972,13 +975,13 @@ function clampToBudget(header, lines, more, footer, maxChars) {
   let working = lines.slice();
   let moreText = more;
   let assembled = assemble(working, moreText);
-  while (assembled.length > maxChars && working.length > 1) {
+  while (assembled.length > maxChars && working.length > 0) {
     working.pop();
     moreText = `... and more (see ${IMPECCABLE_COMMAND} audit).`;
     assembled = assemble(working, moreText);
   }
   if (assembled.length > maxChars) {
-    assembled = `${assembled.slice(0, maxChars - 1)}…`;
+    assembled = CONTEXT_BUDGET_FALLBACK;
   }
   return assembled;
 }
@@ -992,9 +995,30 @@ function formatFindingLine(f) {
   const nameSegment = name ? `${name.replace(/\.+\s*$/, '')}.` : '';
   const ignoreCommand = formatFindingIgnoreCommand(f);
   const ignoreSegment = ignoreCommand
-    ? ` If the user explicitly confirms this value is intentional: \`${ignoreCommand}\`.`
+    ? ` If the user explicitly confirms this value is intentional: ${formatInlineCode(ignoreCommand)}.`
     : '';
   return `${prefix} [${f.antipattern}] ${nameSegment} ${desc}${ignoreSegment}`.replace(/\s+/g, ' ').trim();
+}
+
+function formatInlineCode(value) {
+  const text = String(value);
+  let longestDelimiterRun = 0;
+  let currentRun = 0;
+  for (const character of text) {
+    currentRun = character === '`' ? currentRun + 1 : 0;
+    longestDelimiterRun = Math.max(longestDelimiterRun, currentRun);
+  }
+  const delimiter = '`'.repeat(longestDelimiterRun + 1);
+  const padding = text.startsWith('`') || text.endsWith('`') ? ' ' : '';
+  return `${delimiter}${padding}${text}${padding}${delimiter}`;
+}
+
+function formatContextValue(value) {
+  const singleLine = String(value).replace(
+    /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu,
+    character => `\\u{${character.codePointAt(0).toString(16).padStart(4, '0')}}`,
+  );
+  return formatInlineCode(singleLine);
 }
 
 function formatFindingIgnoreCommand(finding) {
@@ -1430,7 +1454,7 @@ const STEER_LINE = 'That does not mean the design is good: keep following the pr
 export function renderCleanAck(filePath, opts = {}) {
   const cwd = opts.cwd || process.cwd();
   const display = relativize(filePath, cwd);
-  return `${ENVELOPE_PREFIX} Design hook scanned ${display}. No deterministic design-quality issues found. ${STEER_LINE}`;
+  return `${ENVELOPE_PREFIX} Design hook scanned ${formatContextValue(display)}. No deterministic design-quality issues found. ${STEER_LINE}`;
 }
 
 export function renderPendingAck(filePath, knownFindings, opts = {}) {
@@ -1438,9 +1462,9 @@ export function renderPendingAck(filePath, knownFindings, opts = {}) {
   const display = relativize(filePath, cwd);
   const count = knownFindings.length;
   // `knownFindings` here are the cache strings like "side-tab:3".
-  const sample = knownFindings.slice(0, 3).join(', ');
+  const sample = knownFindings.slice(0, 3).map(formatContextValue).join(', ');
   const more = count > 3 ? `, +${count - 3} more` : '';
-  return `${ENVELOPE_PREFIX} Design hook scanned ${display}. Still has ${count} finding(s) flagged earlier this session (${sample}${more}). Handle them before finalizing — the previous reminder still applies.`;
+  return `${ENVELOPE_PREFIX} Design hook scanned ${formatContextValue(display)}. Still has ${count} finding(s) flagged earlier this session (${sample}${more}). Handle them before finalizing — the previous reminder still applies.`;
 }
 
 export function shouldEmitAckForFile(filePath, config = null) {
@@ -1483,9 +1507,13 @@ export function appendDesignSystemNote(text, scanOptions) {
 //      reply is the cheapest way to make the feedback loop visible.
 function directiveFooter(display, opts = {}) {
   const ignoreFileCommand = `${IMPECCABLE_COMMAND} hooks ignore-file ${quoteCommandArg(display)}`;
-  const fileIgnoreGuidance = opts.grouped
+  const unsafeExactPath = (
+    /[\u0000-\u001f\u007f-\u009f\u2028\u2029*?{}]/u.test(display)
+    || display !== display.trim()
+  );
+  const fileIgnoreGuidance = opts.grouped || unsafeExactPath
     ? `run \`${IMPECCABLE_COMMAND} hooks ignore-file <path>\` for the specific file`
-    : `run \`${ignoreFileCommand}\``;
+    : `run ${formatInlineCode(ignoreFileCommand)}`;
   return [
     'Handle these before finalizing: fix findings that are real design problems, or explicitly classify contextually intentional findings as false positives. Acknowledge what you changed or why you are leaving a finding unchanged.',
     '',

@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { readContainedFile } from '../../lib/safe-fs.mjs';
+
 // ---------------------------------------------------------------------------
 // File walker
 // ---------------------------------------------------------------------------
@@ -97,95 +99,59 @@ function buildImportGraph(files, options = {}) {
 
 const FRAMEWORK_CONFIGS = [
   { name: 'Next.js', files: ['next.config.js', 'next.config.mjs', 'next.config.ts'], defaultPort: 3000,
-    portRe: /port\s*[:=]\s*(\d+)/,
-    fingerprint: { header: 'x-powered-by', value: /next/i } },
+    portRe: /port\s*[:=]\s*(\d+)/ },
   { name: 'SvelteKit', files: ['svelte.config.js', 'svelte.config.ts'], defaultPort: 5173,
-    portRe: /port\s*[:=]\s*(\d+)/,
-    fingerprint: { header: 'x-sveltekit-page', value: null } },
+    portRe: /port\s*[:=]\s*(\d+)/ },
   { name: 'Nuxt', files: ['nuxt.config.js', 'nuxt.config.ts'], defaultPort: 3000,
-    portRe: /port\s*[:=]\s*(\d+)/,
-    fingerprint: { header: 'x-powered-by', value: /nuxt/i } },
+    portRe: /port\s*[:=]\s*(\d+)/ },
   { name: 'Vite', files: ['vite.config.js', 'vite.config.ts', 'vite.config.mjs'], defaultPort: 5173,
-    portRe: /port\s*[:=]\s*(\d+)/,
-    fingerprint: { body: /@vite\/client/ } },
+    portRe: /port\s*[:=]\s*(\d+)/ },
   { name: 'Astro', files: ['astro.config.js', 'astro.config.ts', 'astro.config.mjs'], defaultPort: 4321,
-    portRe: /port\s*[:=]\s*(\d+)/,
-    fingerprint: { body: /astro/i } },
+    portRe: /port\s*[:=]\s*(\d+)/ },
   { name: 'Angular', files: ['angular.json'], defaultPort: 4200,
-    portRe: /"port"\s*:\s*(\d+)/,
-    fingerprint: { body: /ng-version/i } },
+    portRe: /"port"\s*:\s*(\d+)/ },
   { name: 'Remix', files: ['remix.config.js', 'remix.config.ts'], defaultPort: 3000,
-    portRe: /port\s*[:=]\s*(\d+)/,
-    fingerprint: { header: 'x-powered-by', value: /remix/i } },
+    portRe: /port\s*[:=]\s*(\d+)/ },
 ];
+
+const MAX_FRAMEWORK_CONFIG_BYTES = 1024 * 1024;
+
+function isValidPort(port) {
+  return Number.isInteger(port) && port >= 1 && port <= 65535;
+}
 
 function detectFrameworkConfig(dir) {
   let entries;
-  try { entries = fs.readdirSync(dir); } catch { return null; }
-  const entrySet = new Set(entries);
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+  const fileNames = new Set(
+    entries.filter(entry => entry.isFile()).map(entry => entry.name),
+  );
 
   for (const cfg of FRAMEWORK_CONFIGS) {
-    const match = cfg.files.find(f => entrySet.has(f));
+    const match = cfg.files.find(file => fileNames.has(file));
     if (!match) continue;
 
     const configPath = path.join(dir, match);
-    let port = cfg.defaultPort;
+    let content;
     try {
-      const content = fs.readFileSync(configPath, 'utf-8');
-      const portMatch = content.match(cfg.portRe);
-      if (portMatch) port = parseInt(portMatch[1], 10);
-    } catch { /* use default */ }
+      content = readContainedFile(
+        dir,
+        match,
+        'utf-8',
+        { maxBytes: MAX_FRAMEWORK_CONFIG_BYTES },
+      );
+    } catch {
+      continue;
+    }
 
-    return { name: cfg.name, port, configPath, fingerprint: cfg.fingerprint };
+    let port = cfg.defaultPort;
+    const portMatch = content.match(cfg.portRe);
+    const configuredPort = portMatch ? Number(portMatch[1]) : null;
+    if (isValidPort(configuredPort)) port = configuredPort;
+
+    return { name: cfg.name, port, configPath };
   }
   return null;
-}
-
-/**
- * Check if a port is listening and optionally verify it matches the expected framework.
- * Returns { listening: true, matched: true/false } or { listening: false }.
- */
-async function isPortListening(port, fingerprint = null) {
-  if (!fingerprint) {
-    // Simple TCP probe fallback
-    const net = await import('node:net');
-    return new Promise((resolve) => {
-      const sock = net.default.createConnection({ port, host: '127.0.0.1' });
-      sock.setTimeout(500);
-      sock.on('connect', () => { sock.destroy(); resolve({ listening: true, matched: true }); });
-      sock.on('error', () => resolve({ listening: false }));
-      sock.on('timeout', () => { sock.destroy(); resolve({ listening: false }); });
-    });
-  }
-
-  // HTTP probe with fingerprint matching
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 2000);
-    const res = await fetch(`http://localhost:${port}/`, { signal: controller.signal, redirect: 'follow' });
-    clearTimeout(timeout);
-
-    // Check header fingerprint
-    if (fingerprint.header) {
-      const val = res.headers.get(fingerprint.header);
-      if (val && (!fingerprint.value || fingerprint.value.test(val))) {
-        return { listening: true, matched: true };
-      }
-    }
-
-    // Check body fingerprint
-    if (fingerprint.body) {
-      const body = await res.text();
-      if (fingerprint.body.test(body)) {
-        return { listening: true, matched: true };
-      }
-    }
-
-    // Port is listening but doesn't match the expected framework
-    return { listening: true, matched: false };
-  } catch {
-    return { listening: false };
-  }
 }
 
 export {
@@ -197,5 +163,4 @@ export {
   buildImportGraph,
   FRAMEWORK_CONFIGS,
   detectFrameworkConfig,
-  isPortListening,
 };

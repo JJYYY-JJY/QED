@@ -11,24 +11,40 @@ export function readBoundedBody(req, { maxBytes }) {
     throw new Error('maxBytes must be a positive integer');
   }
   return new Promise((resolve, reject) => {
-    const chunks = [];
+    let body = null;
     let total = 0;
     let settled = false;
 
     req.on('data', (chunk) => {
       if (settled) return;
-      total += chunk.length;
-      if (total > maxBytes) {
+      const nextTotal = total + chunk.length;
+      if (nextTotal > maxBytes) {
         settled = true;
+        body = null;
         reject(new RequestBodyTooLargeError(maxBytes));
         return;
       }
-      chunks.push(chunk);
+      if (body === null || body.length < nextTotal) {
+        let nextCapacity = body?.length || Math.min(1024, maxBytes);
+        while (nextCapacity < nextTotal) {
+          nextCapacity = Math.min(
+            maxBytes,
+            Math.max(nextTotal, nextCapacity * 2),
+          );
+        }
+        const grown = Buffer.allocUnsafe(nextCapacity);
+        if (body !== null) body.copy(grown, 0, 0, total);
+        body = grown;
+      }
+      body.set(chunk, total);
+      total = nextTotal;
     });
     req.on('end', () => {
       if (settled) return;
       settled = true;
-      resolve(Buffer.concat(chunks).toString('utf-8'));
+      const text = body ? body.toString('utf-8', 0, total) : '';
+      body = null;
+      resolve(text);
     });
     req.on('error', (error) => {
       if (settled) return;

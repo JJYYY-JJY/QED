@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.types import Message, Scope
 
 from qed.api import create_app
 from qed.config import QEDConfig
@@ -152,6 +155,108 @@ def test_bearer_auth_is_enforced_without_exposing_the_secret(tmp_path: Path) -> 
     assert missing.headers["www-authenticate"] == "Bearer"
     assert missing.json()["error"]["code"] == "authentication_required"
     assert token not in missing.text + wrong.text + accepted.text
+
+
+def test_run_creation_rejects_declared_and_streamed_oversized_bodies_before_auth(
+    tmp_path: Path,
+) -> None:
+    token = "s" * 32
+    service = _service(tmp_path)
+    app = create_app(
+        settings=ServiceSettings(data_root=tmp_path, auth_token=token),
+        service=service,
+    )
+    oversized_body = json.dumps(
+        {
+            "run_id": "run-oversized",
+            "run_input": {"problem": "P" * (1024 * 1024)},
+        }
+    )
+
+    with TestClient(app) as client:
+        declared_response = client.post(
+            "/api/v1/runs",
+            content=oversized_body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert service.list_runs() == ()
+
+    async def post_streamed_body() -> list[Message]:
+        received: list[Message] = [
+            {"type": "http.request", "body": b"x" * 600_000, "more_body": True},
+            {"type": "http.request", "body": b"y" * 600_000, "more_body": False},
+        ]
+        sent: list[Message] = []
+
+        async def receive() -> Message:
+            return received.pop(0)
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        scope: Scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/v1/runs",
+            "raw_path": b"/api/v1/runs",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 12345),
+            "server": ("127.0.0.1", 8000),
+            "state": {},
+        }
+        await app(scope, receive, send)
+        return sent
+
+    streamed_messages = asyncio.run(post_streamed_body())
+    streamed_start = next(
+        message for message in streamed_messages if message["type"] == "http.response.start"
+    )
+    streamed_body = b"".join(
+        message.get("body", b"")
+        for message in streamed_messages
+        if message["type"] == "http.response.body"
+    )
+
+    assert declared_response.status_code == 413
+    assert declared_response.json()["error"]["code"] == "request_too_large"
+    assert streamed_start["status"] == 413
+    assert json.loads(streamed_body)["error"]["code"] == "request_too_large"
+
+
+@pytest.mark.parametrize(
+    "run_input",
+    (
+        {"problem": "P" * 131_073},
+        {"problem": "Prove P.", "prove_guidance": "G" * 65_537},
+        {
+            "problem": "Prove P.",
+            "verification_rules": ["R" * 8_193],
+        },
+        {
+            "problem": "Prove P.",
+            "verification_rules": [f"Check condition {index}." for index in range(65)],
+        },
+    ),
+)
+def test_run_creation_rejects_inputs_beyond_finite_schema_bounds(
+    tmp_path: Path,
+    run_input: dict[str, object],
+) -> None:
+    app = create_app(
+        settings=ServiceSettings(data_root=tmp_path),
+        service=_service(tmp_path),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/runs", json={"run_input": run_input})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 def test_api_maps_not_found_and_validation_errors_to_safe_envelopes(tmp_path: Path) -> None:

@@ -103,15 +103,24 @@ def _open_directory_at(
 def _pinned_directory(path: Path) -> Iterator[tuple[int, Path]]:
     descriptor: int | None = None
     try:
-        descriptor = os.open(path, _descriptor_flags(directory=True))
+        absolute_path = path.absolute()
+        descriptor = os.open(
+            absolute_path.anchor,
+            _descriptor_flags(directory=True),
+        )
+        for index, component in enumerate(absolute_path.parts[1:], start=1):
+            child_descriptor = _open_directory_at(
+                descriptor,
+                component,
+                display_path=str(Path(*absolute_path.parts[: index + 1])),
+            )
+            os.close(descriptor)
+            descriptor = child_descriptor
         metadata = os.fstat(descriptor)
         if not stat.S_ISDIR(metadata.st_mode):
             raise LegacyImportError(f"legacy source is not a directory: {path}")
-        resolved = path.resolve(strict=True)
-        resolved_metadata = os.stat(resolved, follow_symlinks=False)
-        if not _same_file(metadata, resolved_metadata):
-            raise LegacyImportError("legacy source changed while it was being opened")
-        yield descriptor, resolved
+        source_root = Path(os.path.normpath(absolute_path))
+        yield descriptor, source_root
     except LegacyImportError:
         raise
     except OSError as exc:
