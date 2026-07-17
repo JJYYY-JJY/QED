@@ -1,0 +1,222 @@
+# Operations
+
+QED runs as one FastAPI process with a local Codex runtime and a managed SQLite
+data root. Use one durable data root per deployment. Place it on local storage
+that supports file locks and `fsync`.
+
+## Start the service
+
+For a local research workstation:
+
+```bash
+uv sync --all-groups --frozen
+uv run qed init --data-root .qed
+uv run qed --log-level info --log-format json serve \
+  --data-root .qed \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --runtime codex
+```
+
+The live runtime uses the active Codex authentication context. Confirm that
+Codex can authenticate before you start a research run. QED requires the exact
+configured model in that account's model catalog.
+
+`GET /api/v1/capabilities` provides a process-readiness check:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8000/api/v1/capabilities
+```
+
+QED has no separate liveness endpoint. A successful capabilities response
+proves that FastAPI can serve requests; the first run also probes Codex model
+and feature capabilities.
+
+## Remote bind
+
+A non-loopback bind requires a bearer token of at least 32 characters. Put the
+service behind a TLS reverse proxy, set an exact CORS allowlist, and keep the
+App Server process on local stdio.
+
+```bash
+export QED_AUTH_TOKEN="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export QED_ALLOWED_ORIGINS='["https://qed.example.org"]'
+
+uv run qed --log-level info --log-format json serve \
+  --data-root /srv/qed \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --runtime codex
+```
+
+Do not expose Codex App Server, the SQLite files, or the export directory
+through the reverse proxy. The API uses bearer authentication rather than a
+multi-user identity or authorization model. Use one trusted research group per
+deployment or add an external access-control layer.
+
+The browser console never receives the QED bearer token. For remote browser
+access, use a same-origin backend-for-frontend (BFF) that authenticates users
+with an HttpOnly, Secure, SameSite session cookie and adds the QED bearer header
+on the server-side proxy hop. Bind QED to a private interface that only the BFF
+can reach.
+
+## Run the web console
+
+For local development, start the tokenless loopback API on port 8000 and Vite on
+port 5173:
+
+```bash
+npm ci
+npm run dev
+```
+
+Vite proxies `/api` to `http://127.0.0.1:8000`. Open
+<http://127.0.0.1:5173>.
+
+Build static production assets with:
+
+```bash
+npm run build
+```
+
+The build writes `dist/`. Serve that directory from the same origin as the BFF
+and route `/api` through the BFF to QED. Do not put a bearer token in a Vite
+environment variable, HTML, JavaScript bundle, browser storage, or request made
+by browser JavaScript.
+
+## Run commands
+
+Start one blocking CLI run:
+
+```bash
+uv run qed run \
+  'Prove that the square of every odd integer is congruent to 1 modulo 8.' \
+  --run-id odd-square-001 \
+  --guidance 'Parameterize the odd integer.' \
+  --verification-rule 'Check every divisibility claim.' \
+  --data-root .qed
+```
+
+Inspect, cancel, or resume the durable run from another terminal:
+
+```bash
+uv run qed status odd-square-001 --data-root .qed
+uv run qed cancel odd-square-001 \
+  --idempotency-key odd-square-cancel-1 \
+  --data-root .qed
+uv run qed resume odd-square-001 \
+  --idempotency-key odd-square-resume-1 \
+  --data-root .qed
+```
+
+Reuse a command's idempotency key when a transport failure leaves its response
+unknown. Choose a new key when you intend a new resume attempt. The service
+queues accepted run workers when active run configurations leave no capacity.
+
+## Event streaming
+
+The event route replays stored events and then follows the run until a terminal
+status:
+
+```bash
+curl --no-buffer \
+  http://127.0.0.1:8000/api/v1/runs/odd-square-001/events
+```
+
+Each SSE `id` equals the store-assigned event sequence. Reconnect with the last
+processed value:
+
+```bash
+curl --no-buffer \
+  --header 'Last-Event-ID: 42' \
+  http://127.0.0.1:8000/api/v1/runs/odd-square-001/events
+```
+
+The service sends comment heartbeats during quiet periods. Proxies must disable
+response buffering and keep streaming connections open. Add the bearer header
+when authentication is active.
+
+## Shutdown and recovery
+
+Send the service process `SIGINT` or `SIGTERM` through your process supervisor.
+Service shutdown cancels in-process workers. The workflow asks the runtime to
+interrupt active turns, retains frozen records, and normally marks the run
+`paused` and releases its lease after each turn reports a terminal event. Start
+the service against the same data root and resume each paused run with a stable
+idempotency key.
+
+A browser or SSE disconnect does not stop a run. Use the cancel command when you
+want the workflow to stop. Cancellation first records `cancelling`, interrupts
+active turns, and records `cancelled` only after every started turn has a
+confirmed terminal event. Fenced lifecycle events that arrive during
+`cancelling` continue draining, and a late terminal remains attached to an
+in-process reconciliation pump. The execution owner then releases its lease.
+
+QED records `runtime.turn_attempt_started` before invoking the runtime. A normal
+EOF before any remote thread starts is closed by `runtime.turn_not_started`.
+Local runtime preflight rejections happen before the attempt is recorded. If a
+start may have been accepted but its turn identity was not recovered, QED
+records `runtime.turn_start_unconfirmed`. If the identity is known but the
+stream or protocol ends without a terminal event, QED records
+`runtime.turn_terminal_unconfirmed`. Either ambiguous state fails closed: QED
+will not acknowledge cancellation, release the execution, resume, or allow a
+replacement execution even after lease expiry. Preserve the database and
+runtime logs and treat a state that cannot be reconciled as an incident. Do not
+edit SQLite to force a resume; normal resume is available only after the
+attempt is proven not started or its matching terminal is durably recorded.
+
+QED marks schema, runtime, output, integrity, and exhausted-budget failures as
+`failed`. A failed run keeps its events and artifacts for audit. Paused,
+cancelled, and failed runs may resume from their current durable stage. Resume
+requires no unconfirmed runtime turn or live execution lease. It does not
+restore exhausted budgets or discard earlier attempts, so correct the underlying
+runtime or policy problem before retrying a failed run.
+
+## Backups
+
+Stop the service before a filesystem backup. Copy the complete data root so the
+backup contains the SQLite database, WAL files, exports, and legacy imports:
+
+```bash
+cp -a /srv/qed /srv/backups/qed-2026-07-16
+```
+
+Restore into a new empty path, start QED against that path, and inspect runs with
+`qed status` or the API before opening it to users. The current release opens
+SQLite schema version 2 and automatically upgrades version 1; it rejects other
+database schema versions. Typed records retain their separate schema version 1.
+The project has no retention task, remote backup task, or manual schema
+migration command, so the operator owns backup rotation and upgrade sequencing.
+
+## Upgrade procedure
+
+1. Stop the service and back up the complete data root.
+2. Check out the reviewed release commit.
+3. Run `uv sync --all-groups --frozen` and the repository verification commands.
+4. Start QED on loopback against a copy of production data, allowing any
+   supported database schema upgrade to run there first.
+5. Check the resulting database version, capabilities, snapshots, export paths,
+   and one paused-run resume.
+6. Start the production service and retain the prior binary plus backup for
+   rollback.
+
+Do not run two QED versions against one data root during an upgrade.
+
+## Logs and diagnostics
+
+The CLI writes command responses to stdout and structured logs to stderr. JSON
+is the default log format. Set `--log-level info` for lifecycle events and use
+`--log-format console` for an interactive workstation.
+
+Log records include event names, run IDs, and error types. API errors return a
+diagnostic ID without returning internal exception text. QED redacts known
+secret keys and bearer values. Keep input problem text and credentials out of
+external log context added by a proxy or supervisor.
+
+The durable event log provides the audit timeline. Use
+`GET /api/v1/runs/{run_id}/snapshot` for the complete typed state and inspect
+`manifest.json` for research-record and turn-input hashes, thread/turn lineage,
+proof-linked findings, runtime resolutions, execution segments, input/output
+and cached-input/reasoning-output token totals, turn and search-query counts,
+execution timing, terminal `completed` status, explicit code-derived `PASS`,
+and the canonical event-chain hash.
