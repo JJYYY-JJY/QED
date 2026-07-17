@@ -65,7 +65,8 @@ def test_config_is_codex_only_strict_and_safe_by_default() -> None:
     # Effort remains capability-driven rather than an enum frozen in this repository.
     assert QEDConfig(effort="future-supported-effort").effort == "future-supported-effort"
     assert QEDConfig(backend="exec").backend == "exec"
-    assert SandboxPolicy(prover="workspace-write").prover == "workspace-write"
+    with pytest.raises(ValidationError):
+        SandboxPolicy(prover="workspace-write")
 
     with pytest.raises(ValidationError):
         QEDConfig(effort="")

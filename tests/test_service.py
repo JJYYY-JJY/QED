@@ -336,10 +336,12 @@ async def test_service_uses_only_the_explicit_runtime_factory_and_closes_once(
 ) -> None:
     runtime = ClosingRuntime()
     calls = 0
+    codex_homes: list[Path] = []
 
-    def factory() -> ClosingRuntime:
+    def factory(codex_home: Path) -> ClosingRuntime:
         nonlocal calls
         calls += 1
+        codex_homes.append(codex_home)
         return runtime
 
     service = build_service(
@@ -353,6 +355,7 @@ async def test_service_uses_only_the_explicit_runtime_factory_and_closes_once(
     await service.close()
 
     assert calls == 1
+    assert codex_homes == [tmp_path / "codex-home"]
     assert runtime.close_count == 1
 
 

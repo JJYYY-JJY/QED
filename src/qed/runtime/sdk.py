@@ -15,6 +15,7 @@ from .app_server import (
     _UsageParams,
 )
 from .base import CodexRuntime
+from .isolation import codex_home_environment, server_config
 from .models import (
     CapabilityRequest,
     ForkThread,
@@ -36,6 +37,7 @@ from .models import (
     UnknownNotification,
     WebSearchMode,
 )
+from .stdio import build_app_server_argv
 
 
 class _SdkHandle(Protocol):
@@ -72,17 +74,24 @@ class SdkRuntime:
         *,
         capability_runtime: CodexRuntime | None = None,
         executable: Path | None = None,
+        codex_home: Path | None = None,
     ) -> None:
         if client is None:
-            if executable is None or not executable.is_absolute():
+            if (
+                executable is None
+                or not executable.is_absolute()
+                or codex_home is None
+            ):
                 raise ValueError(
-                    "SdkRuntime requires the resolved absolute Codex executable"
+                    "SdkRuntime requires the resolved executable and server-owned Codex home"
                 )
             client = cast(
                 _SdkClient,
                 AsyncCodex(
                     CodexConfig(
                         codex_bin=str(executable),
+                        launch_args_override=build_app_server_argv(executable),
+                        env=codex_home_environment(codex_home),
                         experimental_api=False,
                     )
                 ),
@@ -92,7 +101,7 @@ class SdkRuntime:
         self._handles: dict[tuple[str, str], _SdkHandle] = {}
 
     def supports(self, request: RunRequest) -> bool:
-        if request.effort == "auto" or request.command_network is not None:
+        if request.effort == "auto":
             return False
         if request.web_search is WebSearchMode.INDEXED:
             return False
@@ -121,10 +130,10 @@ class SdkRuntime:
         sandbox = self._sandbox(request.sandbox)
         lifecycle: dict[str, Any] = {
             "approval_mode": ApprovalMode.deny_all,
-            "cwd": str(request.cwd) if request.cwd is not None else None,
+            "cwd": str(request.cwd),
             "model": request.model,
             "sandbox": sandbox,
-            "config": {"web_search": request.web_search.value},
+            "config": server_config(request.web_search),
         }
         if isinstance(request.thread, FreshThread):
             thread = await self._client.thread_start(**lifecycle)
@@ -139,7 +148,7 @@ class SdkRuntime:
         handle = await thread.turn(
             request.prompt,
             approval_mode=ApprovalMode.deny_all,
-            cwd=str(request.cwd) if request.cwd is not None else None,
+            cwd=str(request.cwd),
             effort=ReasoningEffort(request.effort),
             model=request.model,
             output_schema=request.output_schema,
@@ -258,9 +267,9 @@ class SdkRuntime:
 
     @staticmethod
     def _sandbox(mode: SandboxMode) -> Sandbox:
-        if mode is SandboxMode.READ_ONLY:
-            return Sandbox.read_only
-        return Sandbox.workspace_write
+        if mode is not SandboxMode.READ_ONLY:
+            raise ValueError("QED runtime turns must be read-only")
+        return Sandbox.read_only
 
     async def interrupt(self, turn: TurnRef) -> None:
         if turn.backend is not RuntimeBackend.SDK:

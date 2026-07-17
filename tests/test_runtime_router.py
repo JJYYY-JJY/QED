@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import stat
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +16,7 @@ from qed.runtime import (
     RuntimePreference,
     ThreadStarted,
     TurnRef,
+    create_codex_runtime,
 )
 
 
@@ -71,7 +74,21 @@ def _request(
         prompt="Return a verdict.",
         output_schema={"type": "object", "additionalProperties": False},
         runtime=runtime,
+        cwd=Path("/var/lib/qed/turns/test"),
     )
+
+
+async def test_runtime_factory_creates_private_server_codex_home(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+
+    runtime = create_codex_runtime(codex_home)
+    try:
+        assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+        assert not (codex_home / "auth.json").exists()
+    finally:
+        await runtime.close()
 
 
 async def test_explicit_effort_streams_never_reprobe_live_capabilities() -> None:

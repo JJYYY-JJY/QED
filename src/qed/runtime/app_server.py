@@ -5,6 +5,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .isolation import server_config
 from .models import (
     CapabilityRequest,
     ForkThread,
@@ -17,7 +18,6 @@ from .models import (
     RuntimeCapabilities,
     RuntimeErrorEvent,
     RuntimeEvent,
-    SandboxMode,
     ThreadStarted,
     TokenUsage,
     TokenUsageUpdated,
@@ -321,9 +321,8 @@ class AppServerRuntime:
             "sandbox": request.sandbox.value,
             "model": request.model,
             "config": self._thread_config(request),
+            "cwd": str(request.cwd),
         }
-        if request.cwd is not None:
-            params["cwd"] = str(request.cwd)
         if isinstance(request.thread, FreshThread):
             return "thread/start", params
         if isinstance(request.thread, ResumeThread):
@@ -336,44 +335,23 @@ class AppServerRuntime:
 
     @staticmethod
     def _thread_config(request: RunRequest) -> dict[str, Any]:
-        config: dict[str, Any] = {"web_search": request.web_search.value}
-        if request.command_network is not None:
-            config["features"] = {
-                "network_proxy": {
-                    "enabled": True,
-                    "mode": "limited",
-                    "domains": {domain: "allow" for domain in request.command_network.domains},
-                    "allow_local_binding": False,
-                    "allow_upstream_proxy": False,
-                }
-            }
-        return config
+        return server_config(request.web_search)
 
     @staticmethod
     def _turn_request(request: RunRequest, thread_id: str) -> dict[str, Any]:
-        network_access = request.command_network is not None
-        if request.sandbox is SandboxMode.READ_ONLY:
-            sandbox_policy: dict[str, Any] = {
-                "type": "readOnly",
-                "networkAccess": network_access,
-            }
-        else:
-            sandbox_policy = {
-                "type": "workspaceWrite",
-                "writableRoots": [],
-                "networkAccess": network_access,
-            }
         params: dict[str, Any] = {
             "threadId": thread_id,
             "input": [{"type": "text", "text": request.prompt}],
             "approvalPolicy": "never",
-            "sandboxPolicy": sandbox_policy,
+            "sandboxPolicy": {
+                "type": "readOnly",
+                "networkAccess": False,
+            },
             "model": request.model,
             "effort": request.effort,
             "outputSchema": request.output_schema,
+            "cwd": str(request.cwd),
         }
-        if request.cwd is not None:
-            params["cwd"] = str(request.cwd)
         return params
 
     @staticmethod

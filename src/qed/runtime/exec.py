@@ -10,6 +10,11 @@ from uuid import uuid4
 
 from .app_server import RuntimeProtocolError
 from .base import CodexRuntime
+from .isolation import (
+    codex_home_environment,
+    codex_subprocess_environment,
+    server_config_overrides,
+)
 from .models import (
     CapabilityRequest,
     ForkThread,
@@ -53,16 +58,19 @@ class _ActiveExec:
         self.stop_lock = asyncio.Lock()
 
 
-ExecProcessFactory = Callable[[tuple[str, ...], Path], Awaitable[Any]]
+ExecProcessFactory = Callable[[tuple[str, ...], Path, Path], Awaitable[Any]]
 
 
-async def _spawn(argv: tuple[str, ...], cwd: Path) -> _ExecProcess:
+async def _spawn(
+    argv: tuple[str, ...], cwd: Path, codex_home: Path
+) -> _ExecProcess:
     process = await asyncio.create_subprocess_exec(  # noqa: S603 - absolute argv, no shell
         *argv,
         cwd=cwd,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=codex_subprocess_environment(codex_home),
     )
     if process.stdout is None or process.stderr is None:
         process.terminate()
@@ -82,18 +90,16 @@ def build_exec_argv(
         raise ValueError("codex exec requires a capability-resolved effort")
     if isinstance(request.thread, ForkThread):
         raise ValueError("codex exec cannot fork a thread")
-    if request.sandbox is not SandboxMode.READ_ONLY or request.command_network is not None:
-        raise ValueError("codex exec fallback is restricted to offline read-only turns")
+    if request.sandbox is not SandboxMode.READ_ONLY:
+        raise ValueError("codex exec fallback is restricted to read-only turns")
 
-    controls = (
-        "-c",
-        'approval_policy="never"',
-        "-c",
-        'sandbox_mode="read-only"',
-        "-c",
-        f"model_reasoning_effort={json.dumps(request.effort)}",
-        "-c",
-        f"web_search={json.dumps(request.web_search.value)}",
+    controls = tuple(
+        item
+        for override in (
+            *server_config_overrides(request.web_search),
+            f"model_reasoning_effort={json.dumps(request.effort)}",
+        )
+        for item in ("-c", override)
     )
     common = (
         "--strict-config",
@@ -115,7 +121,6 @@ def build_exec_argv(
             request.thread.thread_id,
             request.prompt,
         )
-    cwd = request.cwd if request.cwd is not None else Path.cwd()
     return (
         str(executable),
         "exec",
@@ -123,7 +128,7 @@ def build_exec_argv(
         "--sandbox",
         "read-only",
         "--cd",
-        str(cwd),
+        str(request.cwd),
         "--",
         request.prompt,
     )
@@ -136,6 +141,7 @@ class ExecRuntime:
         self,
         executable: Path,
         *,
+        codex_home: Path,
         process_factory: ExecProcessFactory = _spawn,
         turn_id_factory: Callable[[], str] = lambda: str(uuid4()),
         capability_runtime: CodexRuntime | None = None,
@@ -143,9 +149,11 @@ class ExecRuntime:
     ) -> None:
         if not executable.is_absolute():
             raise ValueError("codex exec executable must be absolute")
+        codex_home_environment(codex_home)
         if terminate_timeout_seconds <= 0:
             raise ValueError("codex exec termination timeout must be positive")
         self._executable = executable
+        self._codex_home = codex_home
         self._process_factory = process_factory
         self._turn_id_factory = turn_id_factory
         self._capability_runtime = capability_runtime
@@ -157,7 +165,6 @@ class ExecRuntime:
             request.effort != "auto"
             and not isinstance(request.thread, ForkThread)
             and request.sandbox is SandboxMode.READ_ONLY
-            and request.command_network is None
         )
 
     async def probe(self, request: CapabilityRequest) -> RuntimeCapabilities:
@@ -173,7 +180,7 @@ class ExecRuntime:
 
     async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
         self.preflight(request)
-        cwd = request.cwd if request.cwd is not None else Path.cwd()
+        cwd = request.cwd
         final_output: str | None = None
         turn: TurnRef | None = None
         terminal: Literal["completed", "failed"] | None = None
@@ -187,7 +194,10 @@ class ExecRuntime:
             schema_path = Path(directory) / "output-schema.json"
             schema_path.write_text(json.dumps(request.output_schema), encoding="utf-8")
             argv = build_exec_argv(self._executable, request, schema_path)
-            process = cast(_ExecProcess, await self._process_factory(argv, cwd))
+            process = cast(
+                _ExecProcess,
+                await self._process_factory(argv, cwd, self._codex_home),
+            )
             active = _ActiveExec(process)
             stderr_task = asyncio.create_task(self._drain_stderr(process.stderr))
             try:

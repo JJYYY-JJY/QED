@@ -32,24 +32,28 @@ export function readLiveBrowserScriptParts(parts, readFile = (filePath) => fs.re
   }));
 }
 
-export function assertLiveBootstrapCredentials(port, token) {
+export function assertLiveBootstrapPort(port) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error('Live bootstrap port must be an integer from 1 to 65535');
   }
+}
+
+function assertBrowserCapability(browserCapability) {
   if (
-    typeof token !== 'string'
-    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token)
+    typeof browserCapability !== 'string'
+    || !/^[A-Za-z0-9._~-]{32,256}$/.test(browserCapability)
   ) {
-    throw new Error('Live bootstrap token must be a UUID');
+    throw new Error('Live browser capability is invalid');
   }
 }
 
-export function assembleLiveBrowserScript({ token, port, vocabulary, commandPrefix = '/', parts }) {
-  assertLiveBootstrapCredentials(port, token);
+export function assembleLiveBrowserScript({ browserCapability, port, vocabulary, commandPrefix = '/', parts }) {
+  assertLiveBootstrapPort(port);
+  assertBrowserCapability(browserCapability);
   const prelude =
     `(function () {\n` +
     `'use strict';\n` +
-    `const IMPECCABLE_TOKEN = ${JSON.stringify(token)};\n` +
+    `const IMPECCABLE_BROWSER_CAPABILITY = ${JSON.stringify(browserCapability)};\n` +
     `const IMPECCABLE_PORT = ${port};\n` +
     `const IMPECCABLE_COMMAND_PREFIX = ${JSON.stringify(commandPrefix)};\n` +
     // Canonical command vocabulary (values + labels + icons). live-browser.js

@@ -14,7 +14,9 @@ function readServerInfo() {
 async function fetchServerStatus(info) {
   if (!info) return null;
   try {
-    const res = await fetch(`http://localhost:${info.port}/status?token=${info.token}`);
+    const res = await fetch(`http://localhost:${info.port}/status`, {
+      headers: { Authorization: `Bearer ${info.token}` },
+    });
     if (!res.ok) return null;
     return await res.json();
   } catch {

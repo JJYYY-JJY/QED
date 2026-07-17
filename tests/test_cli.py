@@ -6,13 +6,15 @@ from io import StringIO
 from ipaddress import ip_address
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
+import qed.cli as cli_module
 from qed.cli import app
 from qed.config import QEDConfig
 from qed.inputs import RunInput
 from qed.logging import configure_logging, get_logger
-from qed.service import build_service
+from qed.service import _default_mock_runtime, build_service
 from qed.service_settings import ServiceSettings
 
 _RUNNER = CliRunner()
@@ -126,6 +128,38 @@ def test_mock_run_completes_and_exports_a_reproducible_bundle(tmp_path: Path) ->
         "proof.md",
         "report.md",
     }
+
+
+def test_codex_run_scopes_runtime_state_to_managed_data_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_homes: list[Path] = []
+
+    def runtime_factory(codex_home: Path) -> object:
+        codex_homes.append(codex_home)
+        runtime = _default_mock_runtime()
+        runtime.runtime_version = "test-codex/1"
+        return runtime
+
+    monkeypatch.setattr(cli_module, "create_codex_runtime", runtime_factory)
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "run",
+            "Prove P.",
+            "--run-id",
+            "run-codex-home",
+            "--runtime",
+            "codex",
+            "--data-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert codex_homes == [tmp_path / "codex-home"]
 
 
 def test_cancel_and_resume_commands_share_durable_service_state(tmp_path: Path) -> None:

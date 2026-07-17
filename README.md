@@ -22,8 +22,10 @@ model's completion claim.
 
 Structural and detailed verification run on fresh, read-only, offline Codex
 threads. Citation verification also starts fresh and read-only; it may use the
-restricted literature network policy. QED never requests full-access sandboxes
-or an approval bypass.
+restricted literature network policy. Every turn attempt receives a distinct
+server-owned empty Git working directory. QED disables local shell, file,
+browser, code-mode, plugin, and hook capabilities and never requests
+full-access sandboxes or an approval bypass.
 
 See [Architecture](docs/architecture.md) and the
 [Threat model](docs/threat-model.md) for the full boundary map.
@@ -34,7 +36,8 @@ See [Architecture](docs/architecture.md) and the
   package commands
 - CPython 3.13 or 3.14; `.python-version` pins 3.14.6 for local work
 - Node.js 22.12 or newer and npm for the React console
-- an authenticated Codex session for live research
+- an authenticated Codex session in QED's dedicated Codex state root for live
+  research
 
 QED uses no Conda environment. The lockfile pins the Python dependency graph,
 including the official `openai-codex` SDK and its matching CLI package.
@@ -55,10 +58,31 @@ uv run qed --help
 uv run qed init --data-root .qed
 ```
 
+QED uses the pinned Codex binary from the uv environment and isolates it from
+personal `~/.codex/config.toml` settings. Authenticate that binary once in the
+dedicated state root before a live run:
+
+```bash
+mkdir -p .qed/codex-home
+chmod 700 .qed/codex-home
+QED_CODEX="$(uv run python -c \
+  'from codex_cli_bin import bundled_codex_path; print(bundled_codex_path())')"
+CODEX_HOME="$PWD/.qed/codex-home" "$QED_CODEX" login
+```
+
+QED does not copy or link personal `auth.json` credentials into this directory.
+Managed launches also discard inherited `CODEX_ACCESS_TOKEN`, `CODEX_API_KEY`,
+and `OPENAI_API_KEY` values, so authentication comes only from this dedicated
+state root.
+Treat the entire data root as sensitive: restrict access, never commit it, and
+encrypt complete backups because `codex-home` may contain credentials and
+session state. Credentials are not included in QED logs or exported proof
+bundles.
+
 ## Run from the CLI
 
-The live command uses the active Codex authentication context and requires an
-exact model match in the account's model catalog:
+The live command uses the dedicated authentication context under the selected
+data root and requires an exact model match in that account's model catalog:
 
 ```bash
 uv run qed run \

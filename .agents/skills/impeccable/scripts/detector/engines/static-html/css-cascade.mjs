@@ -1,6 +1,6 @@
-import fs from 'node:fs';
 import path from 'node:path';
 
+import { readContainedFile } from '../../../lib/safe-fs.mjs';
 import { profileStep, recordProfileEvent } from '../../profile/profiler.mjs';
 import { parseAnyColor, resolveLengthPx, resolveVarRefs } from '../../rules/checks.mjs';
 
@@ -859,8 +859,14 @@ function buildStaticWindow(staticDoc) {
   };
 }
 
-function collectStaticCssText(root, fileDir, profile, filePath, modules) {
+function collectStaticCssText(root, fileDir, profile, filePath, modules, options = {}) {
+  const projectRoot = path.resolve(options.projectRoot || fileDir);
+  const maxFiles = boundedCssLimit(options.maxFiles, 32, 'maxFiles');
+  const maxBytes = boundedCssLimit(options.maxBytes, 4 * 1024 * 1024, 'maxBytes');
+  const maxDepth = boundedCssLimit(options.maxDepth, 16, 'maxDepth');
   const styleTexts = [];
+  let fileCount = 0;
+  let byteCount = 0;
   for (const styleEl of modules.selectAll('style', root.children || [])) {
     styleTexts.push(modules.domutils.textContent(styleEl));
   }
@@ -869,7 +875,16 @@ function collectStaticCssText(root, fileDir, profile, filePath, modules) {
     const rel = link.attribs?.rel || '';
     const href = link.attribs?.href || '';
     if (!/\bstylesheet\b/i.test(rel) || !href || /^(https?:)?\/\//i.test(href)) continue;
+    fileCount += 1;
+    if (fileCount > maxFiles) {
+      throw new Error(`Linked CSS exceeds maxFiles limit (${maxFiles})`);
+    }
     const cssPath = path.resolve(fileDir, href);
+    const relative = path.relative(projectRoot, cssPath);
+    const depth = relative ? relative.split(path.sep).length : 0;
+    if (depth > maxDepth) {
+      throw new Error(`Linked CSS exceeds maxDepth limit (${maxDepth}): ${href}`);
+    }
     try {
       const css = profileStep(profile, {
         engine: 'static-html',
@@ -877,11 +892,27 @@ function collectStaticCssText(root, fileDir, profile, filePath, modules) {
         ruleId: 'inline-linked-stylesheet',
         target: filePath,
         detail: href,
-      }, () => fs.readFileSync(cssPath, 'utf-8'));
+      }, () => readContainedFile(
+        projectRoot,
+        cssPath,
+        'utf-8',
+        { maxBytes: maxBytes - byteCount },
+      ));
+      byteCount += Buffer.byteLength(css);
       styleTexts.push(css);
-    } catch { /* skip unreadable */ }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
   }
   return styleTexts.join('\n');
+}
+
+function boundedCssLimit(value, fallback, name) {
+  const resolved = value === undefined ? fallback : value;
+  if (!Number.isSafeInteger(resolved) || resolved < 0) {
+    throw new Error(`${name} must be a non-negative safe integer`);
+  }
+  return resolved;
 }
 
 function buildStaticStyleMap(root, staticDoc, cssText, modules, profile, filePath) {

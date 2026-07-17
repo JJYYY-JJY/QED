@@ -244,6 +244,26 @@ def test_start_command_returns_typed_acknowledgement(tmp_path: Path) -> None:
     }
 
 
+def test_missing_run_commands_do_not_retain_process_locks(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    app = create_app(
+        settings=ServiceSettings(data_root=tmp_path),
+        service=service,
+    )
+
+    with TestClient(app) as client:
+        responses = tuple(
+            client.post(
+                f"/api/v1/runs/missing-{command}/commands/{command}",
+                json={"idempotency_key": f"{command}-missing"},
+            )
+            for command in ("start", "cancel", "resume")
+        )
+
+        assert [response.status_code for response in responses] == [404, 404, 404]
+        assert service._run_locks == {}
+
+
 def test_cancel_and_resume_commands_use_typed_idempotent_receipts(tmp_path: Path) -> None:
     app = create_app(
         settings=ServiceSettings(data_root=tmp_path),

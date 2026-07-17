@@ -18,11 +18,23 @@
   if (window.__IMPECCABLE_LIVE_INIT__) return;
   window.__IMPECCABLE_LIVE_INIT__ = true;
 
-  const TOKEN = IMPECCABLE_TOKEN;
+  const BROWSER_CAPABILITY = IMPECCABLE_BROWSER_CAPABILITY;
   const PORT = IMPECCABLE_PORT;
-  if (!TOKEN || !PORT) {
+  if (!BROWSER_CAPABILITY || !PORT) {
     window.__IMPECCABLE_LIVE_INIT__ = false; // reset so the real load can init
     return;
+  }
+  const LIVE_BASE_URL = 'http://localhost:' + PORT;
+  const nativeFetch = window.fetch.bind(window);
+
+  function liveFetch(route, options = {}) {
+    const target = new URL(route, LIVE_BASE_URL);
+    if (target.origin !== LIVE_BASE_URL) {
+      throw new Error('Live helper requests must stay on the configured origin');
+    }
+    const headers = new Headers(options.headers || {});
+    headers.set('Authorization', 'Bearer ' + BROWSER_CAPABILITY);
+    return nativeFetch(target.href, { ...options, headers });
   }
 
   //
@@ -3631,11 +3643,10 @@
     const container = copyEditContainerContext(contextElement);
     if (container) for (const op of ops) op.container = container;
     try {
-      const res = await fetch('http://localhost:' + PORT + '/manual-edit-stash', {
+      const res = await liveFetch('/manual-edit-stash', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          token: TOKEN,
           id: id8(),
           pageUrl: location.pathname,
           element: extractContext(contextElement),
@@ -3724,7 +3735,7 @@
   }
 
   function manualApplyStateKey() {
-    return PREFIX + ':manual-apply:' + PORT + ':' + TOKEN + ':' + location.pathname;
+    return PREFIX + ':manual-apply:' + PORT + ':' + location.origin + ':' + location.pathname;
   }
 
   function readStoredManualApplyState() {
@@ -3945,8 +3956,8 @@
 
   async function fetchPendingCount() {
     try {
-      const res = await fetch(
-        'http://localhost:' + PORT + '/manual-edit-stash?token=' + encodeURIComponent(TOKEN) + '&pageUrl=' + encodeURIComponent(location.pathname),
+      const res = await liveFetch(
+        '/manual-edit-stash?pageUrl=' + encodeURIComponent(location.pathname),
       );
       if (!res.ok) return;
       const data = await res.json();
@@ -3965,8 +3976,8 @@
     resetManualApplyProgress(count);
     setPendingApplyLoading(true, count);
     try {
-      const res = await fetch(
-        'http://localhost:' + PORT + '/manual-edit-commit?token=' + encodeURIComponent(TOKEN) + '&pageUrl=' + encodeURIComponent(location.pathname) + '&async=1',
+      const res = await liveFetch(
+        '/manual-edit-commit?pageUrl=' + encodeURIComponent(location.pathname) + '&async=1',
         { method: 'POST', keepalive: true },
       );
       if (!res.ok) {
@@ -4009,8 +4020,8 @@
     const ok = confirm('Discard ' + count + ' copy edit' + (count === 1 ? '' : 's') + ' on this page?');
     if (!ok) return;
     try {
-      const res = await fetch(
-        'http://localhost:' + PORT + '/manual-edit-discard?token=' + encodeURIComponent(TOKEN) + '&pageUrl=' + encodeURIComponent(location.pathname),
+      const res = await liveFetch(
+        '/manual-edit-discard?pageUrl=' + encodeURIComponent(location.pathname),
         { method: 'POST' },
       );
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -4058,8 +4069,8 @@
     if (count <= 0) return;
     updateManualApplyRepairState({ attempt: 1, maxAttempts: 3 }, 'repairing');
     try {
-      const res = await fetch(
-        'http://localhost:' + PORT + '/manual-edit-commit?token=' + encodeURIComponent(TOKEN) + '&pageUrl=' + encodeURIComponent(location.pathname) + '&async=1&repair=1',
+      const res = await liveFetch(
+        '/manual-edit-commit?pageUrl=' + encodeURIComponent(location.pathname) + '&async=1&repair=1',
         { method: 'POST', keepalive: true },
       );
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -4077,12 +4088,12 @@
     const ok = confirm('Rollback source files to before this Apply and keep the edits staged?');
     if (!ok) return;
     try {
-      const res = await fetch(
-        'http://localhost:' + PORT + '/manual-edit-repair-decision?token=' + encodeURIComponent(TOKEN) + '&pageUrl=' + encodeURIComponent(location.pathname),
+      const res = await liveFetch(
+        '/manual-edit-repair-decision?pageUrl=' + encodeURIComponent(location.pathname),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: TOKEN, pageUrl: location.pathname, action: 'rollback' }),
+          body: JSON.stringify({ pageUrl: location.pathname, action: 'rollback' }),
         },
       );
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -5044,9 +5055,8 @@
     const dir = String(manifest?.componentDir || '').replace(/^\/+/, '');
     if (!dir) return {};
     const paramsPath = dir + '/params.json';
-    const url = 'http://localhost:' + PORT + '/source?token=' + TOKEN + '&path=' + encodeURIComponent(paramsPath);
     try {
-      const res = await fetch(url);
+      const res = await liveFetch('/source?path=' + encodeURIComponent(paramsPath));
       if (!res.ok) return {};
       const parsed = JSON.parse(await res.text());
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
@@ -5064,9 +5074,8 @@
     const dir = String(manifest?.componentDir || '').replace(/^\/+/, '');
     if (!dir || !variantNum) return '';
     const sourcePath = dir + '/v' + variantNum + '.svelte';
-    const url = 'http://localhost:' + PORT + '/source?token=' + TOKEN + '&path=' + encodeURIComponent(sourcePath);
     try {
-      const res = await fetch(url);
+      const res = await liveFetch('/source?path=' + encodeURIComponent(sourcePath));
       if (!res.ok) return '';
       return await res.text();
     } catch {
@@ -5330,9 +5339,8 @@
   }
 
   async function injectSvelteComponentsFromManifest(manifestPath, sessionId) {
-    const url = 'http://localhost:' + PORT + '/source?token=' + TOKEN + '&path=' + encodeURIComponent(manifestPath);
     try {
-      const res = await fetch(url);
+      const res = await liveFetch('/source?path=' + encodeURIComponent(manifestPath));
       if (!res.ok) throw new Error(String(res.status));
       const manifest = JSON.parse(await res.text());
       if (manifest.id !== sessionId) return;
@@ -5511,8 +5519,7 @@
       return;
     }
     rememberSessionFileMeta({ file: filePath });
-    const url = 'http://localhost:' + PORT + '/source?token=' + TOKEN + '&path=' + encodeURIComponent(filePath);
-    fetch(url)
+    liveFetch('/source?path=' + encodeURIComponent(filePath))
       .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
       .then(html => {
         const parser = new DOMParser();
@@ -6131,8 +6138,64 @@
   let sseRetries = 0;
   const SSE_MAX_RETRIES = 20;  // generous: heartbeats keep the connection alive, so retries mean real trouble
 
+  function createAuthenticatedEventStream() {
+    let closed = false;
+    let controller = null;
+    let reconnectTimer = null;
+    const stream = {
+      onopen: null,
+      onmessage: null,
+      onerror: null,
+      close() {
+        closed = true;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (controller) controller.abort();
+      },
+    };
+
+    async function open() {
+      if (closed) return;
+      controller = new AbortController();
+      try {
+        const response = await liveFetch('/events', {
+          cache: 'no-store',
+          headers: { Accept: 'text/event-stream' },
+          signal: controller.signal,
+        });
+        if (!response.ok || !response.body) throw new Error('HTTP ' + response.status);
+        stream.onopen?.();
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (!closed) {
+          const { value, done } = await reader.read();
+          if (done) throw new Error('event stream closed');
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+          let boundary;
+          while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+            const frame = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            const data = frame
+              .split('\n')
+              .filter((line) => line.startsWith('data:'))
+              .map((line) => line.slice(5).trimStart())
+              .join('\n');
+            if (data) stream.onmessage?.({ data });
+          }
+        }
+      } catch (error) {
+        if (closed || error?.name === 'AbortError') return;
+        stream.onerror?.(error);
+        if (!closed) reconnectTimer = setTimeout(open, 1000);
+      }
+    }
+
+    queueMicrotask(open);
+    return stream;
+  }
+
   function connectSSE() {
-    evtSource = new EventSource('http://localhost:' + PORT + '/events?token=' + TOKEN);
+    evtSource = createAuthenticatedEventStream();
 
     evtSource.onopen = () => {
       sseRetries = 0; // reset on successful (re)connect
@@ -6245,7 +6308,7 @@
       sseRetries++;
       if (sseRetries <= SSE_MAX_RETRIES) {
         console.log('[impeccable] SSE connection lost. Retry ' + sseRetries + '/' + SSE_MAX_RETRIES + '...');
-        return; // EventSource auto-reconnects
+        return; // authenticated fetch stream reconnects automatically
       }
       // Server is gone. Clean up gracefully.
       console.log('[impeccable] Live server unreachable. Cleaning up UI.');
@@ -6279,7 +6342,6 @@
   }
 
   function sendEvent(msg, opts) {
-    msg.token = TOKEN;
     function handleFailure(err) {
       if (opts && opts.throwOnError) {
         console.error('[impeccable] Failed to send event:', err);
@@ -6288,7 +6350,7 @@
       console.debug('[impeccable] Dropped optional live event:', err);
       return null;
     }
-    return fetch('http://localhost:' + PORT + '/events', {
+    return liveFetch('/events', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(msg),
@@ -7123,9 +7185,8 @@
     const hasAnnotations = snapshot && (snapshot.comments.length > 0 || snapshot.strokes.length > 0);
     if (blob && hasAnnotations) {
       try {
-        const uploadRes = await fetch(
-          'http://localhost:' + PORT + '/annotation?token=' + encodeURIComponent(TOKEN) +
-          '&eventId=' + encodeURIComponent(basePayload.id),
+        const uploadRes = await liveFetch(
+          '/annotation?eventId=' + encodeURIComponent(basePayload.id),
           { method: 'POST', headers: { 'Content-Type': 'image/png' }, body: blob },
         );
         if (uploadRes.ok) {
@@ -9371,7 +9432,7 @@ void main() {
   }
 
   function fetchAgentPollingStatus() {
-    fetch('http://localhost:' + PORT + '/status?token=' + TOKEN, { cache: 'no-store' })
+    liveFetch('/status', { cache: 'no-store' })
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (data && typeof data.agentPolling === 'boolean') syncAgentPollingUi(data.agentPolling);
@@ -10501,8 +10562,8 @@ void main() {
     renderDesignBody();
     try {
       const [jsonRes, rawRes] = await Promise.all([
-        fetch(`http://localhost:${PORT}/design-system.json?token=${TOKEN}`, { cache: 'no-store' }),
-        fetch(`http://localhost:${PORT}/design-system/raw?token=${TOKEN}`, { cache: 'no-store' }),
+        liveFetch('/design-system.json', { cache: 'no-store' }),
+        liveFetch('/design-system/raw', { cache: 'no-store' }),
       ]);
       const jsonData = await jsonRes.json();
       designState.present = jsonData.present === true;
@@ -10883,16 +10944,25 @@ void main() {
         const stage = document.createElement('div');
         stage.className = 'cmp-stage';
 
-        // Render the component in its own shadow root so its CSS can't bleed.
-        const host = document.createElement('div');
-        const sub = host.attachShadow({ mode: 'open' });
-        const style = document.createElement('style');
-        style.textContent = c.css || '';
-        sub.appendChild(style);
-        const container = document.createElement('div');
-        container.innerHTML = c.html || '';
-        sub.appendChild(container);
-        stage.appendChild(host);
+        // Sidecar snippets are project-controlled input. Keep them in an
+        // opaque, scriptless document rather than the preview page's realm.
+        const frame = document.createElement('iframe');
+        frame.setAttribute('sandbox', '');
+        frame.setAttribute('title', String(c.name || c.kind || 'Component') + ' preview');
+        frame.setAttribute('referrerpolicy', 'no-referrer');
+        frame.setAttribute('loading', 'lazy');
+        frame.inert = true;
+        frame.tabIndex = -1;
+        frame.style.cssText = 'display:block;width:100%;height:160px;border:0;background:transparent;pointer-events:none;';
+        const componentCsp = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'";
+        const componentCss = String(c.css || '').replace(/<\/style/gi, '<\\/style');
+        frame.srcdoc = '<!doctype html><html><head>'
+          + '<meta http-equiv="Content-Security-Policy" content="' + componentCsp + '">'
+          + '<meta name="referrer" content="no-referrer">'
+          + '<style>html,body{margin:0;min-height:100%;box-sizing:border-box}*,*::before,*::after{box-sizing:inherit}</style>'
+          + '<style>' + componentCss + '</style>'
+          + '</head><body>' + String(c.html || '') + '</body></html>';
+        stage.appendChild(frame);
 
         // Show component name as a sublabel only when the tile groups >1 item,
         // or when the component's display name differs from its kind.

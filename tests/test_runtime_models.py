@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
 import pytest
@@ -10,7 +11,6 @@ from qed.runtime import (
     ForkThread,
     FreshThread,
     ModelCapability,
-    RestrictedNetworkPolicy,
     ResumeThread,
     RunRequest,
     RuntimeBackend,
@@ -34,6 +34,7 @@ def _request(**overrides: object) -> RunRequest:
         "model": "gpt-5.6-sol",
         "prompt": "Inspect the claim.",
         "output_schema": {"type": "object", "additionalProperties": False},
+        "cwd": Path("/var/lib/qed/turns/test"),
     }
     values.update(overrides)
     return RunRequest.model_validate(values)
@@ -42,12 +43,26 @@ def _request(**overrides: object) -> RunRequest:
 def test_run_request_defaults_to_a_fresh_read_only_offline_turn() -> None:
     request = _request()
 
+    assert tuple(SandboxMode) == (SandboxMode.READ_ONLY,)
     assert request.thread == FreshThread()
     assert request.effort == "auto"
     assert request.sandbox is SandboxMode.READ_ONLY
     assert request.web_search is WebSearchMode.DISABLED
-    assert request.command_network is None
+    assert "command_network" not in RunRequest.model_fields
     assert "approval" not in RunRequest.model_fields
+
+
+def test_run_request_requires_an_explicit_absolute_cwd() -> None:
+    values = {
+        "model": "gpt-5.6-sol",
+        "prompt": "Inspect the claim.",
+        "output_schema": {"type": "object", "additionalProperties": False},
+    }
+
+    with pytest.raises(ValidationError, match="cwd"):
+        RunRequest.model_validate(values)
+    with pytest.raises(ValidationError, match="absolute"):
+        RunRequest.model_validate({**values, "cwd": Path("relative/workspace")})
 
 
 def test_run_request_rejects_an_empty_output_schema() -> None:
@@ -105,7 +120,6 @@ def test_only_literature_roles_may_enable_web_search() -> None:
     request = _request(role=WorkRole.LITERATURE, web_search=WebSearchMode.LIVE)
 
     assert request.web_search is WebSearchMode.LIVE
-    assert request.command_network is None
 
 
 @pytest.mark.parametrize("role", [WorkRole.VERIFIER, WorkRole.CITATION])
@@ -121,14 +135,14 @@ def test_verification_roles_require_a_fresh_read_only_thread(role: WorkRole) -> 
             role=role,
             thread=ResumeThread(thread_id="prior-verifier"),
         )
-    with pytest.raises(ValidationError, match="verification turns must be fresh"):
+    with pytest.raises(ValidationError, match="sandbox"):
         _request(
             role=role,
-            sandbox=SandboxMode.WORKSPACE_WRITE,
+            sandbox="workspace-write",
         )
 
 
-def test_citation_role_may_use_live_search_while_remaining_read_only() -> None:
+def test_citation_role_may_search_while_remaining_fresh_and_read_only() -> None:
     request = _request(role=WorkRole.CITATION, web_search=WebSearchMode.LIVE)
 
     assert isinstance(request.thread, FreshThread)
@@ -142,18 +156,9 @@ def test_literature_role_accepts_indexed_web_search() -> None:
     assert request.web_search is WebSearchMode.INDEXED
 
 
-def test_command_network_requires_an_explicit_restricted_policy() -> None:
-    request = _request(
-        role=WorkRole.CITATION,
-        command_network=RestrictedNetworkPolicy(domains=("api.crossref.org",)),
-    )
-
-    assert request.command_network is not None
-    assert request.command_network.domains == ("api.crossref.org",)
-
-    for wildcard in ("*", "*.example.com"):
-        with pytest.raises(ValidationError, match="restricted"):
-            RestrictedNetworkPolicy(domains=(wildcard,))
+def test_command_network_is_not_part_of_the_turn_contract() -> None:
+    with pytest.raises(ValidationError, match="command_network"):
+        _request(command_network={"domains": ["api.crossref.org"]})
 
 
 def test_auto_effort_uses_ultra_only_for_proactive_multi_agent() -> None:

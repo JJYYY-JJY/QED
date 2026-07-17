@@ -21,6 +21,9 @@ This note uses three evidence labels:
 6. Give literature, planning, candidate generation, verification, and adjudication separate application-owned Codex threads. Start verifiers on new threads with frozen input and a read-only sandbox. Use `thread/fork` only when a stage must inherit conversation history.
 7. Pass a JSON Schema on every control-producing turn and validate the final assistant message with the matching Pydantic model. Application code, not rendered text, computes transitions and final PASS.
 8. Keep `codex exec` as a tested fallback. The fallback must emit JSONL, use the same output schema and explicit safety settings, and map into the same internal event types. No code path may use sandbox, approval, or hook-trust bypass flags.
+9. Require an application-created absolute `cwd` on every turn. Build a distinct empty Git working directory for each attempt, including retries, and perform request construction and local preflight inside the attempt loop.
+10. Keep command network out of the public turn contract. Apply one server-owned configuration through SDK, App Server, and exec that disables local shell, file-editing, browser, code-mode, plugin, and hook capabilities. Native web search remains available only to literature and citation roles.
+11. Preserve Codex-native multi-agent capability when advertised. Subagents inherit the turn's empty Git working directory, read-only sandbox, and server-owned local-tool restrictions; QED does not force-enable an experimental multi-agent version.
 
 ## Official Python SDK
 
@@ -275,18 +278,26 @@ QED permits only these role policies:
 
 | Role | Filesystem | Command network | Search | Approval behavior |
 |---|---|---|---|---|
-| Literature/citation | `readOnly` with frozen input | enabled only through a scoped proxy allowlist when a paper fetch needs it | configured live/indexed mode | fail closed or explicit UI approval |
-| Planning/adjudication | `readOnly` | off | disabled unless the stage consumes frozen evidence | deny all |
-| Candidate generation | `workspaceWrite` in a disposable stage workspace | off | disabled | deny all |
+| Literature/citation | `readOnly` in an empty per-attempt Git working directory | off | configured live/indexed mode | deny all |
+| Planning/adjudication | `readOnly` in an empty per-attempt Git working directory | off | disabled | deny all |
+| Candidate generation | `readOnly` in an empty per-attempt Git working directory | off | disabled | deny all |
 | Structural/detailed verifier | `readOnly` over sealed candidate and evidence | off | disabled | deny all |
 
-The published SDK's presets do not expose `networkAccess`. App Server's stable `SandboxPolicy` supports both `{ "type": "readOnly", "networkAccess": true }` and workspace-write policies with `networkAccess` and `writableRoots`. This missing SDK control justifies the typed adapter for literature turns.
+The published SDK's presets do not expose `networkAccess`. QED therefore keeps
+command network disabled in every adapter and uses only native web search for
+literature and citation work.
 
-Enabling command network access alone grants unrestricted outbound access. To restrict destinations, enable the `network_proxy` feature and configure exact allow rules. The proxy remains beta and uses allowlist-first domain rules; `deny` wins. Keep local/private binding disabled. If production cannot accept this beta dependency, leave command network off and use the built-in web search tool or an external egress sandbox.
+Enabling command network access alone grants unrestricted outbound access. QED
+does not expose that control and explicitly disables the network proxy feature.
 
 `web_search` is separate from command network. Supported documented modes are `disabled`, `cached`, `indexed`, and `live`. Only the literature/citation policy may select a non-disabled mode. Treat retrieved content as untrusted input and preserve source URLs plus hashes in the evidence ledger.
 
-Do not expose `danger-full-access`, `Sandbox.full_access`, `approval_policy = "never"` without a sandbox, `--dangerously-bypass-approvals-and-sandbox`, `--yolo`, or `--dangerously-bypass-hook-trust` in QED configuration. `ApprovalMode.deny_all` is safe only because QED pairs it with `readOnly` or `workspaceWrite`; it removes prompts, not the sandbox.
+Do not expose `workspace-write`, `danger-full-access`, `Sandbox.full_access`,
+`approval_policy = "never"` without a sandbox,
+`--dangerously-bypass-approvals-and-sandbox`, `--yolo`, or
+`--dangerously-bypass-hook-trust` in QED configuration.
+`ApprovalMode.deny_all` is safe only because QED pairs it with `readOnly`; it
+removes prompts, not the sandbox.
 
 ## `codex exec` fallback
 
@@ -295,7 +306,7 @@ Do not expose `danger-full-access`, `Sandbox.full_access`, `approval_policy = "n
 QED's fallback command builder must supply:
 
 - exact model and validated effort through `--model` and explicit config override;
-- `--sandbox read-only` or `--sandbox workspace-write`;
+- `--sandbox read-only`;
 - `--json`, `--output-schema`, `--strict-config`, and an explicit working directory;
 - `--ignore-user-config` for deterministic application runs while retaining auth in `CODEX_HOME`;
 - no bypass, `--full-auto`, or `--skip-git-repo-check` flags.
@@ -310,7 +321,7 @@ Run mocked parity tests for start, stream, structured result, failure, cancel, a
 2. The package's pinned CLI and a separately installed `codex` can differ. Never combine them through `CodexConfig(codex_bin=...)` without proving schema compatibility.
 3. `gpt-5.6-sol`, `max`, `ultra`, and multi-agent availability can vary by account and auth mode. Probe the executor session and fail closed.
 4. Model discovery has no advertised structured-output bit. Require a schema-constrained real-model smoke test before enabling production execution for a new model/runtime pair.
-5. The network proxy remains beta. Deploy external egress enforcement or keep command networking disabled if beta controls do not meet the deployment's threat model.
+5. Command networking stays disabled; literature and citation use native web search instead.
 6. App Server WebSocket transport remains experimental and unsupported. Use local stdio for this rewrite.
 
 ## Direct official sources

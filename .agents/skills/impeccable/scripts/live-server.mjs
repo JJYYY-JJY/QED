@@ -23,12 +23,20 @@ import { fileURLToPath } from 'node:url';
 import { parseDesignMd } from './lib/design-parser.mjs';
 import { loadContext } from './context.mjs';
 import {
-  assertLiveBootstrapCredentials,
+  assertLiveBootstrapPort,
   assembleLiveBrowserScript,
   assertLiveBrowserScriptParts,
   readLiveBrowserScriptParts,
   resolveLiveBrowserScriptParts,
 } from './live/browser-script-parts.mjs';
+import {
+  createBrowserAuthorization,
+  hasAgentBearer,
+} from './live/browser-authorization.mjs';
+import {
+  readBoundedJsonBody,
+  RequestBodyTooLargeError,
+} from './live/bounded-body.mjs';
 import {
   appendContainedFile,
   ensureContainedDirectory,
@@ -117,6 +125,9 @@ const state = {
   // a poll to be parked at the exact moment we dispatch.
   lastPollAt: 0,
   timedOutApplyIds: new Map(),
+  browserAuthorization: createBrowserAuthorization(),
+  issuedScreenshotPaths: new Map(),
+  browserSourcePathsBySession: new Map(),
 };
 
 const CHAT_POLL_FRESHNESS_MS = 60_000;
@@ -135,7 +146,6 @@ const manualApply = createManualApplyController({
 });
 
 const manualEditRoutes = createManualEditRoutes({
-  getToken: () => state.token,
   manualApply,
   recordManualEditActivity,
   getManualEditStatus,
@@ -153,6 +163,13 @@ function chatAgentLikelyActive() {
 // Cap per-annotation upload size. A full 1920×1080 PNG is typically <1 MB;
 // cap at 10 MB to guard against runaway writes from a misbehaving client.
 const MAX_ANNOTATION_BYTES = 10 * 1024 * 1024;
+const MAX_JSON_BODY_BYTES = 256 * 1024;
+const MAX_AUTHORIZE_BODY_BYTES = 4 * 1024;
+const MAX_AGENT_JSON_BODY_BYTES = 512 * 1024;
+const MAX_BROWSER_SOURCE_BYTES = 2 * 1024 * 1024;
+const BROWSER_SOURCE_EXTENSIONS = new Set([
+  '.html', '.jsx', '.tsx', '.vue', '.svelte', '.astro', '.js', '.mjs', '.ts',
+]);
 
 function enqueueEvent(event) {
   if (!event || (event.id && state.pendingEvents.some((entry) => entry.event?.id === event.id && entry.event?.type === event.type))) return;
@@ -164,6 +181,16 @@ function restorePendingEventsFromStore() {
   if (!state.sessionStore) return;
   for (const snapshot of state.sessionStore.listActiveSessions()) {
     if (snapshot.pendingEvent) enqueueEvent(snapshot.pendingEvent);
+  }
+}
+
+function restoreBrowserSourcePathsFromStore() {
+  if (!state.sessionStore) return;
+  for (const snapshot of state.sessionStore.listActiveSessions()) {
+    issueBrowserSourcePaths(
+      snapshot.id,
+      snapshot.previewFile || snapshot.sourceFile,
+    );
   }
 }
 
@@ -415,20 +442,127 @@ function readContextFile(filePath) {
 // HTTP request handler
 // ---------------------------------------------------------------------------
 
-function createRequestHandler({ detectScript, liveScriptParts }) {
-  return (req, res) => {
-    const url = new URL(req.url, `http://localhost:${state.port}`);
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+function writeJson(res, status, body, headers = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+  res.end(JSON.stringify(body));
+}
 
+function writeAuthorizationFailure(res, result) {
+  writeJson(res, result.status, { error: result.error });
+}
+
+function authorizeBrowserRequest(req, res) {
+  const result = state.browserAuthorization.authenticate(req);
+  if (!result.ok) {
+    writeAuthorizationFailure(res, result);
+    return null;
+  }
+  const headers = state.browserAuthorization.corsHeaders(result.origin);
+  for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
+  return result;
+}
+
+function writeJsonBodyError(res, error) {
+  if (error instanceof RequestBodyTooLargeError) {
+    writeJson(res, 413, { error: 'Payload too large' });
+    return;
+  }
+  if (error?.code === 'INVALID_JSON') {
+    writeJson(res, 400, { error: 'Invalid JSON' });
+    return;
+  }
+  writeJson(res, 400, { error: error?.message || 'Invalid request body' });
+}
+
+function jsonBodyLimitForRoute(pathname, method) {
+  if (method !== 'POST') return null;
+  if (pathname === '/authorize-browser') return MAX_AUTHORIZE_BODY_BYTES;
+  if (pathname === '/events') return MAX_JSON_BODY_BYTES;
+  if (pathname === '/poll') return MAX_AGENT_JSON_BODY_BYTES;
+  if (
+    pathname === '/manual-edit-stash'
+    || pathname === '/manual-edit-repair-decision'
+  ) {
+    return MAX_JSON_BODY_BYTES;
+  }
+  return null;
+}
+
+function declaredBodyExceedsLimit(req, limit) {
+  if (limit === null) return false;
+  const raw = req.headers['content-length'];
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) return false;
+  return BigInt(raw) > BigInt(limit);
+}
+
+function createRequestHandler({ detectScript, liveScriptParts }) {
+  return async (req, res) => {
+    const url = new URL(req.url, `http://localhost:${state.port}`);
     const p = url.pathname;
+    const jsonLimit = jsonBodyLimitForRoute(p, req.method);
+    if (declaredBodyExceedsLimit(req, jsonLimit)) {
+      writeJson(res, 413, { error: 'Payload too large' });
+      req.resume();
+      return;
+    }
+
+    if (req.method === 'OPTIONS') {
+      const preflight = state.browserAuthorization.preflight(req);
+      if (!preflight.ok) {
+        writeAuthorizationFailure(res, preflight);
+        return;
+      }
+      res.writeHead(204, state.browserAuthorization.corsHeaders(preflight.origin));
+      res.end();
+      return;
+    }
+
+    if (p === '/authorize-browser' && req.method === 'POST') {
+      if (!hasAgentBearer(req, state.token)) {
+        writeJson(res, 401, { error: 'Unauthorized' });
+        return;
+      }
+      let payload;
+      try {
+        payload = await readBoundedJsonBody(req, { maxBytes: MAX_AUTHORIZE_BODY_BYTES });
+      } catch (error) {
+        writeJsonBodyError(res, error);
+        return;
+      }
+      try {
+        const registered = state.browserAuthorization.registerOrigin(payload.origin);
+        if (registered.replaced) {
+          for (const client of state.sseClients) {
+            if (client.impeccableBrowserOrigin === registered.origin) continue;
+            state.sseClients.delete(client);
+            try { client.end(); } catch {}
+          }
+        }
+        writeJson(res, 200, { ok: true, origin: registered.origin });
+      } catch (error) {
+        writeJson(res, 400, { error: error.message });
+      }
+      return;
+    }
 
     // --- Scripts ---
     if (p === '/live.js') {
-      const token = url.searchParams.get('token');
-      if (token !== state.token) { res.writeHead(401); res.end('Unauthorized'); return; }
+      if (url.search) {
+        writeJson(res, 400, { error: 'live.js uses a fixed tokenless URL' });
+        return;
+      }
+      const bootstrap = state.browserAuthorization.bootstrap(req);
+      if (!bootstrap.ok) {
+        writeAuthorizationFailure(res, bootstrap);
+        return;
+      }
+      if (req.headers.origin) {
+        for (const [name, value] of Object.entries(
+          state.browserAuthorization.corsHeaders(bootstrap.origin),
+        )) {
+          res.setHeader(name, value);
+        }
+      }
       // Re-read from disk each request so edits to live-browser.js land on
       // the next tab reload. No-store headers prevent browser caching across
       // sessions — during iteration, a cached old script silently breaks
@@ -442,7 +576,7 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
         return;
       }
       const body = assembleLiveBrowserScript({
-        token: state.token,
+        browserCapability: bootstrap.capability,
         port: state.port,
         vocabulary: LIVE_COMMANDS,
         commandPrefix: IMPECCABLE_COMMAND_PREFIX,
@@ -485,8 +619,7 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
     // event with screenshotPath already set. Keeps bytes out of the SSE/poll
     // bridge and preserves the "one shot from the user's POV" UX.
     if (p === '/annotation' && req.method === 'POST') {
-      const token = url.searchParams.get('token');
-      if (token !== state.token) { res.writeHead(401); res.end('Unauthorized'); return; }
+      if (!authorizeBrowserRequest(req, res)) return;
       const eventId = url.searchParams.get('eventId');
       if (!eventId || !/^[A-Za-z0-9_-]{1,64}$/.test(eventId)) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -528,6 +661,7 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
           res.end(JSON.stringify({ error: 'Write failed: ' + err.message }));
           return;
         }
+        state.issuedScreenshotPaths.set(eventId, absPath);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, path: absPath }));
       });
@@ -542,8 +676,7 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
 
     // --- Health ---
     if (p === '/status') {
-      const token = url.searchParams.get('token');
-      if (token !== state.token) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+      if (!hasAgentBearer(req, state.token) && !authorizeBrowserRequest(req, res)) return;
       const sessions = activeSessionSummaries();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -580,8 +713,7 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
     //                            extensions + components + narrative.
     //   /design-system/raw     returns DESIGN.md markdown verbatim
     if (p === '/design-system.json' || p === '/design-system/raw') {
-      const token = url.searchParams.get('token');
-      if (token !== state.token) { res.writeHead(401); res.end('Unauthorized'); return; }
+      if (!authorizeBrowserRequest(req, res)) return;
 
       const mdPath = DESIGN_MD_PATH;
       const jsonPath = resolveDesignSidecarPath(process.cwd(), PROJECT_CONTEXT.designContextDir || CONTEXT_DIR) || getDesignSidecarPath(process.cwd());
@@ -637,13 +769,27 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
 
     // --- Source file (no-HMR fallback) ---
     if (p === '/source') {
-      const token = url.searchParams.get('token');
-      if (token !== state.token) { res.writeHead(401); res.end('Unauthorized'); return; }
+      if (!authorizeBrowserRequest(req, res)) return;
       const filePath = url.searchParams.get('path');
       if (!filePath) { res.writeHead(400); res.end('Bad path'); return; }
       let content;
       try {
-        content = readContainedFile(process.cwd(), filePath, 'utf-8');
+        const safePath = resolveContainedPath(
+          process.cwd(),
+          filePath,
+          { allowMissing: false, type: 'file' },
+        );
+        if (!isBrowserSourcePathIssued(safePath)) {
+          res.writeHead(403);
+          res.end('Forbidden');
+          return;
+        }
+        content = readContainedFile(
+          process.cwd(),
+          safePath,
+          'utf-8',
+          { maxBytes: MAX_BROWSER_SOURCE_BYTES },
+        );
       } catch (err) {
         if (err?.code === 'ENOENT') {
           res.writeHead(404);
@@ -661,8 +807,8 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
 
     // --- SSE: server→browser push (replaces WebSocket) ---
     if (p === '/events' && req.method === 'GET') {
-      const token = url.searchParams.get('token');
-      if (token !== state.token) { res.writeHead(401); res.end('Unauthorized'); return; }
+      const browserRequest = authorizeBrowserRequest(req, res);
+      if (!browserRequest) return;
       clearTimeout(state.exitTimer);
       state.exitTimer = null;
       cancelQueuedAnonymousExitEvents();
@@ -678,6 +824,7 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
         activeSessions: activeSessionSummaries(),
       }) + '\n\n');
 
+      res.impeccableBrowserOrigin = browserRequest.origin;
       state.sseClients.add(res);
 
       // Keepalive: SSE comment every 30s prevents silent connection drops.
@@ -698,24 +845,21 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
       return;
     }
 
-    if (manualEditRoutes(req, res, url)) return;
+    if (p === '/manual-edit' || p.startsWith('/manual-edit-')) {
+      if (!authorizeBrowserRequest(req, res)) return;
+      if (manualEditRoutes(req, res, url)) return;
+    }
 
     // --- Browser→server events (replaces WebSocket messages) ---
     if (p === '/events' && req.method === 'POST') {
-      let body = '';
-      req.on('data', (c) => { body += c; });
-      req.on('end', () => {
-        let msg;
-        try { msg = JSON.parse(body); } catch {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid JSON' }));
-          return;
-        }
-        if (msg.token !== state.token) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Unauthorized' }));
-          return;
-        }
+      if (!authorizeBrowserRequest(req, res)) return;
+      let msg;
+      try {
+        msg = await readBoundedJsonBody(req, { maxBytes: MAX_JSON_BODY_BYTES });
+      } catch (error) {
+        writeJsonBodyError(res, error);
+        return;
+      }
         // Defense in depth: manual copy edits must use the staged stash/apply
         // endpoints. The direct Save event path is disabled in the browser.
         if (msg.type === 'manual_edits') {
@@ -726,6 +870,14 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
         if (msg.type === 'manual_edit_apply') {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'manual_edit_apply is disabled; use /manual-edit-stash then /manual-edit-commit' }));
+          return;
+        }
+        if (
+          msg.screenshotPath !== undefined
+          && state.issuedScreenshotPaths.get(msg.id) !== msg.screenshotPath
+        ) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'generate: screenshotPath was not issued for this event' }));
           return;
         }
         const error = validateEvent(msg);
@@ -749,9 +901,14 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
         if (msg.type !== 'checkpoint') {
           enqueueEvent(msg);
         }
+        if (msg.type === 'accept' || msg.type === 'discard' || msg.type === 'exit') {
+          state.browserSourcePathsBySession.delete(msg.id);
+        }
+        if (msg.screenshotPath !== undefined) {
+          state.issuedScreenshotPaths.delete(msg.id);
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
-      });
       return;
     }
 
@@ -771,7 +928,7 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
       return;
     }
     if (p === '/poll' && req.method === 'POST') {
-      handlePollPost(req, res);
+      await handlePollPost(req, res);
       return;
     }
 
@@ -828,20 +985,28 @@ function sessionFileMetadataFromPollReply(file) {
   if (!file || typeof file !== 'string') return { file };
   const normalized = file.split(path.sep).join('/');
   const base = { file: normalized };
-  if (!normalized.endsWith('/manifest.json') && normalized !== 'manifest.json') return base;
-  if (!normalized.includes('node_modules/.impeccable-live/') && !normalized.includes('src/lib/impeccable/')) return base;
+  if (!isSvelteComponentManifestPath(normalized)) return base;
 
   let full;
   try {
-    full = path.resolve(process.cwd(), normalized);
-    const rel = path.relative(process.cwd(), full);
-    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return base;
+    full = resolveContainedPath(
+      process.cwd(),
+      normalized,
+      { allowMissing: false, type: 'file' },
+    );
   } catch {
     return base;
   }
 
   try {
-    const manifest = JSON.parse(fs.readFileSync(full, 'utf-8'));
+    const manifest = JSON.parse(
+      readContainedFile(
+        process.cwd(),
+        full,
+        'utf-8',
+        { maxBytes: MAX_BROWSER_SOURCE_BYTES },
+      ),
+    );
     if (manifest?.previewMode !== 'svelte-component' || !manifest.sourceFile) return base;
     return {
       file: String(manifest.sourceFile).split(path.sep).join('/'),
@@ -854,14 +1019,88 @@ function sessionFileMetadataFromPollReply(file) {
   }
 }
 
-function handlePollPost(req, res) {
-  let body = '';
-  req.on('data', (c) => { body += c; });
-  req.on('end', () => {
+function isSvelteComponentManifestPath(file) {
+  const normalized = String(file || '').split(path.sep).join('/');
+  if (!normalized.endsWith('/manifest.json') && normalized !== 'manifest.json') return false;
+  return normalized.includes('node_modules/.impeccable-live/')
+    || normalized.includes('src/lib/impeccable/');
+}
+
+function addIssuedBrowserSourcePath(paths, file, allowedExtensions = BROWSER_SOURCE_EXTENSIONS) {
+  let safePath;
+  try {
+    safePath = resolveContainedPath(
+      process.cwd(),
+      file,
+      { allowMissing: false, type: 'file' },
+    );
+  } catch {
+    return false;
+  }
+  if (allowedExtensions && !allowedExtensions.has(path.extname(safePath).toLowerCase())) return false;
+  paths.add(safePath);
+  return true;
+}
+
+function issueBrowserSourcePaths(sessionId, file) {
+  if (!/^[0-9a-f]{8}$/.test(String(sessionId || '')) || typeof file !== 'string') return;
+  const paths = new Set();
+  const normalized = file.split(path.sep).join('/');
+  if (isSvelteComponentManifestPath(normalized)) {
+    let manifestPath;
+    let manifest;
+    try {
+      manifestPath = resolveContainedPath(
+        process.cwd(),
+        normalized,
+        { allowMissing: false, type: 'file' },
+      );
+      manifest = JSON.parse(
+        readContainedFile(
+          process.cwd(),
+          manifestPath,
+          'utf-8',
+          { maxBytes: MAX_BROWSER_SOURCE_BYTES },
+        ),
+      );
+    } catch {
+      return;
+    }
+    if (
+      manifest?.id !== sessionId
+      || manifest?.previewMode !== 'svelte-component'
+      || !Number.isInteger(manifest.count)
+      || manifest.count < 1
+      || manifest.count > 8
+    ) {
+      return;
+    }
+    paths.add(manifestPath);
+    const componentDir = path.dirname(manifestPath);
+    addIssuedBrowserSourcePath(paths, path.join(componentDir, 'params.json'), new Set(['.json']));
+    for (let variant = 1; variant <= manifest.count; variant += 1) {
+      addIssuedBrowserSourcePath(paths, path.join(componentDir, `v${variant}.svelte`));
+    }
+  } else {
+    addIssuedBrowserSourcePath(paths, normalized);
+  }
+  if (paths.size > 0) state.browserSourcePathsBySession.set(sessionId, paths);
+}
+
+function isBrowserSourcePathIssued(file) {
+  const absolute = path.resolve(file);
+  for (const paths of state.browserSourcePathsBySession.values()) {
+    if (paths.has(absolute)) return true;
+  }
+  return false;
+}
+
+async function handlePollPost(req, res) {
     let msg;
-    try { msg = JSON.parse(body); } catch {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Invalid JSON' }));
+    try {
+      msg = await readBoundedJsonBody(req, { maxBytes: MAX_AGENT_JSON_BODY_BYTES });
+    } catch (error) {
+      writeJsonBodyError(res, error);
       return;
     }
     if (msg.token !== state.token) {
@@ -947,6 +1186,15 @@ function handlePollPost(req, res) {
       return;
     }
     const replyFileMeta = sessionFileMetadataFromPollReply(msg.file);
+    issueBrowserSourcePaths(msg.id, msg.file);
+    if (
+      msg.type === 'complete'
+      || msg.type === 'discard'
+      || msg.type === 'discarded'
+      || msg.type === 'error'
+    ) {
+      state.browserSourcePathsBySession.delete(msg.id);
+    }
     if (state.sessionStore && msg.id && !skipJournalReply) {
       try {
         const eventType = msg.type === 'steer_done'
@@ -985,7 +1233,6 @@ function handlePollPost(req, res) {
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,6 +1251,8 @@ function shutdown() {
   }
   for (const res of state.sseClients) { try { res.end(); } catch {} }
   state.sseClients.clear();
+  state.browserSourcePathsBySession.clear();
+  state.issuedScreenshotPaths.clear();
   for (const poll of state.pendingPolls) poll.resolve({ type: 'exit' });
   state.pendingPolls.length = 0;
   if (httpServer) httpServer.close();
@@ -1154,14 +1403,14 @@ if (portArg) {
   const rawPort = portArg.slice('--port='.length);
   state.port = /^[1-9]\d*$/.test(rawPort) ? Number(rawPort) : NaN;
   try {
-    assertLiveBootstrapCredentials(state.port, state.token);
+    assertLiveBootstrapPort(state.port);
   } catch (err) {
     console.error(`Invalid --port value: ${err.message}`);
     process.exit(1);
   }
 } else {
   state.port = await findOpenPort();
-  assertLiveBootstrapCredentials(state.port, state.token);
+  assertLiveBootstrapPort(state.port);
 }
 state.sessionStore = createLiveSessionStore({ cwd: process.cwd() });
 manualApply.rollbackTransaction({
@@ -1169,6 +1418,7 @@ manualApply.rollbackTransaction({
 });
 applyLegacyDeferredAcceptsOnStartup();
 restorePendingEventsFromStore();
+restoreBrowserSourcePathsFromStore();
 manualApply.pruneStaleEvidence();
 // Annotation screenshots live in the project root so the agent's Read tool
 // doesn't trip a per-file permission prompt. Sessioned by token so concurrent
@@ -1185,7 +1435,7 @@ httpServer.listen(state.port, '127.0.0.1', () => {
   const url = `http://localhost:${state.port}`;
   console.log(`\nImpeccable live server running on ${url}`);
   console.log(`Token: ${state.token}\n`);
-  console.log(`Script: ${url}/live.js?token=${encodeURIComponent(state.token)}`);
+  console.log(`Script: ${url}/live.js (authorize the preview origin before loading)`);
   console.log('Inject: managed by live-inject.mjs; Astro source tags use is:inline automatically.');
   console.log(`Stop:   node ${path.basename(fileURLToPath(import.meta.url))} stop`);
 });

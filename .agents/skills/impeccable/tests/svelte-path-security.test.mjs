@@ -15,6 +15,7 @@ import {
   removeAllSvelteComponentSessions,
   removeSvelteComponentSession,
   scaffoldSvelteComponentSession,
+  validateSvelteComponentParamValues,
   writeDeferredAccept,
 } from '../scripts/live/svelte-component.mjs';
 
@@ -204,6 +205,72 @@ test('Svelte accept still applies an edited variant when the source binding is u
 
   assert.equal(result.handled, true);
   assert.equal(fs.readFileSync(source, 'utf-8'), '<p class="chosen">{name}</p>\n');
+});
+
+test('Svelte accept validates param types, ranges, and options against params.json', (t) => {
+  const root = fixture(t);
+  const project = path.join(root, 'project');
+  const source = path.join(project, 'src', 'App.svelte');
+  fs.mkdirSync(path.dirname(source), { recursive: true });
+  fs.writeFileSync(source, '<div class="card">Original</div>\n');
+
+  const { componentDir } = scaffoldSvelteComponentSession({
+    id: 'deadbeef',
+    count: 1,
+    sourceFile: 'src/App.svelte',
+    sourceStartLine: 1,
+    sourceEndLine: 1,
+    originalLines: ['<div class="card">Original</div>'],
+    cwd: project,
+  });
+  fs.writeFileSync(
+    path.join(project, componentDir, 'params.json'),
+    JSON.stringify({
+      1: [
+        { id: 'width', kind: 'range', min: 0, max: 10, step: 1, default: 5, label: 'Width' },
+        {
+          id: 'density',
+          kind: 'steps',
+          default: 'snug',
+          label: 'Density',
+          options: [{ value: 'airy', label: 'Airy' }, { value: 'snug', label: 'Snug' }],
+        },
+        { id: 'serif', kind: 'toggle', default: false, label: 'Serif' },
+      ],
+    }),
+  );
+  fs.writeFileSync(
+    path.join(project, componentDir, 'v1.svelte'),
+    '<div class="card">Variant</div>\n<style>.card { width: var(--p-width, 5px); }</style>\n',
+  );
+  const manifest = findSvelteComponentManifest('deadbeef', project);
+
+  assert.deepEqual(
+    validateSvelteComponentParamValues(manifest, 1, {
+      width: 7,
+      density: 'airy',
+      serif: true,
+    }, project),
+    { width: 7, density: 'airy', serif: true },
+  );
+  for (const invalid of [
+    { width: '7' },
+    { width: 11 },
+    { width: 7.5 },
+    { density: '";color:red;/*' },
+    { serif: 'true' },
+    { unknown: 1 },
+  ]) {
+    assert.throws(
+      () => validateSvelteComponentParamValues(manifest, 1, invalid, project),
+      /param|range|step|option|unknown/i,
+    );
+  }
+  assert.throws(
+    () => inlineSvelteComponentAccept(manifest, 1, { width: '0);color:red;/*' }, project),
+    /param|range/i,
+  );
+  assert.equal(fs.readFileSync(source, 'utf-8'), '<div class="card">Original</div>\n');
 });
 
 test('design sidecar resolution ignores symlinks to files outside the project', (t) => {

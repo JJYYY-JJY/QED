@@ -289,6 +289,38 @@ test('manual-edit state and evidence never follow repository symlinks', (t) => {
   assert.equal(fs.readFileSync(bufferSecret, 'utf-8'), '{"version":1,"entries":[]}\n');
 });
 
+test('manual-edit evidence rejects a symlinked search root', (t) => {
+  const root = fixture(t);
+  const outside = fixture(t);
+  fs.writeFileSync(path.join(outside, 'secret.tsx'), 'export const SEARCH_ROOT_SECRET = true;\n');
+  fs.symlinkSync(outside, path.join(root, 'src'));
+  stageEntry(root, {
+    id: 'entry1',
+    pageUrl: '/',
+    element: {},
+    ops: [{
+      ref: 'ref1',
+      tag: 'div',
+      originalText: 'SEARCH_ROOT_SECRET',
+      newText: 'safe',
+    }],
+  });
+
+  const evidence = buildManualEditEvidence({ cwd: root, pageUrl: '/' });
+
+  assert.equal(JSON.stringify(evidence).includes('export const SEARCH_ROOT_SECRET'), false);
+  assert.deepEqual(evidence.candidates[0].textMatches, []);
+});
+
+test('live drift scan rejects a symlinked page root', (t) => {
+  const root = fixture(t);
+  const outside = fixture(t);
+  fs.writeFileSync(path.join(outside, 'outside.html'), '<p>outside checkout</p>\n');
+  fs.symlinkSync(outside, path.join(root, 'public'));
+
+  assert.equal(liveModule.scanForDrift(root, [], {}), null);
+});
+
 test('session and hook state cannot escape through symlinks or config paths', (t) => {
   const root = fixture(t);
   const outside = fixture(t);

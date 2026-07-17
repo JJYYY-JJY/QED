@@ -26,6 +26,9 @@ export const DEFERRED_ACCEPTS_FILE = '.impeccable/live/deferred-svelte-component
 const MUSTACHE_RE = /\{([^{}]+)\}/g;
 const SESSION_ID_RE = /^[0-9a-f]{8}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+const PARAM_ID_RE = /^[a-z][a-z0-9-]{0,63}$/;
+const MAX_SVELTE_PARAMS = 5;
+const MAX_SVELTE_PARAMS_BYTES = 64 * 1024;
 
 function requireSessionId(id) {
   if (typeof id !== 'string' || !SESSION_ID_RE.test(id)) {
@@ -435,8 +438,10 @@ function bakeParamValuesInCss(cssLines, paramValues) {
   return cssLines.map((line) => {
     let out = line;
     for (const [key, value] of Object.entries(paramValues)) {
+      if (typeof value !== 'number' && typeof value !== 'boolean') continue;
       const varName = `--p-${key}`;
-      out = out.replace(new RegExp(`var\\(${escapeRegExp(varName)}(?:,\\s*[^)]+)?\\)`, 'g'), String(value));
+      const serialized = typeof value === 'boolean' ? (value ? '1' : '0') : String(value);
+      out = out.replace(new RegExp(`var\\(${escapeRegExp(varName)}(?:,\\s*[^)]+)?\\)`, 'g'), serialized);
     }
     return out;
   });
@@ -632,6 +637,159 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+export function validateSvelteComponentParamValues(
+  manifest,
+  variantNum,
+  paramValues,
+  cwd = process.cwd(),
+) {
+  if (paramValues === null || paramValues === undefined) return null;
+  if (!isPlainRecord(paramValues)) {
+    throw new Error('Svelte param values must be a plain object');
+  }
+  const valueEntries = Object.entries(paramValues);
+  if (valueEntries.length === 0) return {};
+
+  validateManifestIdentity(manifest, cwd, manifest?.id);
+  const selectedVariant = Number(variantNum);
+  if (!Number.isInteger(selectedVariant) || selectedVariant < 1 || selectedVariant > manifest.count) {
+    throw new Error('Invalid Svelte component variant number');
+  }
+
+  const paramsPath = path.join(componentSessionDir(manifest.id, cwd), 'params.json');
+  let paramsByVariant;
+  try {
+    paramsByVariant = JSON.parse(
+      readContainedFile(cwd, paramsPath, 'utf-8', { maxBytes: MAX_SVELTE_PARAMS_BYTES }),
+    );
+  } catch (error) {
+    throw new Error(`Svelte params.json is missing or invalid: ${error.message}`);
+  }
+  if (!isPlainRecord(paramsByVariant)) {
+    throw new Error('Svelte params.json must be an object keyed by variant number');
+  }
+  const schema = paramsByVariant[String(selectedVariant)];
+  if (!Array.isArray(schema) || schema.length > MAX_SVELTE_PARAMS) {
+    throw new Error(`Svelte params for variant ${selectedVariant} must be an array of at most ${MAX_SVELTE_PARAMS}`);
+  }
+
+  const definitions = new Map();
+  for (const definition of schema) {
+    validateSvelteParamDefinition(definition);
+    if (definitions.has(definition.id)) {
+      throw new Error(`Duplicate Svelte param id: ${definition.id}`);
+    }
+    definitions.set(definition.id, definition);
+  }
+
+  const validated = {};
+  for (const [id, value] of valueEntries) {
+    const definition = definitions.get(id);
+    if (!definition) throw new Error(`Unknown Svelte param: ${id}`);
+    validateSvelteParamValue(definition, value);
+    validated[id] = value;
+  }
+  return validated;
+}
+
+function validateSvelteParamDefinition(definition) {
+  if (!isPlainRecord(definition) || !PARAM_ID_RE.test(definition.id || '')) {
+    throw new Error('Svelte param id must be a lowercase CSS-safe identifier');
+  }
+  if (definition.label !== undefined && typeof definition.label !== 'string') {
+    throw new Error(`Svelte param ${definition.id} label must be a string`);
+  }
+  if (definition.kind === 'range') {
+    for (const key of ['min', 'max', 'step', 'default']) {
+      if (!Number.isFinite(definition[key])) {
+        throw new Error(`Svelte range param ${definition.id} ${key} must be finite`);
+      }
+    }
+    if (definition.max < definition.min || definition.step <= 0) {
+      throw new Error(`Svelte range param ${definition.id} has an invalid range or step`);
+    }
+    validateRangeParamValue(definition, definition.default, 'default');
+    return;
+  }
+  if (definition.kind === 'steps') {
+    if (
+      !Array.isArray(definition.options)
+      || definition.options.length === 0
+      || definition.options.length > 20
+    ) {
+      throw new Error(`Svelte steps param ${definition.id} options must be a non-empty array`);
+    }
+    const optionValues = new Set();
+    for (const option of definition.options) {
+      if (
+        !isPlainRecord(option)
+        || typeof option.value !== 'string'
+        || option.value.length === 0
+        || option.value.length > 128
+        || /[\u0000-\u001f\u007f]/.test(option.value)
+        || typeof option.label !== 'string'
+      ) {
+        throw new Error(`Svelte steps param ${definition.id} has an invalid option`);
+      }
+      if (optionValues.has(option.value)) {
+        throw new Error(`Svelte steps param ${definition.id} has duplicate options`);
+      }
+      optionValues.add(option.value);
+    }
+    if (typeof definition.default !== 'string' || !optionValues.has(definition.default)) {
+      throw new Error(`Svelte steps param ${definition.id} default must match an option`);
+    }
+    return;
+  }
+  if (definition.kind === 'toggle') {
+    if (typeof definition.default !== 'boolean') {
+      throw new Error(`Svelte toggle param ${definition.id} default must be boolean`);
+    }
+    return;
+  }
+  throw new Error(`Svelte param ${definition.id} has an unsupported kind`);
+}
+
+function validateSvelteParamValue(definition, value) {
+  if (definition.kind === 'range') {
+    validateRangeParamValue(definition, value, 'value');
+    return;
+  }
+  if (definition.kind === 'steps') {
+    if (
+      typeof value !== 'string'
+      || !definition.options.some((option) => option.value === value)
+    ) {
+      throw new Error(`Svelte steps param ${definition.id} value must match an option`);
+    }
+    return;
+  }
+  if (definition.kind === 'toggle' && typeof value !== 'boolean') {
+    throw new Error(`Svelte toggle param ${definition.id} value must be boolean`);
+  }
+}
+
+function validateRangeParamValue(definition, value, label) {
+  if (
+    !Number.isFinite(value)
+    || value < definition.min
+    || value > definition.max
+  ) {
+    throw new Error(`Svelte range param ${definition.id} ${label} is outside the allowed range`);
+  }
+  const steps = (value - definition.min) / definition.step;
+  const tolerance = 1e-7 * Math.max(1, Math.abs(steps));
+  if (Math.abs(steps - Math.round(steps)) > tolerance) {
+    throw new Error(`Svelte range param ${definition.id} ${label} is not aligned to step`);
+  }
+}
+
+function isPlainRecord(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 export function inlineSvelteComponentAccept(manifest, variantNum, paramValues = null, cwd = process.cwd()) {
   validateManifestIdentity(manifest, cwd, manifest?.id);
   const sourceFile = resolveSourceFile(manifest.sourceFile, cwd);
@@ -643,6 +801,12 @@ export function inlineSvelteComponentAccept(manifest, variantNum, paramValues = 
   ) {
     throw new Error('Invalid Svelte component variant number');
   }
+  paramValues = validateSvelteComponentParamValues(
+    manifest,
+    selectedVariant,
+    paramValues,
+    cwd,
+  );
   const variantPath = resolveContainedPath(
     cwd,
     path.join(componentSessionDir(manifest.id, cwd), `v${selectedVariant}.svelte`),

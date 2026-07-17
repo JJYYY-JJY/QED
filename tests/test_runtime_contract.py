@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from qed.runtime import (
     MockRuntime,
     RunRequest,
@@ -37,6 +39,7 @@ async def test_mock_runtime_streams_the_public_event_contract() -> None:
             "required": ["verdict"],
             "additionalProperties": False,
         },
+        cwd=Path("/var/lib/qed/turns/test"),
     )
 
     observed = [event async for event in runtime.stream(request)]

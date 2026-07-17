@@ -23,7 +23,6 @@ from qed.runtime import (
     RuntimeErrorEvent,
     RuntimeEvent,
     RuntimePreference,
-    SandboxMode,
     ThreadStarted,
     TokenUsage,
     TokenUsageUpdated,
@@ -1160,9 +1159,20 @@ async def test_heartbeat_failure_fails_run_and_always_releases_worker_state(
 
 
 async def test_retryable_turn_error_uses_bounded_fresh_retry(tmp_path: Path) -> None:
+    class IsolatedRetryRuntime(ScriptedRuntime):
+        def __init__(self, responses: dict[str, list[dict[str, Any]]]) -> None:
+            super().__init__(responses)
+            self.preflight_requests: list[RunRequest] = []
+
+        def preflight(self, request: RunRequest) -> None:
+            self.preflight_requests.append(request)
+            assert request.cwd.is_absolute()
+            assert {entry.name for entry in request.cwd.iterdir()} == {".git"}
+            assert (request.cwd / ".git").is_dir()
+
     responses = passing_responses()
     responses["EvidenceBatch"].insert(0, {"__runtime_error__": "temporary App Server overload"})
-    runtime = ScriptedRuntime(responses)
+    runtime = IsolatedRetryRuntime(responses)
     retry_config = config().model_copy(
         update={"budgets": config().budgets.model_copy(update={"turn_retries": 1})}
     )
@@ -1179,6 +1189,15 @@ async def test_retryable_turn_error_uses_bounded_fresh_retry(tmp_path: Path) -> 
 
     assert completed.status is RunStatus.COMPLETED
     assert runtime.counts["EvidenceBatch"] == 2
+    evidence_attempts = [
+        request
+        for request in runtime.preflight_requests
+        if request.output_schema["title"] == "EvidenceBatch"
+    ]
+    assert len(evidence_attempts) == 2
+    assert evidence_attempts[0].cwd != evidence_attempts[1].cwd
+    assert all(not request.cwd.exists() for request in runtime.preflight_requests)
+    assert list((tmp_path / "runtime-workspaces").iterdir()) == []
     literature_threads = [
         thread for thread in snapshot.threads if thread.role is ThreadRole.LITERATURE
     ]
@@ -1393,26 +1412,19 @@ async def test_local_preflight_rejection_does_not_open_a_turn_attempt(
         def preflight(self, request: RunRequest) -> None:
             if (
                 request.runtime is RuntimePreference.EXEC
-                and request.sandbox is SandboxMode.WORKSPACE_WRITE
+                and request.output_schema["title"] == "ProofDraft"
             ):
                 raise ValueError(
                     "requested controls are not representable by codex exec fallback"
                 )
 
     runtime = RejectingExecRuntime(passing_responses())
-    unsafe_exec = config().model_copy(
-        update={
-            "backend": "exec",
-            "sandbox": config().sandbox.model_copy(
-                update={"prover": "workspace-write"}
-            ),
-        }
-    )
+    rejected_exec = config().model_copy(update={"backend": "exec"})
     with RunStore(tmp_path / "qed.sqlite3") as store:
         workflow = ResearchWorkflow(store, runtime, runtime_version="test-runtime")
         workflow.create_run(
             RunInput(problem="Prove that there are infinitely many primes."),
-            unsafe_exec,
+            rejected_exec,
             run_id="run-1",
         )
 

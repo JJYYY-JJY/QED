@@ -131,6 +131,7 @@ describe("QED research console", () => {
     await user.clear(screen.getByLabelText("Effort"));
     await user.type(screen.getByLabelText("Effort"), "max");
     await user.selectOptions(screen.getByLabelText("Runtime backend"), "exec");
+    expect(screen.queryByRole("option", { name: "Workspace write" })).not.toBeInTheDocument();
     await user.clear(screen.getByLabelText("Concurrent runs"));
     expect(screen.getByLabelText("Concurrent runs")).toHaveValue(null);
     await user.type(screen.getByLabelText("Concurrent runs"), "2");

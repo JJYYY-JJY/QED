@@ -284,13 +284,7 @@ export function NewRunForm({ defaultModel, submitting, onCancel, onSubmit }: New
               </label>
               <label className="field">
                 <span>Prover</span>
-                <select
-                  value={config.sandbox.prover}
-                  onChange={(event) => setConfig({ ...config, sandbox: { ...config.sandbox, prover: event.target.value as QedConfig["sandbox"]["prover"] } })}
-                >
-                  <option value="read-only">Read-only</option>
-                  <option value="workspace-write">Workspace write</option>
-                </select>
+                <select value={config.sandbox.prover} disabled><option value="read-only">Read-only</option></select>
               </label>
               <label className="field">
                 <span>Verifier</span>

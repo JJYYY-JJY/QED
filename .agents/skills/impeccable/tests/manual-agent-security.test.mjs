@@ -17,6 +17,7 @@ import {
   collectManualApplyFiles,
   writeManualApplyTransaction,
 } from '../scripts/live/manual-apply.mjs';
+import { applyBufferedManualEditToLines } from '../scripts/live-wrap.mjs';
 
 const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts');
 
@@ -111,6 +112,56 @@ test('wrap and insert CLIs reject explicit symlinked source files', (t) => {
   assert.match(wrapped.stderr, /symbolic link/i);
   assert.match(inserted.stderr, /symbolic link/i);
   assert.equal(fs.readFileSync(sentinel, 'utf-8'), '<main id="target">unchanged</main>\n');
+});
+
+test('buffered copy edits only replace one unambiguous visible text node', () => {
+  const visible = applyBufferedManualEditToLines(
+    ['<button title="Save">Save</button>'],
+    0,
+    {
+      originalText: 'Save',
+      newText: 'Continue',
+      sourceHint: { line: 1 },
+      tag: 'button',
+    },
+  );
+  assert.equal(visible.changed, true);
+  assert.deepEqual(visible.lines, ['<button title="Save">Continue</button>']);
+
+  const hostileNewText = '</button><script>alert(1)</script><button>{dangerousCall()} & done';
+  const escaped = applyBufferedManualEditToLines(
+    ['<button>Save</button>'],
+    0,
+    {
+      originalText: 'Save',
+      newText: hostileNewText,
+    },
+  );
+  assert.equal(escaped.changed, true);
+  assert.equal(escaped.lines.join('\n').includes('<script>'), false);
+  assert.equal(escaped.lines.join('\n').includes('{dangerousCall()}'), false);
+  assert.deepEqual(escaped.lines, [
+    '<button>&lt;/button&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;button&gt;&#123;dangerousCall()&#125; &amp; done</button>',
+  ]);
+
+  for (const source of [
+    '<button title="Save">Submit</button>',
+    '<script>const label = "Save";</script>',
+    '<style>.Save { color: red; }</style>',
+    '<div>Save</div><span>Save</span>',
+  ]) {
+    const rejected = applyBufferedManualEditToLines(
+      [source],
+      0,
+      {
+        originalText: 'Save',
+        newText: 'Continue',
+        sourceHint: { line: 1 },
+      },
+    );
+    assert.equal(rejected.changed, false, source);
+    assert.deepEqual(rejected.lines, [source]);
+  }
 });
 
 test('manual Apply state and source scopes reject repository symlinks', (t) => {

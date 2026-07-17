@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from codex_cli_bin import bundled_codex_path
 
 from qed.runtime import (
     RuntimeProtocolError,
@@ -14,7 +16,10 @@ from qed.runtime import (
     StdioAppServerTransport,
     build_app_server_argv,
     probe_codex_version,
+    resolve_codex_executable,
 )
+
+_CODEX_HOME = Path("/var/lib/qed/codex-home")
 
 
 class FakeStdout:
@@ -126,13 +131,15 @@ class StubbornProcess(FakeProcess):
 def test_app_server_argv_is_absolute_strict_stdio_and_has_no_escape_flags() -> None:
     argv = build_app_server_argv(Path("/opt/codex/bin/codex"))
 
-    assert argv == (
+    assert argv[:3] == (
         "/opt/codex/bin/codex",
         "app-server",
         "--strict-config",
-        "--listen",
-        "stdio://",
     )
+    assert argv[-2:] == ("--listen", "stdio://")
+    assert "features.shell_tool=false" in argv
+    assert "features.plugins=false" in argv
+    assert 'web_search="disabled"' in argv
     rendered = " ".join(argv)
     assert "danger" not in rendered
     assert "bypass" not in rendered
@@ -155,23 +162,34 @@ def test_runtime_version_comes_from_the_resolved_executable(
     assert calls == [(str(executable), "--version")]
 
 
+def test_default_executable_is_the_uv_bundled_codex() -> None:
+    assert resolve_codex_executable() == bundled_codex_path().resolve(strict=True)
+    assert resolve_codex_executable(sys.executable) == Path(sys.executable).resolve(
+        strict=True
+    )
+
+
 async def test_stdio_transport_initializes_once_and_broadcasts_notifications() -> None:
     process = FakeProcess()
-    launched: list[tuple[str, ...]] = []
+    launched: list[tuple[tuple[str, ...], Path]] = []
 
-    async def spawn(argv: tuple[str, ...]) -> FakeProcess:
-        launched.append(argv)
+    async def spawn(argv: tuple[str, ...], codex_home: Path) -> FakeProcess:
+        launched.append((argv, codex_home))
         return process
 
     transport = StdioAppServerTransport(
-        Path("/opt/codex/bin/codex"), process_factory=cast(Any, spawn)
+        Path("/opt/codex/bin/codex"),
+        codex_home=_CODEX_HOME,
+        process_factory=cast(Any, spawn),
     )
     notifications = transport.notifications()
 
     result = await transport.request("model/list", {"cursor": None, "limit": 100})
 
     assert result == {"data": [], "nextCursor": None}
-    assert launched == [build_app_server_argv(Path("/opt/codex/bin/codex"))]
+    assert launched == [
+        (build_app_server_argv(Path("/opt/codex/bin/codex")), _CODEX_HOME)
+    ]
     assert [message["method"] for message in process.stdin.messages] == [
         "initialize",
         "initialized",
@@ -188,7 +206,9 @@ async def test_stdio_transport_initializes_once_and_broadcasts_notifications() -
 
 
 async def test_unstarted_notification_stream_aclose_unregisters_subscriber() -> None:
-    transport = StdioAppServerTransport(Path("/opt/codex/bin/codex"))
+    transport = StdioAppServerTransport(
+        Path("/opt/codex/bin/codex"), codex_home=_CODEX_HOME
+    )
     notifications = transport.notifications()
 
     assert len(transport._subscribers) == 1
@@ -203,11 +223,13 @@ async def test_concurrent_first_requests_wait_for_initialization() -> None:
     delayed = DelayedInitializeStdin(process)
     process.stdin = delayed
 
-    async def spawn(argv: tuple[str, ...]) -> FakeProcess:
+    async def spawn(_argv: tuple[str, ...], _codex_home: Path) -> FakeProcess:
         return process
 
     transport = StdioAppServerTransport(
-        Path("/opt/codex/bin/codex"), process_factory=cast(Any, spawn)
+        Path("/opt/codex/bin/codex"),
+        codex_home=_CODEX_HOME,
+        process_factory=cast(Any, spawn),
     )
     first = asyncio.create_task(transport.request("fast", {}))
     second = asyncio.create_task(
@@ -235,11 +257,12 @@ async def test_concurrent_first_requests_wait_for_initialization() -> None:
 async def test_notification_subscriber_fails_closed_on_queue_overflow() -> None:
     process = FakeProcess()
 
-    async def spawn(argv: tuple[str, ...]) -> FakeProcess:
+    async def spawn(_argv: tuple[str, ...], _codex_home: Path) -> FakeProcess:
         return process
 
     transport = StdioAppServerTransport(
         Path("/opt/codex/bin/codex"),
+        codex_home=_CODEX_HOME,
         process_factory=cast(Any, spawn),
         notification_queue_size=1,
     )
@@ -260,11 +283,13 @@ async def test_notification_subscriber_fails_closed_on_queue_overflow() -> None:
 async def test_cancelled_request_late_response_does_not_poison_transport() -> None:
     process = FakeProcess()
 
-    async def spawn(argv: tuple[str, ...]) -> FakeProcess:
+    async def spawn(_argv: tuple[str, ...], _codex_home: Path) -> FakeProcess:
         return process
 
     transport = StdioAppServerTransport(
-        Path("/opt/codex/bin/codex"), process_factory=cast(Any, spawn)
+        Path("/opt/codex/bin/codex"),
+        codex_home=_CODEX_HOME,
+        process_factory=cast(Any, spawn),
     )
     slow = asyncio.create_task(transport.request("slow", {}))
     await process.stdin.slow_written.wait()
@@ -287,11 +312,12 @@ async def test_cancelled_request_late_response_does_not_poison_transport() -> No
 async def test_timed_out_request_late_response_does_not_poison_transport() -> None:
     process = FakeProcess()
 
-    async def spawn(argv: tuple[str, ...]) -> FakeProcess:
+    async def spawn(_argv: tuple[str, ...], _codex_home: Path) -> FakeProcess:
         return process
 
     transport = StdioAppServerTransport(
         Path("/opt/codex/bin/codex"),
+        codex_home=_CODEX_HOME,
         process_factory=cast(Any, spawn),
         request_timeout_seconds=0.01,
     )
@@ -311,11 +337,14 @@ async def test_timed_out_request_late_response_does_not_poison_transport() -> No
 async def test_close_escalates_from_terminate_to_kill_with_bounded_waits() -> None:
     process = StubbornProcess()
 
-    async def spawn(argv: tuple[str, ...]) -> StubbornProcess:
+    async def spawn(
+        _argv: tuple[str, ...], _codex_home: Path
+    ) -> StubbornProcess:
         return process
 
     transport = StdioAppServerTransport(
         Path("/opt/codex/bin/codex"),
+        codex_home=_CODEX_HOME,
         process_factory=cast(Any, spawn),
         shutdown_timeout_seconds=0.01,
     )

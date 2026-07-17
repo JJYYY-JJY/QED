@@ -17,7 +17,7 @@ import {
   resolveContainedPath,
   writeContainedFile,
 } from '../lib/safe-fs.mjs';
-import { assertLiveBootstrapCredentials } from './browser-script-parts.mjs';
+import { assertLiveBootstrapPort } from './browser-script-parts.mjs';
 
 export const SVELTE_LIVE_ROOT_COMPONENT = 'src/lib/impeccable/ImpeccableLiveRoot.svelte';
 export const SVELTE_LAYOUT_MARKER_OPEN = '<!-- impeccable-live-svelte-start -->';
@@ -45,14 +45,14 @@ export function detectSvelteKitProject(cwd = process.cwd(), config = null) {
   };
 }
 
-export function applySvelteKitLiveAdapter({ cwd = process.cwd(), port, token, config = null } = {}) {
+export function applySvelteKitLiveAdapter({ cwd = process.cwd(), port, config = null } = {}) {
   const detected = detectSvelteKitProject(cwd, config);
   if (!detected) return null;
 
   const layoutRel = detected.layoutFile;
   const layoutAbs = resolveContainedPath(cwd, layoutRel, { allowMissing: true });
-  assertLiveBootstrapCredentials(port, token);
-  ensureSvelteLiveRootComponent(cwd, port, token);
+  assertLiveBootstrapPort(port);
+  ensureSvelteLiveRootComponent(cwd, port);
 
   const layoutExisted = fs.existsSync(layoutAbs);
   const before = layoutExisted ? readContainedFile(cwd, layoutAbs, 'utf-8') : defaultSvelteLayout();
@@ -141,15 +141,15 @@ export function unpatchSvelteLayout(content) {
   return out.replace(/\n{3,}/g, '\n\n');
 }
 
-export function ensureSvelteLiveRootComponent(cwd, port, token) {
+export function ensureSvelteLiveRootComponent(cwd, port) {
   const file = resolveContainedPath(cwd, SVELTE_LIVE_ROOT_COMPONENT, { allowMissing: true });
-  writeContainedFile(cwd, file, buildSvelteLiveRootComponent(port, token), { encoding: 'utf-8' });
+  writeContainedFile(cwd, file, buildSvelteLiveRootComponent(port), { encoding: 'utf-8' });
   return file;
 }
 
-export function buildSvelteLiveRootComponent(port, token) {
-  assertLiveBootstrapCredentials(port, token);
-  const liveUrl = `http://localhost:${port}/live.js?token=${encodeURIComponent(token)}`;
+export function buildSvelteLiveRootComponent(port) {
+  assertLiveBootstrapPort(port);
+  const liveUrl = `http://localhost:${port}/live.js`;
   return `<script>
   import { onMount } from 'svelte';
 
@@ -195,6 +195,7 @@ export function buildSvelteLiveRootComponent(port, token) {
 
     const script = document.createElement('script');
     script.src = LIVE_URL;
+    script.crossOrigin = 'anonymous';
     script.async = true;
     script.dataset.impeccableLiveScript = 'true';
     document.head.appendChild(script);

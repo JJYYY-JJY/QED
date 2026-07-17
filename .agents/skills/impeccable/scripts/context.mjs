@@ -159,7 +159,8 @@ export function resolveTargetSelection(cwd = process.cwd(), options = {}) {
 
 function resolveProject(cwd = process.cwd(), options = {}) {
   const absCwd = path.resolve(cwd);
-  const targetDir = resolveTargetDir(absCwd, options);
+  const checkoutRoot = findCheckoutRoot(absCwd);
+  const targetDir = resolveTargetDir(absCwd, options, checkoutRoot);
   let repoRoot = findMonorepoRoot(targetDir);
   if (!repoRoot && targetDir !== absCwd) {
     const cwdRepoRoot = findMonorepoRoot(absCwd);
@@ -168,19 +169,23 @@ function resolveProject(cwd = process.cwd(), options = {}) {
     }
   }
   if (!repoRoot) {
-    return {
+    const project = {
       targetDir,
       projectRoot: absCwd,
       repoRoot: absCwd,
       isMonorepo: false,
     };
+    assertProjectWithinCheckout(project, checkoutRoot);
+    return project;
   }
-  return {
+  const project = {
     targetDir,
     projectRoot: resolveWorkspaceProjectRoot(repoRoot, targetDir) || repoRoot,
     repoRoot,
     isMonorepo: true,
   };
+  assertProjectWithinCheckout(project, checkoutRoot);
+  return project;
 }
 
 function isPathInside(candidate, root) {
@@ -208,15 +213,69 @@ function resolveEnvContextDir(cwd) {
   return path.isAbsolute(trimmed) ? trimmed : path.resolve(cwd, trimmed);
 }
 
-function resolveTargetDir(cwd, options = {}) {
+function resolveTargetDir(cwd, options = {}, checkoutRoot = findCheckoutRoot(cwd)) {
   const targetPath = options && typeof options === 'object' ? options.targetPath : null;
   if (!targetPath || !String(targetPath).trim()) return cwd;
-  const abs = path.isAbsolute(targetPath) ? targetPath : path.resolve(cwd, targetPath);
+  const abs = path.isAbsolute(targetPath) ? path.resolve(targetPath) : path.resolve(cwd, targetPath);
+  resolveContainedPath(checkoutRoot, abs, { allowRoot: true, allowMissing: true });
+  assertPhysicalPathWithinCheckout(checkoutRoot, abs);
   try {
-    const stat = fs.statSync(abs);
-    return stat.isDirectory() ? abs : path.dirname(abs);
-  } catch {
+    const stat = fs.lstatSync(abs);
+    if (stat.isSymbolicLink()) throw new Error(`Path contains a symbolic link: ${abs}`);
+    if (stat.isDirectory()) return abs;
+    if (stat.isFile()) return path.dirname(abs);
+    throw new Error(`Target is not a regular file or directory: ${abs}`);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
     return path.extname(abs) ? path.dirname(abs) : abs;
+  }
+}
+
+function findCheckoutRoot(cwd) {
+  const physicalCwd = fs.realpathSync(path.resolve(cwd));
+  let dir = physicalCwd;
+  while (true) {
+    const marker = path.join(dir, '.git');
+    try {
+      const stat = fs.lstatSync(marker);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`Path contains a symbolic link: ${marker}`);
+      }
+      if (stat.isDirectory() || stat.isFile()) return dir;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return physicalCwd;
+    dir = parent;
+  }
+}
+
+function assertProjectWithinCheckout(project, checkoutRoot) {
+  for (const candidate of [project.targetDir, project.projectRoot, project.repoRoot]) {
+    resolveContainedPath(checkoutRoot, candidate, { allowRoot: true, allowMissing: true });
+    assertPhysicalPathWithinCheckout(checkoutRoot, candidate);
+  }
+}
+
+function assertPhysicalPathWithinCheckout(checkoutRoot, candidate) {
+  const physicalRoot = fs.realpathSync(checkoutRoot);
+  let existing = path.resolve(candidate);
+  while (true) {
+    try {
+      const physical = fs.realpathSync(existing);
+      if (!isContainedPath(physicalRoot, physical)) {
+        throw new Error(`Target escapes original checkout: ${candidate}`);
+      }
+      return;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    const parent = path.dirname(existing);
+    if (parent === existing) {
+      throw new Error(`Target escapes original checkout: ${candidate}`);
+    }
+    existing = parent;
   }
 }
 
@@ -797,13 +856,54 @@ function writeUpdateCache(cache) {
   }
 }
 
-/** Compare dotted numeric versions. Returns >0 when a is newer than b. */
+function parseStrictSemver(value) {
+  if (typeof value !== 'string' || value.trim() !== value) return null;
+  const match = value.match(
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
+  );
+  if (!match) return null;
+  const prerelease = match[4] ? match[4].split('.') : [];
+  if (prerelease.some((part) => /^\d+$/.test(part) && part.length > 1 && part.startsWith('0'))) {
+    return null;
+  }
+  return {
+    core: match.slice(1, 4),
+    prerelease,
+  };
+}
+
+function compareNumericSemverIdentifier(left, right) {
+  if (left.length !== right.length) return left.length - right.length;
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+/** Compare strict SemVer versions. Returns >0 when a is newer than b. */
 function compareSemver(a, b) {
-  const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
-  const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const diff = (pa[i] || 0) - (pb[i] || 0);
+  const pa = parseStrictSemver(a);
+  const pb = parseStrictSemver(b);
+  if (!pa || !pb) throw new Error('Invalid semantic version');
+  for (let i = 0; i < 3; i++) {
+    const diff = compareNumericSemverIdentifier(pa.core[i], pb.core[i]);
     if (diff !== 0) return diff;
+  }
+  if (pa.prerelease.length === 0 || pb.prerelease.length === 0) {
+    return pa.prerelease.length === pb.prerelease.length
+      ? 0
+      : pa.prerelease.length === 0 ? 1 : -1;
+  }
+  for (let i = 0; i < Math.max(pa.prerelease.length, pb.prerelease.length); i++) {
+    const left = pa.prerelease[i];
+    const right = pb.prerelease[i];
+    if (left === undefined || right === undefined) return left === undefined ? -1 : 1;
+    if (left === right) continue;
+    const leftNumeric = /^\d+$/.test(left);
+    const rightNumeric = /^\d+$/.test(right);
+    if (leftNumeric && rightNumeric) {
+      return compareNumericSemverIdentifier(left, right);
+    }
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return left < right ? -1 : 1;
   }
   return 0;
 }
@@ -813,7 +913,7 @@ async function fetchLatestSkillVersion() {
     const res = await fetch(`${UPDATE_HOST}/api/version`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (!res.ok) return null;
     const data = await res.json();
-    return typeof data?.skills === 'string' ? data.skills : null;
+    return parseStrictSemver(data?.skills) ? data.skills : null;
   } catch {
     return null; // offline, sandboxed, timed out, or bad JSON: all non-fatal
   }
@@ -854,21 +954,24 @@ async function computeUpdateDirective(now = Date.now()) {
     if (process.env.IMPECCABLE_NO_UPDATE_CHECK) return null;
     if (updateCheckDisabledByConfig()) return null;
     const localVersion = readLocalSkillVersion();
-    if (!localVersion) return null;
+    if (!parseStrictSemver(localVersion)) return null;
 
     const cache = readUpdateCache();
+    if (cache.latestVersion && !parseStrictSemver(cache.latestVersion)) {
+      delete cache.latestVersion;
+    }
 
     // Poll the network only when the throttle window has elapsed. Stamp
     // lastCheck even on failure so an offline machine doesn't poll every boot.
     if (!cache.lastCheck || now - cache.lastCheck > CHECK_INTERVAL_MS) {
       const latest = await fetchLatestSkillVersion();
       cache.lastCheck = now;
-      if (latest) cache.latestVersion = latest;
+      if (parseStrictSemver(latest)) cache.latestVersion = latest;
       writeUpdateCache(cache);
     }
 
     const latest = cache.latestVersion;
-    if (!latest || compareSemver(latest, localVersion) <= 0) return null;
+    if (!parseStrictSemver(latest) || compareSemver(latest, localVersion) <= 0) return null;
 
     // Anti-nag: surface a given version at most once per RENOTIFY window.
     if (cache.notifiedVersion === latest && cache.notifiedAt && now - cache.notifiedAt < RENOTIFY_INTERVAL_MS) {

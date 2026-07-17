@@ -11,7 +11,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { isGeneratedFile } from './lib/is-generated.mjs';
-import { readContainedFile, resolveContainedPath } from './lib/safe-fs.mjs';
+import {
+  readContainedDirectory,
+  readContainedFile,
+  resolveContainedPath,
+  walkContainedFiles,
+} from './lib/safe-fs.mjs';
 import { readBuffer, getBufferPath } from './live/manual-edits-buffer.mjs';
 
 const EVIDENCE_VERSION = 1;
@@ -23,6 +28,12 @@ const OBJECT_KEY_MATCH_LIMIT = 8;
 const LOCATOR_MATCH_LIMIT = 4;
 const CONTEXT_MATCH_LIMIT = 8;
 const CONTEXT_MATCH_PER_HINT = 2;
+const SEARCH_MAX_DEPTH = 8;
+const SEARCH_MAX_ITEMS_PER_ROOT = 5_000;
+const SEARCH_MAX_TREE_BYTES = 64 * 1024 * 1024;
+const SEARCH_MAX_FILES = 1_000;
+const SEARCH_MAX_FILE_BYTES = 256 * 1024;
+const SEARCH_MAX_CONTENT_BYTES = 8 * 1024 * 1024;
 const SKIP_DIRS = new Set([
   'node_modules',
   '.git',
@@ -213,53 +224,57 @@ function normalizeSourceHint(hint) {
 
 function collectSearchFiles(cwd) {
   const out = [];
-  const seenDirs = new Set();
   const seenFiles = new Set();
+  const budget = { files: 0, bytes: 0 };
   for (const dir of SEARCH_DIRS) {
-    scanDir(path.join(cwd, dir), cwd, seenDirs, seenFiles, out, 0);
+    if (budget.files >= SEARCH_MAX_FILES || budget.bytes >= SEARCH_MAX_CONTENT_BYTES) break;
+    const root = path.join(cwd, dir);
+    let files;
+    try {
+      files = walkContainedFiles(cwd, root, {
+        maxDepth: SEARCH_MAX_DEPTH,
+        maxItems: SEARCH_MAX_ITEMS_PER_ROOT,
+        maxBytes: SEARCH_MAX_TREE_BYTES,
+        skipDirectories: SKIP_DIRS,
+      });
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (budget.files >= SEARCH_MAX_FILES || budget.bytes >= SEARCH_MAX_CONTENT_BYTES) break;
+      if (!TEXT_EXTENSIONS.has(path.extname(file).toLowerCase())) continue;
+      maybeAddSearchFile(file, cwd, seenFiles, out, budget);
+    }
   }
-  scanRootFiles(cwd, seenFiles, out);
+  scanRootFiles(cwd, seenFiles, out, budget);
   return out;
 }
 
-function scanDir(dir, cwd, seenDirs, seenFiles, out, depth) {
-  if (depth > 7 || !fs.existsSync(dir)) return;
-  let realDir;
-  try { realDir = fs.realpathSync(dir); } catch { return; }
-  if (seenDirs.has(realDir)) return;
-  seenDirs.add(realDir);
-
+function scanRootFiles(cwd, seenFiles, out, budget = { files: out.length, bytes: 0 }) {
   let entries;
-  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  try { entries = readContainedDirectory(cwd, cwd, { withFileTypes: true }); } catch { return; }
   for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (SKIP_DIRS.has(entry.name)) continue;
-      scanDir(fullPath, cwd, seenDirs, seenFiles, out, depth + 1);
-      continue;
-    }
+    if (budget.files >= SEARCH_MAX_FILES || budget.bytes >= SEARCH_MAX_CONTENT_BYTES) break;
     if (!entry.isFile() || !TEXT_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
-    maybeAddSearchFile(fullPath, cwd, seenFiles, out);
+    maybeAddSearchFile(path.join(cwd, entry.name), cwd, seenFiles, out, budget);
   }
 }
 
-function scanRootFiles(cwd, seenFiles, out) {
-  let entries;
-  try { entries = fs.readdirSync(cwd, { withFileTypes: true }); } catch { return; }
-  for (const entry of entries) {
-    if (!entry.isFile() || !TEXT_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
-    maybeAddSearchFile(path.join(cwd, entry.name), cwd, seenFiles, out);
-  }
-}
-
-function maybeAddSearchFile(file, cwd, seenFiles, out) {
-  let realFile;
-  try { realFile = fs.realpathSync(file); } catch { return; }
-  if (seenFiles.has(realFile)) return;
-  seenFiles.add(realFile);
+function maybeAddSearchFile(file, cwd, seenFiles, out, budget) {
+  const absolute = path.resolve(file);
+  if (seenFiles.has(absolute)) return;
+  seenFiles.add(absolute);
   if (isGeneratedFile(file, { cwd })) return;
   let content;
-  try { content = fs.readFileSync(file, 'utf-8'); } catch { return; }
+  try {
+    content = readContainedFile(cwd, file, 'utf-8', { maxBytes: SEARCH_MAX_FILE_BYTES });
+  } catch {
+    return;
+  }
+  const bytes = Buffer.byteLength(content);
+  if (budget.bytes + bytes > SEARCH_MAX_CONTENT_BYTES) return;
+  budget.files += 1;
+  budget.bytes += bytes;
   out.push({ file, relativeFile: path.relative(cwd, file), content, lines: content.split('\n') });
 }
 

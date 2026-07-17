@@ -68,7 +68,7 @@ export interface QedConfig {
   sandbox: {
     literature: "read-only";
     planner: "read-only";
-    prover: "read-only" | "workspace-write";
+    prover: "read-only";
     verifier: "read-only";
     adjudicator: "read-only";
     approval: "never";

@@ -52,12 +52,15 @@ function resolveImport(specifier, fromDir, fileSet) {
   return null;
 }
 
-function buildImportGraph(files) {
+function buildImportGraph(files, options = {}) {
+  const readFile = typeof options.readFile === 'function'
+    ? options.readFile
+    : (file) => fs.readFileSync(file, 'utf-8');
   const fileSet = new Set(files);
   const graph = new Map();
 
   for (const file of files) {
-    const content = fs.readFileSync(file, 'utf-8');
+    const content = readFile(file);
     const dir = path.dirname(file);
     const imports = new Set();
 

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { finding } from './findings.mjs';
 import { GENERIC_FONTS } from './shared/constants.mjs';
 import { parseAnyColor, resolveLengthPx } from './rules/checks.mjs';
+import { readContainedFile, resolveContainedPath } from '../lib/safe-fs.mjs';
 
 const DESIGN_NAMES = ['DESIGN.md', 'Design.md', 'design.md'];
 const FALLBACK_DIRS = ['.agents/context', 'docs'];
@@ -11,6 +12,7 @@ const COLOR_CHANNEL_TOLERANCE = 6;
 const RADIUS_TOLERANCE_PX = 0.5;
 const FONT_SIZE_TOLERANCE_PX = 0.5;
 const FONT_SIZE_LITERAL_RE = /^-?[\d.]+(?:px|rem)$/;
+const MAX_DESIGN_FILE_BYTES = 1024 * 1024;
 
 const CSS_COLOR_RE = /#[0-9a-f]{3,8}\b|rgba?\([^)]+\)|oklch\([^)]+\)|hsla?\([^)]+\)/gi;
 const FONT_DECL_RE = /font-family\s*:\s*([^;}\n]+)/gi;
@@ -23,21 +25,25 @@ const FONT_SIZE_JS_RE = /fontSize\s*[:=]\s*["'`]([^"'`]+)["'`]/g;
 const TAILWIND_FONT_SIZE_RE = /\btext-\[(-?[\d.]+(?:px|rem))\]/g;
 const STATIC_DESIGN_SKIP_TAGS = new Set(['head', 'title', 'meta', 'link', 'style', 'script', 'noscript', 'template', 'source']);
 
-function firstExisting(dir, names) {
+function firstExisting(projectRoot, dir, names) {
   for (const name of names) {
     const abs = path.join(dir, name);
-    if (fs.existsSync(abs)) return abs;
+    try {
+      return resolveContainedPath(projectRoot, abs, { allowMissing: false, type: 'file' });
+    } catch {
+      // Missing, linked, or non-regular candidates are not design inputs.
+    }
   }
   return null;
 }
 
 function resolveDesignMdPath(cwd = process.cwd()) {
-  const root = firstExisting(cwd, DESIGN_NAMES);
+  const root = firstExisting(cwd, cwd, DESIGN_NAMES);
   if (root) return { path: root, contextDir: cwd };
 
   for (const rel of FALLBACK_DIRS) {
     const dir = path.resolve(cwd, rel);
-    const found = firstExisting(dir, DESIGN_NAMES);
+    const found = firstExisting(cwd, dir, DESIGN_NAMES);
     if (found) return { path: found, contextDir: dir };
   }
 
@@ -50,9 +56,15 @@ function resolveDesignSidecarPath(cwd = process.cwd(), contextDir = cwd) {
     path.join(cwd, 'DESIGN.json'),
     path.join(contextDir, 'DESIGN.json'),
   ];
-  return candidates.find((candidate, index) =>
-    candidates.indexOf(candidate) === index && fs.existsSync(candidate)
-  ) || null;
+  for (const [index, candidate] of candidates.entries()) {
+    if (candidates.indexOf(candidate) !== index) continue;
+    try {
+      return resolveContainedPath(cwd, candidate, { allowMissing: false, type: 'file' });
+    } catch {
+      // Missing, linked, or non-regular sidecars are ignored.
+    }
+  }
+  return null;
 }
 
 function parseFrontmatter(md) {
@@ -149,10 +161,15 @@ function parseScalar(raw) {
   return s;
 }
 
-function safeReadJson(filePath) {
+function safeReadJson(projectRoot, filePath) {
   if (!filePath) return null;
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    return JSON.parse(readContainedFile(
+      projectRoot,
+      filePath,
+      'utf-8',
+      { maxBytes: MAX_DESIGN_FILE_BYTES },
+    ));
   } catch {
     return null;
   }
@@ -376,24 +393,30 @@ function normalizeDesignSystem(input = {}) {
 }
 
 function loadDesignSystemForCwd(cwd = process.cwd()) {
-  const md = resolveDesignMdPath(cwd);
+  const projectRoot = path.resolve(cwd);
+  const md = resolveDesignMdPath(projectRoot);
   if (!md) return null;
 
   let frontmatter = null;
   let mdStat = null;
   try {
-    mdStat = fs.statSync(md.path);
-    frontmatter = parseFrontmatter(fs.readFileSync(md.path, 'utf-8'));
+    frontmatter = parseFrontmatter(readContainedFile(
+      projectRoot,
+      md.path,
+      'utf-8',
+      { maxBytes: MAX_DESIGN_FILE_BYTES },
+    ));
+    mdStat = fs.lstatSync(md.path);
   } catch {
     return null;
   }
   if (!frontmatter || typeof frontmatter !== 'object') return null;
 
-  const sidecarPath = resolveDesignSidecarPath(cwd, md.contextDir);
-  const sidecar = safeReadJson(sidecarPath);
+  const sidecarPath = resolveDesignSidecarPath(projectRoot, md.contextDir);
+  const sidecar = safeReadJson(projectRoot, sidecarPath);
   let sidecarStat = null;
   try {
-    if (sidecarPath) sidecarStat = fs.statSync(sidecarPath);
+    if (sidecarPath) sidecarStat = fs.lstatSync(sidecarPath);
   } catch {
     sidecarStat = null;
   }

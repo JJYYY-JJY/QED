@@ -1,6 +1,6 @@
-import fs from 'node:fs';
 import path from 'node:path';
 
+import { readContainedFile, resolveContainedPath } from '../../../lib/safe-fs.mjs';
 import { GENERIC_FONTS, OVERUSED_FONTS } from '../../shared/constants.mjs';
 import {
   checkSourceDesignSystem,
@@ -39,6 +39,13 @@ import {
   buildStaticWindow,
   collectStaticCssText,
 } from './css-cascade.mjs';
+
+const MAX_HTML_BYTES = 1024 * 1024;
+const LINKED_CSS_LIMITS = Object.freeze({
+  maxFiles: 32,
+  maxBytes: 4 * 1024 * 1024,
+  maxDepth: 16,
+});
 
 function checkStaticPageTypography(document, window) {
   const findings = [];
@@ -106,12 +113,24 @@ const STATIC_ELEMENT_RULES = [
 
 async function detectHtml(filePath, options = {}) {
   const profile = options?.profile;
+  const requestedPath = path.resolve(filePath);
+  const projectRoot = path.resolve(options.projectRoot || path.dirname(requestedPath));
+  const resolvedPath = resolveContainedPath(
+    projectRoot,
+    requestedPath,
+    { allowMissing: false, type: 'file' },
+  );
   const html = profileStep(profile, {
     engine: 'static-html',
     phase: 'setup',
     ruleId: 'read-html',
     target: filePath,
-  }, () => fs.readFileSync(filePath, 'utf-8'));
+  }, () => readContainedFile(
+    projectRoot,
+    resolvedPath,
+    'utf-8',
+    { maxBytes: MAX_HTML_BYTES },
+  ));
 
   let modules;
   try {
@@ -140,7 +159,6 @@ async function detectHtml(filePath, options = {}) {
     return detectText(html, filePath, options);
   }
 
-  const resolvedPath = path.resolve(filePath);
   const fileDir = path.dirname(resolvedPath);
   const root = profileStep(profile, {
     engine: 'static-html',
@@ -149,7 +167,19 @@ async function detectHtml(filePath, options = {}) {
     target: filePath,
   }, () => modules.parseDocument(html, { lowerCaseAttributeNames: false, lowerCaseTags: true }));
 
-  const cssText = collectStaticCssText(root, fileDir, profile, filePath, modules);
+  let cssText;
+  try {
+    cssText = collectStaticCssText(
+      root,
+      fileDir,
+      profile,
+      filePath,
+      modules,
+      { projectRoot, ...LINKED_CSS_LIMITS },
+    );
+  } catch {
+    return detectText(html, filePath, options);
+  }
   const document = new StaticDocument(root, modules);
   buildStaticStyleMap(root, document, cssText, modules, profile, filePath);
   const window = buildStaticWindow(document);

@@ -9,7 +9,15 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from codex_cli_bin import bundled_codex_path  # type: ignore[import-untyped]
+
 from .app_server import RuntimeProtocolError
+from .isolation import (
+    codex_home_environment,
+    codex_subprocess_environment,
+    server_config_overrides,
+)
+from .models import WebSearchMode
 
 
 class RuntimeRequestTimeout(RuntimeProtocolError):
@@ -17,10 +25,10 @@ class RuntimeRequestTimeout(RuntimeProtocolError):
 
 
 def resolve_codex_executable(executable: str | Path | None = None) -> Path:
-    value = "codex" if executable is None else str(executable)
-    candidate = value if Path(value).is_absolute() else shutil.which(value)
+    value = bundled_codex_path() if executable is None else Path(executable)
+    candidate = value if value.is_absolute() else shutil.which(str(value))
     if candidate is None:
-        raise FileNotFoundError(f"could not resolve Codex executable {value!r}")
+        raise FileNotFoundError(f"could not resolve Codex executable {str(value)!r}")
     resolved = Path(candidate).resolve(strict=True)
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise PermissionError(f"Codex executable is not executable: {resolved}")
@@ -51,10 +59,16 @@ def probe_codex_version(executable: Path) -> str:
 def build_app_server_argv(executable: Path) -> tuple[str, ...]:
     if not executable.is_absolute():
         raise ValueError("App Server executable must be an absolute path")
+    controls = tuple(
+        item
+        for override in server_config_overrides(WebSearchMode.DISABLED)
+        for item in ("-c", override)
+    )
     return (
         str(executable),
         "app-server",
         "--strict-config",
+        *controls,
         "--listen",
         "stdio://",
     )
@@ -86,15 +100,16 @@ class _Process(Protocol):
     def kill(self) -> None: ...
 
 
-ProcessFactory = Callable[[tuple[str, ...]], Awaitable[_Process]]
+ProcessFactory = Callable[[tuple[str, ...], Path], Awaitable[_Process]]
 
 
-async def _spawn(argv: tuple[str, ...]) -> _Process:
+async def _spawn(argv: tuple[str, ...], codex_home: Path) -> _Process:
     process = await asyncio.create_subprocess_exec(  # noqa: S603 - absolute argv, no shell
         *argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
+        env=codex_subprocess_environment(codex_home),
     )
     if process.stdin is None or process.stdout is None:
         process.terminate()
@@ -151,6 +166,7 @@ class StdioAppServerTransport:
         self,
         executable: Path,
         *,
+        codex_home: Path,
         process_factory: ProcessFactory = _spawn,
         request_timeout_seconds: float = 30.0,
         notification_queue_size: int = 256,
@@ -162,7 +178,9 @@ class StdioAppServerTransport:
             raise ValueError("notification queue size must be positive")
         if shutdown_timeout_seconds <= 0:
             raise ValueError("App Server shutdown timeout must be positive")
+        codex_home_environment(codex_home)
         self._argv = build_app_server_argv(executable)
+        self._codex_home = codex_home
         self._process_factory = process_factory
         self._request_timeout_seconds = request_timeout_seconds
         self._notification_queue_size = notification_queue_size
@@ -181,8 +199,10 @@ class StdioAppServerTransport:
     def from_environment(
         cls,
         executable: str | Path | None = None,
+        *,
+        codex_home: Path,
     ) -> StdioAppServerTransport:
-        return cls(resolve_codex_executable(executable))
+        return cls(resolve_codex_executable(executable), codex_home=codex_home)
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         await self._ensure_started()
@@ -211,7 +231,9 @@ class StdioAppServerTransport:
             if self._initialized:
                 return
             if self._process is None:
-                self._process = await self._process_factory(self._argv)
+                self._process = await self._process_factory(
+                    self._argv, self._codex_home
+                )
                 self._reader_task = asyncio.create_task(self._reader_loop())
             await self._raw_request(
                 "initialize",

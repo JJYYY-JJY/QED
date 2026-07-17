@@ -8,7 +8,7 @@
  * with zero LLM involvement.
  *
  * Usage:
- *   node live-inject.mjs --port PORT --token UUID   # Insert the live script tag
+ *   node live-inject.mjs --port PORT   # Insert the live script tag
  *   node live-inject.mjs --remove      # Remove the live script tag
  *   node live-inject.mjs --check       # Check whether live config exists
  */
@@ -18,7 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveLiveConfigPath } from './lib/impeccable-paths.mjs';
 import { readContainedFile, resolveContainedPath, writeContainedFile } from './lib/safe-fs.mjs';
-import { assertLiveBootstrapCredentials } from './live/browser-script-parts.mjs';
+import { assertLiveBootstrapPort } from './live/browser-script-parts.mjs';
 import {
   applySvelteKitLiveAdapter,
   detectSvelteKitProject,
@@ -75,7 +75,6 @@ Reads configuration from .impeccable/live/config.json.
 
 Modes:
   --port PORT   Insert script tag pointing at http://localhost:PORT/live.js
-  --token UUID  Authenticate the live.js bootstrap request
   --remove      Remove the script tag (if present)
   --check       Print whether .impeccable/live/config.json exists and its content
 
@@ -151,18 +150,16 @@ Output (JSON):
     console.error(JSON.stringify({ ok: false, error: 'missing_port' }));
     process.exit(1);
   }
-  const tokenIdx = args.indexOf('--token');
-  const token = tokenIdx !== -1 ? args[tokenIdx + 1] : null;
   try {
-    assertLiveBootstrapCredentials(port, token);
+    assertLiveBootstrapPort(port);
   } catch (err) {
-    console.error(JSON.stringify({ ok: false, error: 'invalid_token', message: err.message }));
+    console.error(JSON.stringify({ ok: false, error: 'invalid_port', message: err.message }));
     process.exit(1);
   }
   const gitIgnore = ensureLiveGitIgnores(process.cwd());
 
   if (svelteKit) {
-    const adapterResult = applySvelteKitLiveAdapter({ cwd: process.cwd(), port, token, config });
+    const adapterResult = applySvelteKitLiveAdapter({ cwd: process.cwd(), port, config });
     console.log(JSON.stringify({ ok: true, port, adapter: 'sveltekit', gitIgnore, results: [adapterResult] }));
     return;
   }
@@ -172,7 +169,7 @@ Output (JSON):
     if (!fs.existsSync(absFile)) return { file: relFile, error: 'file_not_found' };
     const content = readContainedFile(process.cwd(), absFile, 'utf-8');
     const withoutOld = revertCspMeta(removeTag(content, config.commentSyntax));
-    const withTag = insertTag(withoutOld, config, port, relFile, token);
+    const withTag = insertTag(withoutOld, config, port, relFile);
     if (withTag === withoutOld) {
       return { file: relFile, error: 'insertion_point_not_found', anchor: config.insertBefore || config.insertAfter };
     }
@@ -378,15 +375,15 @@ function validateConfig(cfg) {
 function commentOpen(syntax) { return syntax === 'jsx' ? '{/*' : '<!--'; }
 function commentClose(syntax) { return syntax === 'jsx' ? '*/}' : '-->'; }
 
-function buildTagBlock(syntax, port, filePath, token) {
-  assertLiveBootstrapCredentials(port, token);
+function buildTagBlock(syntax, port, filePath) {
+  assertLiveBootstrapPort(port);
   const open = commentOpen(syntax);
   const close = commentClose(syntax);
   // Astro processes <script> tags by default and rewrites src to its own
   // bundled URL. is:inline opts out so the literal external src survives.
   const isAstro = typeof filePath === 'string' && filePath.endsWith('.astro');
-  const scriptAttrs = isAstro ? 'is:inline ' : '';
-  const liveUrl = `http://localhost:${port}/live.js?token=${encodeURIComponent(token)}`;
+  const scriptAttrs = (isAstro ? 'is:inline ' : '') + 'crossorigin="anonymous" ';
+  const liveUrl = `http://localhost:${port}/live.js`;
   return (
     open + ' ' + MARKER_OPEN_TEXT + ' ' + close + '\n' +
     '<script ' + scriptAttrs + 'src="' + liveUrl + '"></script>\n' +
@@ -411,9 +408,9 @@ function readLineEndingAt(content, index) {
   return '';
 }
 
-function insertTag(content, config, port, filePath, token) {
+function insertTag(content, config, port, filePath) {
   const lineEnding = detectLineEnding(content);
-  const block = normalizeLineEndings(buildTagBlock(config.commentSyntax, port, filePath, token), lineEnding);
+  const block = normalizeLineEndings(buildTagBlock(config.commentSyntax, port, filePath), lineEnding);
   // insertBefore: match the LAST occurrence. Anchors like `</body>` naturally
   // belong at the end, and the same literal can appear earlier in code blocks
   // within rendered documentation pages.

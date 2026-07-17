@@ -5,9 +5,12 @@ import path from 'node:path';
 const NO_FOLLOW = fs.constants.O_NOFOLLOW || 0;
 const DIRECTORY = fs.constants.O_DIRECTORY || 0;
 const DIRECTORY_FLAGS = fs.constants.O_RDONLY | DIRECTORY | NO_FOLLOW;
+// Node does not expose O_PATH, but Linux defines it as octal 010000000.
+const PATH_DIRECTORY_FLAGS = 0o10000000 | DIRECTORY | NO_FOLLOW;
 const DESCRIPTOR_ROOT = process.platform === 'linux' ? '/proc/self/fd' : null;
 const MAX_REMOVE_DEPTH = 64;
 const MAX_REMOVE_PASSES = 32;
+const READ_CHUNK_BYTES = 64 * 1024;
 
 export function isPathInsideOrEqual(root, candidate) {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
@@ -80,7 +83,8 @@ export function makeContainedTemporaryDirectory(root, parent, prefix = 'tmp-') {
   }
 }
 
-export function readContainedFile(root, file, encoding = null) {
+export function readContainedFile(root, file, encoding = null, options = {}) {
+  const maxBytes = optionalLimit(options.maxBytes, 'maxBytes');
   const pinned = pinParentDirectory(root, file, { create: false });
   let descriptor;
   try {
@@ -91,49 +95,80 @@ export function readContainedFile(root, file, encoding = null) {
       undefined,
       pinned.absolute,
     );
-    return fs.readFileSync(descriptor, encoding === null ? undefined : { encoding });
+    if (maxBytes === null) {
+      return fs.readFileSync(descriptor, encoding === null ? undefined : { encoding });
+    }
+    return readBoundedDescriptor(descriptor, pinned.absolute, encoding, maxBytes);
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
     fs.closeSync(pinned.descriptor);
   }
 }
 
+export function walkContainedFiles(root, directory, options = {}) {
+  const maxDepth = requiredLimit(options.maxDepth, 'maxDepth');
+  const maxItems = requiredLimit(options.maxItems, 'maxItems');
+  const maxBytes = requiredLimit(options.maxBytes, 'maxBytes');
+  const skipDirectories = directoryNameSet(options.skipDirectories);
+  const includeExtensions = fileExtensionSet(options.includeExtensions);
+  const pinned = pinDirectory(root, directory, { create: false });
+  const files = [];
+  const state = { items: 0, bytes: 0 };
+  try {
+    walkDirectoryDescriptor(
+      pinned.descriptor,
+      pinned.absolute,
+      0,
+      { maxDepth, maxItems, maxBytes, skipDirectories, includeExtensions },
+      state,
+      files,
+    );
+    return files;
+  } finally {
+    fs.closeSync(pinned.descriptor);
+  }
+}
+
 export function writeContainedFile(root, file, data, options = {}) {
   const pinned = pinParentDirectory(root, file, { create: true });
-  const target = descriptorEntryPath(pinned.descriptor, pinned.leaf);
-  let mode = options.mode ?? 0o600;
-  let descriptor;
-  let temporary;
   try {
+    writeFileAtPinnedParent(pinned, data, options);
+  } finally {
+    fs.closeSync(pinned.descriptor);
+  }
+  return pinned.absolute;
+}
+
+export function updateContainedFile(root, file, update, options = {}) {
+  if (typeof update !== 'function') throw new Error('update must be a function');
+  const maxBytes = optionalLimit(options.maxBytes, 'maxBytes');
+  const pinned = pinParentDirectory(root, file, { create: true });
+  let descriptor;
+  try {
+    let existing = null;
     try {
-      const stat = fs.lstatSync(target);
-      if (stat.isSymbolicLink()) throw new Error(`Path contains a symbolic link: ${pinned.absolute}`);
-      if (!stat.isFile()) throw new Error(`Path is not a regular file: ${pinned.absolute}`);
-      mode = stat.mode & 0o777;
+      descriptor = openRegularFileAt(
+        pinned.descriptor,
+        pinned.leaf,
+        fs.constants.O_RDONLY | NO_FOLLOW,
+        undefined,
+        pinned.absolute,
+      );
+      existing = maxBytes === null
+        ? fs.readFileSync(descriptor, options.encoding ? { encoding: options.encoding } : undefined)
+        : readBoundedDescriptor(descriptor, pinned.absolute, options.encoding || null, maxBytes);
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
 
-    const temporaryLeaf = `.${pinned.leaf}.${process.pid}.${randomUUID()}.tmp`;
-    temporary = descriptorEntryPath(pinned.descriptor, temporaryLeaf);
-    descriptor = fs.openSync(
-      temporary,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW,
-      mode,
-    );
-    assertRegularDescriptor(descriptor, pinned.absolute);
-    fs.writeFileSync(descriptor, data, options.encoding ? { encoding: options.encoding } : undefined);
-    fs.closeSync(descriptor);
-    descriptor = undefined;
-    fs.renameSync(temporary, target);
+    const next = update(existing);
+    if (next === undefined) return false;
+    writeFileAtPinnedParent(pinned, next, options);
+    return true;
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
-    if (temporary) {
-      try { fs.unlinkSync(temporary); } catch {}
-    }
     fs.closeSync(pinned.descriptor);
   }
-  return pinned.absolute;
 }
 
 export function appendContainedFile(root, file, data, options = {}) {
@@ -186,6 +221,50 @@ export function removeContainedFile(root, file, options = {}) {
     fs.unlinkSync(target);
     return true;
   } finally {
+    fs.closeSync(pinned.descriptor);
+  }
+}
+
+export function removeContainedFileIf(root, file, condition, options = {}) {
+  if (typeof condition !== 'function') throw new Error('condition must be a function');
+  const maxBytes = optionalLimit(options.maxBytes, 'maxBytes');
+  let pinned;
+  let descriptor;
+  try {
+    pinned = pinParentDirectory(root, file, { create: false });
+    descriptor = openRegularFileAt(
+      pinned.descriptor,
+      pinned.leaf,
+      fs.constants.O_RDONLY | NO_FOLLOW,
+      undefined,
+      pinned.absolute,
+    );
+  } catch (error) {
+    if (pinned !== undefined) fs.closeSync(pinned.descriptor);
+    if (options.force === true && error?.code === 'ENOENT') return false;
+    throw error;
+  }
+  const target = descriptorEntryPath(pinned.descriptor, pinned.leaf);
+  try {
+    const opened = fs.fstatSync(descriptor);
+    const existing = maxBytes === null
+      ? fs.readFileSync(descriptor, options.encoding ? { encoding: options.encoding } : undefined)
+      : readBoundedDescriptor(descriptor, pinned.absolute, options.encoding || null, maxBytes);
+    if (!condition(existing)) return false;
+
+    const current = fs.lstatSync(target);
+    if (
+      current.isSymbolicLink()
+      || !current.isFile()
+      || current.dev !== opened.dev
+      || current.ino !== opened.ino
+    ) {
+      return false;
+    }
+    fs.unlinkSync(target);
+    return true;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
     fs.closeSync(pinned.descriptor);
   }
 }
@@ -286,22 +365,41 @@ function pinParentDirectory(root, file, { create }) {
 }
 
 function openRootDirectory(root) {
-  let descriptor;
+  requireDescriptorFilesystem();
+  const absolute = path.resolve(root);
+  const filesystemRoot = path.parse(absolute).root;
+  const parts = absolute.slice(filesystemRoot.length).split(path.sep).filter(Boolean);
+  let descriptor = fs.openSync(
+    filesystemRoot,
+    parts.length === 0 ? DIRECTORY_FLAGS : PATH_DIRECTORY_FLAGS,
+  );
+  let current = filesystemRoot;
   try {
-    descriptor = fs.openSync(root, DIRECTORY_FLAGS);
-    assertDirectoryDescriptor(descriptor, root);
+    assertDirectoryDescriptor(descriptor, current);
+    for (let index = 0; index < parts.length; index += 1) {
+      const part = parts[index];
+      current = path.join(current, part);
+      const next = openDirectoryAt(descriptor, part, {
+        create: false,
+        displayPath: current,
+        readable: index === parts.length - 1,
+      });
+      fs.closeSync(descriptor);
+      descriptor = next;
+    }
     return descriptor;
   } catch (error) {
-    if (descriptor !== undefined) fs.closeSync(descriptor);
+    fs.closeSync(descriptor);
     throw pathTypeError(error, root, 'directory');
   }
 }
 
-function openDirectoryAt(parentDescriptor, name, { create, displayPath }) {
+function openDirectoryAt(parentDescriptor, name, { create, displayPath, readable = true }) {
   const candidate = descriptorEntryPath(parentDescriptor, name);
+  const flags = readable ? DIRECTORY_FLAGS : PATH_DIRECTORY_FLAGS;
   let descriptor;
   try {
-    descriptor = fs.openSync(candidate, DIRECTORY_FLAGS);
+    descriptor = fs.openSync(candidate, flags);
   } catch (error) {
     if (create && error?.code === 'ENOENT') {
       try {
@@ -310,7 +408,7 @@ function openDirectoryAt(parentDescriptor, name, { create, displayPath }) {
         if (mkdirError?.code !== 'EEXIST') throw pathTypeError(mkdirError, displayPath, 'directory');
       }
       try {
-        descriptor = fs.openSync(candidate, DIRECTORY_FLAGS);
+        descriptor = fs.openSync(candidate, flags);
       } catch (openError) {
         throw pathTypeError(openError, displayPath, 'directory');
       }
@@ -339,6 +437,202 @@ function openRegularFileAt(parentDescriptor, name, flags, mode, displayPath) {
     if (descriptor !== undefined) fs.closeSync(descriptor);
     throw pathTypeError(error, displayPath, 'file');
   }
+}
+
+function writeFileAtPinnedParent(pinned, data, options) {
+  const target = descriptorEntryPath(pinned.descriptor, pinned.leaf);
+  let mode = options.mode ?? 0o600;
+  let descriptor;
+  let temporary;
+  try {
+    try {
+      const stat = fs.lstatSync(target);
+      if (stat.isSymbolicLink()) throw new Error(`Path contains a symbolic link: ${pinned.absolute}`);
+      if (!stat.isFile()) throw new Error(`Path is not a regular file: ${pinned.absolute}`);
+      mode = stat.mode & 0o777;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+
+    const temporaryLeaf = `.${pinned.leaf}.${process.pid}.${randomUUID()}.tmp`;
+    temporary = descriptorEntryPath(pinned.descriptor, temporaryLeaf);
+    descriptor = fs.openSync(
+      temporary,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW,
+      mode,
+    );
+    assertRegularDescriptor(descriptor, pinned.absolute);
+    fs.writeFileSync(descriptor, data, options.encoding ? { encoding: options.encoding } : undefined);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(temporary, target);
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+    if (temporary) {
+      try { fs.unlinkSync(temporary); } catch {}
+    }
+  }
+}
+
+function readBoundedDescriptor(descriptor, displayPath, encoding, maxBytes) {
+  const initial = fs.fstatSync(descriptor);
+  if (initial.size > maxBytes) {
+    throw new Error(`File exceeds maxBytes limit (${maxBytes}): ${displayPath}`);
+  }
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const remainingWithSentinel = maxBytes - total + 1;
+    const chunk = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, remainingWithSentinel));
+    const count = fs.readSync(descriptor, chunk, 0, chunk.length, null);
+    if (count === 0) break;
+    total += count;
+    if (total > maxBytes) {
+      throw new Error(`File exceeds maxBytes limit (${maxBytes}): ${displayPath}`);
+    }
+    chunks.push(chunk.subarray(0, count));
+  }
+  const body = Buffer.concat(chunks, total);
+  return encoding === null ? body : body.toString(encoding);
+}
+
+function walkDirectoryDescriptor(
+  descriptor,
+  displayPath,
+  depth,
+  limits,
+  state,
+  files,
+) {
+  const names = fs.readdirSync(descriptorPath(descriptor)).sort();
+  for (const name of names) {
+    const entryPath = descriptorEntryPath(descriptor, name);
+    const absolute = path.join(displayPath, name);
+    const stat = fs.lstatSync(entryPath);
+    if (stat.isSymbolicLink()) {
+      continue;
+    }
+    if (stat.isDirectory() && limits.skipDirectories.has(name)) continue;
+
+    const entryDepth = depth + 1;
+    if (entryDepth > limits.maxDepth) {
+      throw new Error(`Contained walk exceeds maxDepth limit (${limits.maxDepth}): ${absolute}`);
+    }
+    if (stat.isDirectory()) {
+      let child;
+      try {
+        child = openDirectoryAt(
+          descriptor,
+          name,
+          { create: false, displayPath: absolute },
+        );
+      } catch (error) {
+        if (isSkippableWalkEntryError(error)) continue;
+        throw error;
+      }
+      try {
+        walkDirectoryDescriptor(child, absolute, entryDepth, limits, state, files);
+      } finally {
+        fs.closeSync(child);
+      }
+      continue;
+    }
+    if (!stat.isFile()) {
+      continue;
+    }
+    if (
+      limits.includeExtensions
+      && !limits.includeExtensions.has(path.extname(name).toLowerCase())
+    ) {
+      continue;
+    }
+
+    state.items += 1;
+    if (state.items > limits.maxItems) {
+      throw new Error(`Contained walk exceeds maxItems limit (${limits.maxItems})`);
+    }
+
+    let fileDescriptor;
+    try {
+      try {
+        fileDescriptor = openRegularFileAt(
+          descriptor,
+          name,
+          fs.constants.O_RDONLY | NO_FOLLOW,
+          undefined,
+          absolute,
+        );
+      } catch (error) {
+        if (isSkippableWalkEntryError(error)) continue;
+        throw error;
+      }
+      const size = fs.fstatSync(fileDescriptor).size;
+      state.bytes += size;
+      if (state.bytes > limits.maxBytes) {
+        throw new Error(`Contained walk exceeds maxBytes limit (${limits.maxBytes})`);
+      }
+    } finally {
+      if (fileDescriptor !== undefined) fs.closeSync(fileDescriptor);
+    }
+    files.push(absolute);
+  }
+}
+
+function optionalLimit(value, name) {
+  if (value === undefined || value === null) return null;
+  return requiredLimit(value, name);
+}
+
+function requiredLimit(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function directoryNameSet(value) {
+  if (value === undefined) return new Set();
+  if (!Array.isArray(value) && !(value instanceof Set)) {
+    throw new Error('skipDirectories must be an array or Set of directory names');
+  }
+  const names = new Set();
+  for (const name of value) {
+    if (
+      typeof name !== 'string'
+      || !name
+      || name === '.'
+      || name === '..'
+      || name.includes('/')
+      || name.includes('\0')
+    ) {
+      throw new Error('skipDirectories contains an invalid directory name');
+    }
+    names.add(name);
+  }
+  return names;
+}
+
+function fileExtensionSet(value) {
+  if (value === undefined) return null;
+  if (!Array.isArray(value) && !(value instanceof Set)) {
+    throw new Error('includeExtensions must be an array or Set of file extensions');
+  }
+  const extensions = new Set();
+  for (const extension of value) {
+    if (
+      typeof extension !== 'string'
+      || !/^\.[A-Za-z0-9]+$/.test(extension)
+    ) {
+      throw new Error('includeExtensions contains an invalid file extension');
+    }
+    extensions.add(extension.toLowerCase());
+  }
+  return extensions;
+}
+
+function isSkippableWalkEntryError(error) {
+  const code = error?.code || error?.cause?.code;
+  return code === 'ENOENT' || code === 'ELOOP' || code === 'ENOTDIR';
 }
 
 function clearDirectoryDescriptor(descriptor, depth) {
@@ -374,7 +668,11 @@ function clearDirectoryDescriptor(descriptor, depth) {
 }
 
 function assertDirectoryDescriptor(descriptor, displayPath) {
-  if (!fs.fstatSync(descriptor).isDirectory()) {
+  const stat = fs.fstatSync(descriptor);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Path contains a symbolic link: ${displayPath}`);
+  }
+  if (!stat.isDirectory()) {
     throw new Error(`Path is not a directory: ${displayPath}`);
   }
 }

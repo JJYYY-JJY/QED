@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self, TypeVar
@@ -31,7 +30,6 @@ class RuntimePreference(StrEnum):
 
 class SandboxMode(StrEnum):
     READ_ONLY = "read-only"
-    WORKSPACE_WRITE = "workspace-write"
 
 
 class WebSearchMode(StrEnum):
@@ -65,21 +63,6 @@ class ForkThread(_FrozenModel):
 ThreadTarget = Annotated[FreshThread | ResumeThread | ForkThread, Field(discriminator="kind")]
 
 
-class RestrictedNetworkPolicy(_FrozenModel):
-    domains: tuple[str, ...] = Field(min_length=1)
-
-    @field_validator("domains")
-    @classmethod
-    def validate_restricted_domains(cls, domains: tuple[str, ...]) -> tuple[str, ...]:
-        domain_pattern = re.compile(
-            r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
-            r"[a-zA-Z]{2,63}"
-        )
-        if any(domain == "*" or domain_pattern.fullmatch(domain) is None for domain in domains):
-            raise ValueError("restricted network domains must be explicit host patterns")
-        return domains
-
-
 class RunRequest(_FrozenModel):
     model: str = Field(min_length=1)
     effort: str = Field(default="auto", min_length=1)
@@ -90,9 +73,15 @@ class RunRequest(_FrozenModel):
     role: WorkRole = WorkRole.GENERAL
     sandbox: SandboxMode = SandboxMode.READ_ONLY
     web_search: WebSearchMode = WebSearchMode.DISABLED
-    command_network: RestrictedNetworkPolicy | None = None
     runtime: RuntimePreference = RuntimePreference.AUTO
-    cwd: Path | None = None
+    cwd: Path
+
+    @field_validator("cwd")
+    @classmethod
+    def validate_absolute_cwd(cls, cwd: Path) -> Path:
+        if not cwd.is_absolute():
+            raise ValueError("cwd must be absolute")
+        return cwd
 
     @model_validator(mode="after")
     def validate_network_controls(self) -> Self:
@@ -101,18 +90,17 @@ class RunRequest(_FrozenModel):
             or self.sandbox is not SandboxMode.READ_ONLY
         ):
             raise ValueError("verification turns must be fresh and read-only")
-        if self.role is WorkRole.VERIFIER and (
-            self.web_search is not WebSearchMode.DISABLED
-            or self.command_network is not None
+        if (
+            self.role is WorkRole.VERIFIER
+            and self.web_search is not WebSearchMode.DISABLED
         ):
             raise ValueError("structural and detailed verifiers must be offline")
         network_roles = {WorkRole.LITERATURE, WorkRole.CITATION}
-        if self.web_search is not WebSearchMode.DISABLED and self.role not in network_roles:
+        if (
+            self.web_search is not WebSearchMode.DISABLED
+            and self.role not in network_roles
+        ):
             raise ValueError("web search is limited to literature and citation turns")
-        if self.command_network is not None and self.role not in network_roles:
-            raise ValueError(
-                "restricted command network is limited to literature and citation turns"
-            )
         return self
 
 

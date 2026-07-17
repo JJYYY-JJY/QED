@@ -15,6 +15,7 @@ def test_service_defaults_to_local_only_managed_state(tmp_path: Path) -> None:
     assert settings.host == "127.0.0.1"
     assert settings.auth_required is False
     assert settings.database_path == tmp_path / "qed.sqlite3"
+    assert settings.codex_home == tmp_path / "codex-home"
     assert settings.allowed_origins == ("http://127.0.0.1:5173", "http://localhost:5173")
 
 

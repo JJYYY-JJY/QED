@@ -1012,7 +1012,7 @@ function formatFindingIgnoreCommand(finding) {
 function quoteCommandArg(value) {
   const text = String(value || '').trim();
   if (/^[A-Za-z0-9._:-]+$/.test(text)) return text;
-  return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return `'${text.replace(/'/g, `'"'"'`)}'`;
 }
 
 function relativize(filePath, cwd) {
@@ -1218,6 +1218,7 @@ const CO_SCAN_STYLE_NAMES = [
   'globals.css', 'globals.scss', 'globals.sass', 'globals.less',
 ];
 const MAX_SCAN_TARGETS = 6;
+const MAX_SCAN_FILE_BYTES = 1024 * 1024;
 
 const STATIC_STYLE_IMPORT_RE = /import\s+(?:[\w*{}\s,$]+\s+from\s+)?['"]([^'"]+\.(?:css|scss|sass|less))['"]/gi;
 
@@ -1317,7 +1318,14 @@ export function expandScanTargets(primaryTargets, projectCwd) {
     if (STYLE_EXTS.has(ext) || !UI_CODE_EXTS.has(ext)) continue;
 
     let content = '';
-    try { content = fs.readFileSync(p, 'utf-8'); } catch { /* unreadable primary */ }
+    try {
+      content = readContainedFile(
+        baseCwd,
+        p,
+        'utf-8',
+        { maxBytes: MAX_SCAN_FILE_BYTES },
+      );
+    } catch { /* unreadable or unsafe primary */ }
 
     for (const imp of parseStaticStyleImports(content, p, projectCwd)) {
       add(imp);
@@ -1444,13 +1452,14 @@ export function shouldEmitAckForFile(filePath, config = null) {
 }
 
 export function designSystemOptions(config, detector, projectCwd) {
-  if (config?.designSystem?.enabled === false) return {};
-  if (!detector || typeof detector.loadDesignSystemForCwd !== 'function') return {};
+  const options = { projectRoot: path.resolve(projectCwd || process.cwd()) };
+  if (config?.designSystem?.enabled === false) return options;
+  if (!detector || typeof detector.loadDesignSystemForCwd !== 'function') return options;
   try {
     const designSystem = detector.loadDesignSystemForCwd(projectCwd);
-    return designSystem ? { designSystem } : {};
+    return designSystem ? { ...options, designSystem } : options;
   } catch {
-    return {};
+    return options;
   }
 }
 
@@ -1588,8 +1597,16 @@ export async function runHook({ stdinJson, env = {}, cwd = process.cwd(), now = 
         lastSkip = 'config-ignore-file';
         continue;
       }
-      if (!fs.existsSync(filePath)) {
-        lastSkip = 'file-missing';
+      let content;
+      try {
+        content = readContainedFile(
+          projectCwd,
+          filePath,
+          'utf-8',
+          { maxBytes: MAX_SCAN_FILE_BYTES },
+        );
+      } catch {
+        lastSkip = 'file-unsafe-or-unreadable';
         continue;
       }
 
@@ -1609,7 +1626,6 @@ export async function runHook({ stdinJson, env = {}, cwd = process.cwd(), now = 
         }
       }
 
-      const content = fs.readFileSync(filePath, 'utf-8');
       let findings;
       let detectorThrew = false;
       const useHtmlEngine = configuredExt

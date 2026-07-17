@@ -13,9 +13,14 @@
  * in the project root and creates/removes the pin in all of them.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { basename, join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  removeContainedFileIf,
+  resolveContainedPath,
+  updateContainedFile,
+} from './lib/safe-fs.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -38,6 +43,7 @@ const VALID_COMMANDS = [
 
 // Marker to identify pinned skills (so unpin doesn't delete user skills)
 const PIN_MARKER = '<!-- impeccable-pinned-skill -->';
+const MAX_PINNED_SKILL_BYTES = 256 * 1024;
 
 /**
  * Walk up from startDir to find a project root.
@@ -67,9 +73,23 @@ function findHarnessDirs(projectRoot) {
   for (const harness of HARNESS_DIRS) {
     const skillsDir = join(projectRoot, harness, 'skills');
     // Only pin in harness dirs that already have impeccable installed
-    const impeccableDir = join(skillsDir, 'impeccable');
-    if (existsSync(impeccableDir) || existsSync(join(skillsDir, 'i-impeccable'))) {
-      dirs.push(skillsDir);
+    try {
+      resolveContainedPath(projectRoot, skillsDir, { allowMissing: false, type: 'directory' });
+      const installed = ['impeccable', 'i-impeccable'].some((name) => {
+        try {
+          resolveContainedPath(
+            projectRoot,
+            join(skillsDir, name),
+            { allowMissing: false, type: 'directory' },
+          );
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      if (installed) dirs.push(skillsDir);
+    } catch {
+      // A missing or linked harness is not an eligible write destination.
     }
   }
   return dirs;
@@ -129,21 +149,22 @@ function pin(command, projectRoot) {
   for (const skillsDir of harnessDirs) {
     const commandPrefix = commandPrefixForSkillsDir(skillsDir);
     const content = generatePinnedSkill(command, metadata, commandPrefix);
-    // Check if skill already exists (and isn't a pin)
     const skillDir = join(skillsDir, command);
-    if (existsSync(skillDir)) {
-      const existingMd = join(skillDir, 'SKILL.md');
-      if (existsSync(existingMd)) {
-        const existing = readFileSync(existingMd, 'utf-8');
-        if (!existing.includes(PIN_MARKER)) {
-          console.log(`  SKIP: ${skillDir} (non-pinned skill already exists)`);
-          continue;
-        }
-      }
+    const existingMd = join(skillDir, 'SKILL.md');
+    const updated = updateContainedFile(
+      projectRoot,
+      existingMd,
+      existing => (
+        existing === null || existing.includes(PIN_MARKER)
+          ? content
+          : undefined
+      ),
+      { encoding: 'utf-8', maxBytes: MAX_PINNED_SKILL_BYTES },
+    );
+    if (!updated) {
+      console.log(`  SKIP: ${skillDir} (non-pinned skill already exists)`);
+      continue;
     }
-
-    mkdirSync(skillDir, { recursive: true });
-    writeFileSync(join(skillDir, 'SKILL.md'), content, 'utf-8');
     console.log(`  + ${skillDir}`);
     created++;
   }
@@ -165,19 +186,23 @@ function unpin(command, projectRoot) {
 
   for (const skillsDir of harnessDirs) {
     const skillDir = join(skillsDir, command);
-    if (!existsSync(skillDir)) continue;
-
     const skillMd = join(skillDir, 'SKILL.md');
-    if (!existsSync(skillMd)) continue;
-
-    // Safety: only remove if it's a pinned skill
-    const content = readFileSync(skillMd, 'utf-8');
-    if (!content.includes(PIN_MARKER)) {
+    let found = false;
+    const didRemove = removeContainedFileIf(
+      projectRoot,
+      skillMd,
+      content => {
+        found = true;
+        return content.includes(PIN_MARKER);
+      },
+      { encoding: 'utf-8', maxBytes: MAX_PINNED_SKILL_BYTES, force: true },
+    );
+    if (!found) continue;
+    if (!didRemove) {
       console.log(`  SKIP: ${skillDir} (not a pinned skill)`);
       continue;
     }
 
-    rmSync(skillDir, { recursive: true, force: true });
     console.log(`  - ${skillDir}`);
     removed++;
   }

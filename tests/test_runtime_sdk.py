@@ -9,7 +9,6 @@ import pytest
 from qed.runtime import (
     ForkThread,
     FreshThread,
-    RestrictedNetworkPolicy,
     ResumeThread,
     RunRequest,
     RuntimeBackend,
@@ -23,7 +22,11 @@ from qed.runtime import (
     TurnStarted,
     WebSearchMode,
     WorkRole,
+    build_app_server_argv,
 )
+from qed.runtime.isolation import server_config
+
+_CODEX_HOME = Path("/var/lib/qed/codex-home")
 
 
 class FakeHandle:
@@ -80,6 +83,7 @@ def _request(**overrides: object) -> RunRequest:
         "effort": "high",
         "prompt": "Return a verdict.",
         "output_schema": {"type": "object", "additionalProperties": False},
+        "cwd": Path("/var/lib/qed/turns/test"),
     }
     values.update(overrides)
     return RunRequest.model_validate(values)
@@ -96,21 +100,14 @@ def test_sdk_support_is_limited_to_published_typed_controls() -> None:
         )
         is False
     )
-    assert (
-        runtime.supports(
-            _request(
-                role=WorkRole.LITERATURE,
-                command_network=RestrictedNetworkPolicy(domains=("api.crossref.org",)),
-            )
-        )
-        is False
-    )
 
 
 def test_sdk_uses_the_same_resolved_executable_as_other_backends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: list[Any] = []
+    for name in ("CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.setenv(name, f"parent-{name.lower()}")
 
     def build_client(config: Any) -> FakeSdkClient:
         captured.append(config)
@@ -119,9 +116,16 @@ def test_sdk_uses_the_same_resolved_executable_as_other_backends(
     monkeypatch.setattr("qed.runtime.sdk.AsyncCodex", build_client)
     executable = Path("/opt/codex/bin/codex")
 
-    SdkRuntime(executable=executable)
+    SdkRuntime(executable=executable, codex_home=_CODEX_HOME)
 
     assert captured[0].codex_bin == str(executable)
+    assert captured[0].launch_args_override == build_app_server_argv(executable)
+    assert captured[0].env == {
+        "CODEX_ACCESS_TOKEN": "",
+        "CODEX_API_KEY": "",
+        "CODEX_HOME": str(_CODEX_HOME),
+        "OPENAI_API_KEY": "",
+    }
     assert captured[0].experimental_api is False
 
 
@@ -195,11 +199,13 @@ async def test_sdk_stream_enforces_safety_and_maps_usage_and_output(
     assert (method, source) == (expected_method, expected_source)
     assert lifecycle["approval_mode"].value == "deny_all"
     assert lifecycle["sandbox"].value == "read-only"
-    assert lifecycle["config"] == {"web_search": "disabled"}
+    assert lifecycle["cwd"] == str(request.cwd)
+    assert lifecycle["config"] == server_config(WebSearchMode.DISABLED)
     prompt, turn_kwargs = thread.turn_calls[0]
     assert prompt == request.prompt
     assert turn_kwargs["approval_mode"].value == "deny_all"
     assert turn_kwargs["sandbox"].value == "read-only"
+    assert turn_kwargs["cwd"] == str(request.cwd)
     assert turn_kwargs["effort"].value == "high"
     assert turn_kwargs["output_schema"] == request.output_schema
 

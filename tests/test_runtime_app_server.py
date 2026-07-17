@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -11,7 +12,6 @@ from qed.runtime import (
     ForkThread,
     FreshThread,
     ItemCompleted,
-    RestrictedNetworkPolicy,
     ResumeThread,
     RunRequest,
     RuntimeBackend,
@@ -22,8 +22,12 @@ from qed.runtime import (
     TurnRef,
     TurnStarted,
     UnknownNotification,
+    WebSearchMode,
     WorkRole,
 )
+from qed.runtime.isolation import server_config
+
+TURN_CWD = Path("/var/lib/qed/turns/test")
 
 
 class FakeNotificationStream:
@@ -158,6 +162,7 @@ async def test_stream_closes_notifications_when_thread_start_fails() -> None:
         effort="high",
         prompt="Return the verdict.",
         output_schema={"type": "object", "additionalProperties": False},
+        cwd=TURN_CWD,
     )
 
     with pytest.raises(RuntimeError, match="thread failed"):
@@ -179,6 +184,7 @@ async def test_stream_closes_notifications_when_turn_start_fails() -> None:
         effort="high",
         prompt="Return the verdict.",
         output_schema={"type": "object", "additionalProperties": False},
+        cwd=TURN_CWD,
     )
     events = runtime.stream(request)
 
@@ -260,6 +266,7 @@ async def test_stream_enforces_controls_and_maps_terminal_output(
         prompt="Return the verdict.",
         output_schema={"type": "object", "additionalProperties": False},
         thread=target,
+        cwd=TURN_CWD,
     )
 
     events = [event async for event in runtime.stream(request)]
@@ -301,6 +308,8 @@ async def test_stream_enforces_controls_and_maps_terminal_output(
     assert lifecycle_params["approvalPolicy"] == "never"
     assert lifecycle_params["sandbox"] == "read-only"
     assert lifecycle_params["model"] == "gpt-5.6-sol"
+    assert lifecycle_params["cwd"] == str(TURN_CWD)
+    assert lifecycle_params["config"] == server_config(WebSearchMode.DISABLED)
     if thread_param is not None:
         assert lifecycle_params["threadId"] == thread_param
     turn_method, turn_params = transport.requests[1]
@@ -309,6 +318,7 @@ async def test_stream_enforces_controls_and_maps_terminal_output(
     assert turn_params["sandboxPolicy"] == {"type": "readOnly", "networkAccess": False}
     assert turn_params["outputSchema"] == request.output_schema
     assert turn_params["effort"] == "max"
+    assert turn_params["cwd"] == str(TURN_CWD)
     assert "multiAgentMode" not in repr(transport.requests)
 
 
@@ -398,6 +408,7 @@ async def test_concurrent_streams_ignore_other_turn_lifecycle_events() -> None:
             effort="high",
             prompt=f"Return stream {label}.",
             output_schema={"type": "object", "additionalProperties": False},
+            cwd=TURN_CWD,
         )
         return [event async for event in runtime.stream(request)]
 
@@ -423,7 +434,7 @@ async def test_concurrent_streams_ignore_other_turn_lifecycle_events() -> None:
     )
 
 
-async def test_explicit_network_policy_builds_allowlist_first_config() -> None:
+async def test_citation_search_does_not_enable_command_network_or_local_tools() -> None:
     transport = FakeTransport(
         {
             "thread/start": [{"thread": {"id": "thread-1"}}],
@@ -459,17 +470,13 @@ async def test_explicit_network_policy_builds_allowlist_first_config() -> None:
         prompt="Fetch the citation metadata.",
         output_schema={"type": "object", "additionalProperties": False},
         role=WorkRole.CITATION,
-        command_network=RestrictedNetworkPolicy(domains=("api.crossref.org",)),
+        web_search=WebSearchMode.LIVE,
+        cwd=TURN_CWD,
     )
 
     _ = [event async for event in runtime.stream(request)]
 
     thread_config = transport.requests[0][1]["config"]
-    assert thread_config["features"]["network_proxy"] == {
-        "enabled": True,
-        "mode": "limited",
-        "domains": {"api.crossref.org": "allow"},
-        "allow_local_binding": False,
-        "allow_upstream_proxy": False,
-    }
-    assert transport.requests[1][1]["sandboxPolicy"]["networkAccess"] is True
+    assert thread_config == server_config(WebSearchMode.LIVE)
+    assert thread_config["features"]["network_proxy"] is False
+    assert transport.requests[1][1]["sandboxPolicy"]["networkAccess"] is False

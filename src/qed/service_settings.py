@@ -78,5 +78,9 @@ class ServiceSettings(BaseSettings):
         return self.data_root / self.database_name
 
     @property
+    def codex_home(self) -> Path:
+        return self.data_root / "codex-home"
+
+    @property
     def auth_required(self) -> bool:
         return self.auth_token is not None

@@ -113,8 +113,10 @@ Structural and detailed verifiers start on fresh threads, receive frozen input,
 use a read-only sandbox, and run offline. Citation verification also starts on a
 fresh read-only thread; it may use live web search under the restricted role
 policy. Literature work may use the same search policy. The current workflow
-grants no command network. Runtime validation limits any command-network policy
-to literature or citation roles and explicit host patterns.
+has no command-network control. Every attempt receives a distinct server-owned
+empty Git working directory, including retries. Request construction and local
+preflight happen inside the attempt loop, and all runtime adapters disable
+local shell, file-editing, browser, code-mode, plugin, and hook capabilities.
 
 The store binds each verifier report to a fresh external Codex thread identity.
 It rejects writer reuse, verifier reuse within a required report set, candidate

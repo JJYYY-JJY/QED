@@ -71,11 +71,9 @@ breakdowns are not added again to the budget total.
 | `search.max_queries_per_stage` | integer at least 1, default 20 | Caps completed web-search items for each stage. |
 
 Literature and citation turns may use live web search and remain read-only. The
-current workflow grants no command network. Runtime validation restricts any
-future command-network policy to those two roles, rejects wildcard host
-patterns, and keeps the sandbox read-only. Structural and detailed verification
-stays offline. Planning, proof generation, and adjudication receive no search
-or command network access.
+runtime request model has no command-network control. Structural and detailed
+verification stays offline. Planning, proof generation, and adjudication
+receive no search or command network access.
 
 ### Sandbox and approval
 
@@ -83,13 +81,18 @@ or command network access.
 | --- | --- | --- |
 | `sandbox.literature` | `read-only` | `read-only` |
 | `sandbox.planner` | `read-only` | `read-only` |
-| `sandbox.prover` | `read-only` or `workspace-write` | `read-only` |
+| `sandbox.prover` | `read-only` | `read-only` |
 | `sandbox.verifier` | `read-only` | `read-only` |
 | `sandbox.adjudicator` | `read-only` | `read-only` |
 | `sandbox.approval` | `never` | `never` |
 
-The API cannot select full access, an approval escape path, executable paths,
-or raw Codex configuration overrides.
+The API cannot select workspace write, full access, an approval escape path,
+executable paths, or raw Codex configuration overrides. Each attempt starts in
+a different server-owned empty Git working directory. SDK, App Server, and
+`codex exec` all receive the same server-owned configuration that disables
+local shell, file-editing, browser, code-mode, plugin, and hook capabilities.
+Codex-native subagents remain available when the probed runtime supports them;
+they inherit the same working directory, sandbox, and tool restrictions.
 
 ## Service settings
 
@@ -104,11 +107,40 @@ and can contain a bearer secret.
 | Listen port | `--port` | `8000` | 1 to 65535. |
 | Bearer token | `QED_AUTH_TOKEN` or `--auth-token` | unset | At least 32 characters. A non-loopback bind requires it. |
 | CORS origins | `QED_ALLOWED_ORIGINS` | local Vite origins | JSON array of full `http` or `https` origins. Wildcards, credentials, paths, queries, and fragments fail validation. |
+| Codex state root | derived from data root | `<data-root>/codex-home` | Persistent server-owned directory created with mode `0700`; all runtime adapters share it. |
 
 Prefer `QED_AUTH_TOKEN` over `--auth-token` so process listings do not expose the
 secret. QED redacts known secret fields and bearer values from structured logs.
 Do not put credentials in run input, run configuration, guidance, or
 verification rules.
+
+### Dedicated Codex authentication
+
+QED resolves the Codex executable from the uv-pinned
+`openai-codex-cli-bin` package by default. An explicitly supplied executable
+still overrides that default. App Server, the Python SDK, and `codex exec` all
+receive the same `<data-root>/codex-home` through `CODEX_HOME`; exec additionally
+uses `--ignore-user-config`. This prevents arbitrary personal
+`~/.codex/config.toml` values from changing or breaking a managed run. All
+three adapters suppress inherited `CODEX_ACCESS_TOKEN`, `CODEX_API_KEY`, and
+`OPENAI_API_KEY` values so they cannot replace the dedicated authentication
+context.
+
+The dedicated root does not inherit, copy, or link `~/.codex/auth.json`.
+Authenticate the pinned binary separately for each data root:
+
+```bash
+mkdir -p .qed/codex-home
+chmod 700 .qed/codex-home
+QED_CODEX="$(uv run python -c \
+  'from codex_cli_bin import bundled_codex_path; print(bundled_codex_path())')"
+CODEX_HOME="$PWD/.qed/codex-home" "$QED_CODEX" login
+```
+
+`codex-home` can contain credentials, local thread state, and other sensitive
+Codex data. Keep the data root access-restricted and out of version control.
+Encrypt full backups and restrict access to them. QED does not log credentials
+or include the Codex state root in exported proof bundles.
 
 The React console does not accept, store, or send this bearer token. Use it for
 non-browser API clients or for the server-side hop from a

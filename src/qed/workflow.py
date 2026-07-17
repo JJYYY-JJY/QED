@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import secrets
+import shutil
+import subprocess
+import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
@@ -43,7 +47,6 @@ from qed.runtime import (
     RuntimeCapabilities,
     RuntimeErrorEvent,
     RuntimePreference,
-    SandboxMode,
     ThreadStarted,
     TokenUsageUpdated,
     TurnCompleted,
@@ -136,6 +139,15 @@ class _PreparedTurnInput:
     output_schema: dict[str, Any]
 
 
+@dataclass(slots=True)
+class _TurnWorkspace:
+    directory: tempfile.TemporaryDirectory[str]
+    cwd: Path
+
+    def close(self) -> None:
+        self.directory.cleanup()
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -200,6 +212,9 @@ class ResearchWorkflow:
         self._runtime_version = runtime_version
         self._export_root = (
             Path(export_root) if export_root is not None else store.path.parent / "exports"
+        )
+        self._workspace_root = (
+            store.path.resolve(strict=False).parent / "runtime-workspaces"
         )
         self._clock = clock
         self._active_turns: dict[str, set[TurnRef]] = defaultdict(set)
@@ -1170,16 +1185,6 @@ class ResearchWorkflow:
             schema=schema,
             payload=payload,
         )
-        request = self._build_turn_request(
-            run_id,
-            thread_role=thread_role,
-            work_role=work_role,
-            prepared=prepared,
-            capabilities=capabilities,
-        )
-        preflight = getattr(self._runtime, "preflight", None)
-        if preflight is not None:
-            preflight(request)
         attempts_started = sum(
             1
             for event in self._store.list_events(run_id)
@@ -1197,29 +1202,49 @@ class ResearchWorkflow:
                 raise WorkflowExecutionError(
                     f"{schema.__name__} exceeded the stage timeout"
                 )
-            self._store.append_event(
-                run_id,
-                event_type="runtime.turn_attempt_started",
-                stage=self._store.get_run(run_id).stage,
-                payload={
-                    "turn_input_id": prepared.id,
-                    "output_schema": schema.__name__,
-                    "attempt": attempt + 1,
-                },
-                execution=self._execution(run_id),
-            )
-            turn_task = asyncio.create_task(
-                self._turn_once(
+            workspace = self._new_turn_workspace()
+            try:
+                request = self._build_turn_request(
                     run_id,
-                    attempt=attempt + 1,
-                    prompt_role=prompt_role,
-                    thread_role=thread_role,
-                    schema=schema,
+                    work_role=work_role,
                     prepared=prepared,
-                    request=request,
-                ),
-                name=f"qed-turn-{run_id}-{prepared.id}-{attempt + 1}",
-            )
+                    capabilities=capabilities,
+                    cwd=workspace.cwd,
+                )
+                preflight = getattr(self._runtime, "preflight", None)
+                if preflight is not None:
+                    preflight(request)
+            except BaseException:
+                workspace.close()
+                raise
+            try:
+                self._store.append_event(
+                    run_id,
+                    event_type="runtime.turn_attempt_started",
+                    stage=self._store.get_run(run_id).stage,
+                    payload={
+                        "turn_input_id": prepared.id,
+                        "output_schema": schema.__name__,
+                        "attempt": attempt + 1,
+                    },
+                    execution=self._execution(run_id),
+                )
+                turn_task = asyncio.create_task(
+                    self._turn_once_in_workspace(
+                        run_id,
+                        workspace=workspace,
+                        attempt=attempt + 1,
+                        prompt_role=prompt_role,
+                        thread_role=thread_role,
+                        schema=schema,
+                        prepared=prepared,
+                        request=request,
+                    ),
+                    name=f"qed-turn-{run_id}-{prepared.id}-{attempt + 1}",
+                )
+            except BaseException:
+                workspace.close()
+                raise
             try:
                 async with asyncio.timeout(remaining):
                     return await asyncio.shield(turn_task)
@@ -1293,19 +1318,12 @@ class ResearchWorkflow:
         self,
         run_id: str,
         *,
-        thread_role: ThreadRole,
         work_role: WorkRole,
         prepared: _PreparedTurnInput,
         capabilities: RuntimeCapabilities,
+        cwd: Path,
     ) -> RunRequest:
         run = self._store.get_run(run_id)
-        sandbox_value = {
-            ThreadRole.LITERATURE: run.config.sandbox.literature,
-            ThreadRole.PLANNER: run.config.sandbox.planner,
-            ThreadRole.PROVER: run.config.sandbox.prover,
-            ThreadRole.VERIFIER: run.config.sandbox.verifier,
-            ThreadRole.ADJUDICATOR: run.config.sandbox.adjudicator,
-        }[thread_role]
         can_search = (
             run.config.search.enabled
             and work_role.value in run.config.search.allowed_roles
@@ -1318,10 +1336,90 @@ class ResearchWorkflow:
             output_schema=prepared.output_schema,
             thread=FreshThread(),
             role=work_role,
-            sandbox=SandboxMode(sandbox_value),
             web_search=WebSearchMode.LIVE if can_search else WebSearchMode.DISABLED,
             runtime=_runtime_preference(run.config.backend),
+            cwd=cwd,
         )
+
+    def _new_turn_workspace(self) -> _TurnWorkspace:
+        root = self._workspace_root
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if root.is_symlink() or not root.is_dir():
+            raise WorkflowExecutionError("runtime workspace root is not a directory")
+        os.chmod(root, 0o700)
+        executable = shutil.which("git")
+        if executable is None:
+            raise WorkflowExecutionError("git is required for isolated runtime workspaces")
+        git = Path(executable).resolve(strict=True)
+        template = tempfile.TemporaryDirectory(prefix=".git-template-", dir=root)
+        directory: tempfile.TemporaryDirectory[str] | None = None
+        try:
+            directory = tempfile.TemporaryDirectory(prefix=".turn-", dir=root)
+            cwd = Path(directory.name).resolve(strict=True)
+            subprocess.run(  # noqa: S603 - resolved executable and fixed argv
+                (
+                    str(git),
+                    "init",
+                    "--quiet",
+                    f"--template={template.name}",
+                    "--initial-branch=qed",
+                    str(cwd),
+                ),
+                check=True,
+                capture_output=True,
+                env={
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "LC_ALL": "C",
+                },
+            )
+            if {entry.name for entry in cwd.iterdir()} != {".git"}:
+                raise WorkflowExecutionError(
+                    "isolated runtime workspace was not initialized empty"
+                )
+            git_directory = cwd / ".git"
+            if git_directory.is_symlink() or not git_directory.is_dir():
+                raise WorkflowExecutionError(
+                    "isolated runtime workspace has an invalid Git directory"
+                )
+            return _TurnWorkspace(directory=directory, cwd=cwd)
+        except (OSError, subprocess.SubprocessError) as error:
+            if directory is not None:
+                directory.cleanup()
+            raise WorkflowExecutionError(
+                "could not initialize an isolated runtime workspace"
+            ) from error
+        except BaseException:
+            if directory is not None:
+                directory.cleanup()
+            raise
+        finally:
+            template.cleanup()
+
+    async def _turn_once_in_workspace(
+        self,
+        run_id: str,
+        *,
+        workspace: _TurnWorkspace,
+        attempt: int,
+        prompt_role: TurnRole,
+        thread_role: ThreadRole,
+        schema: type[DraftT],
+        prepared: _PreparedTurnInput,
+        request: RunRequest,
+    ) -> _TurnResult:
+        try:
+            return await self._turn_once(
+                run_id,
+                attempt=attempt,
+                prompt_role=prompt_role,
+                thread_role=thread_role,
+                schema=schema,
+                prepared=prepared,
+                request=request,
+            )
+        finally:
+            workspace.close()
 
     async def _turn_once(
         self,

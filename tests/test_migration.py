@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,46 @@ def test_legacy_import_rejects_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(LegacyImportError, match="symbolic link"):
         inspect_legacy_run(source)
+
+
+def test_legacy_import_rejects_a_parent_swapped_to_a_symlink_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "old-run"
+    source_parent = source / "nested"
+    source_parent.mkdir(parents=True)
+    (source_parent / "proof.md").write_text("original proof", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "proof.md").write_text("outside secret", encoding="utf-8")
+    displaced = tmp_path / "displaced"
+    real_open = os.open
+    swapped = False
+
+    def racing_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and Path(os.fsdecode(path)).name == "proof.md":
+            source_parent.rename(displaced)
+            source_parent.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+
+    with pytest.raises(LegacyImportError, match="symbolic link|changed during import"):
+        import_legacy_run(source, tmp_path / "managed")
+
+    assert swapped is True
+    assert not list((tmp_path / "managed" / "legacy-imports").glob("legacy-*"))
 
 
 def test_legacy_import_rejects_managed_root_inside_source(tmp_path: Path) -> None:

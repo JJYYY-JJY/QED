@@ -30,7 +30,7 @@ from qed.store import (
 )
 from qed.workflow import ResearchWorkflow
 
-RuntimeFactory = Callable[[], CodexRuntime]
+RuntimeFactory = Callable[[Path], CodexRuntime]
 _LOGGER = get_logger(__name__)
 _COMMAND_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -135,7 +135,7 @@ def build_service(
         runtime: CodexRuntime = _default_mock_runtime()
         selected_version = runtime_version or "mock-runtime/1"
     else:
-        runtime = runtime_factory()
+        runtime = runtime_factory(settings.codex_home)
         observed_version = getattr(runtime, "runtime_version", None)
         if runtime_version is None and (
             not isinstance(observed_version, str) or not observed_version.strip()
@@ -300,6 +300,7 @@ class ApplicationService:
 
         if _COMMAND_KEY.fullmatch(idempotency_key) is None:
             raise ValueError("idempotency_key has an invalid format")
+        self._store.get_run(run_id)
         key = (run_id, "cancel", idempotency_key)
         async with self._run_lock(run_id):
             existing = self._receipts.get(key)
@@ -369,6 +370,7 @@ class ApplicationService:
     ) -> CommandReceipt:
         if _COMMAND_KEY.fullmatch(idempotency_key) is None:
             raise ValueError("idempotency_key has an invalid format")
+        self._store.get_run(run_id)
         key = (run_id, command, idempotency_key)
         async with self._run_lock(run_id):
             existing = self._receipts.get(key)

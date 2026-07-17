@@ -11,6 +11,11 @@ For a local research workstation:
 ```bash
 uv sync --all-groups --frozen
 uv run qed init --data-root .qed
+mkdir -p .qed/codex-home
+chmod 700 .qed/codex-home
+QED_CODEX="$(uv run python -c \
+  'from codex_cli_bin import bundled_codex_path; print(bundled_codex_path())')"
+CODEX_HOME="$PWD/.qed/codex-home" "$QED_CODEX" login
 uv run qed --log-level info --log-format json serve \
   --data-root .qed \
   --host 127.0.0.1 \
@@ -18,9 +23,13 @@ uv run qed --log-level info --log-format json serve \
   --runtime codex
 ```
 
-The live runtime uses the active Codex authentication context. Confirm that
-Codex can authenticate before you start a research run. QED requires the exact
-configured model in that account's model catalog.
+The live runtime uses the uv-pinned Codex binary and the dedicated
+`<data-root>/codex-home` authentication context. It does not read or copy the
+personal `~/.codex/config.toml` or `auth.json`. Authenticate this dedicated
+context once per data root and confirm that the configured model appears in
+that account's model catalog before starting research. The service removes
+inherited `CODEX_ACCESS_TOKEN`, `CODEX_API_KEY`, and `OPENAI_API_KEY` values
+from managed Codex launches.
 
 `GET /api/v1/capabilities` provides a process-readiness check:
 
@@ -175,11 +184,18 @@ runtime or policy problem before retrying a failed run.
 ## Backups
 
 Stop the service before a filesystem backup. Copy the complete data root so the
-backup contains the SQLite database, WAL files, exports, and legacy imports:
+backup contains the SQLite database, WAL files, exports, legacy imports, and the
+dedicated Codex state needed to resume recorded threads:
 
 ```bash
 cp -a /srv/qed /srv/backups/qed-2026-07-16
 ```
+
+`codex-home` can contain authentication credentials and local session state.
+Restrict the data root and backup to the service account, encrypt backup media,
+and never publish or commit either path. Restoring the complete root also
+restores that credential material; use the Codex login flow to rotate or revoke
+it when a backup may have been exposed.
 
 Restore into a new empty path, start QED against that path, and inspect runs with
 `qed status` or the API before opening it to users. The current release opens

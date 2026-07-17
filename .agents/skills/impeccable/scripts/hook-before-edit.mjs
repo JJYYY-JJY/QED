@@ -36,6 +36,9 @@ import {
   truthy,
   writeAuditLog,
 } from './hook-lib.mjs';
+import { readContainedFile } from './lib/safe-fs.mjs';
+
+const MAX_HOOK_FILE_BYTES = 1024 * 1024;
 
 async function readStdin() {
   if (process.stdin.isTTY) return '';
@@ -164,9 +167,12 @@ function readExistingProjectFile(filePath, cwd) {
   if (!isInsideProject(filePath, cwd)) return null;
   if (SENSITIVE_PATH.test(filePath) || GENERATED_PATH.test(filePath)) return null;
   try {
-    const stat = fs.statSync(filePath);
-    if (!stat.isFile() || stat.size > 1024 * 1024) return null;
-    return fs.readFileSync(filePath, 'utf-8');
+    return readContainedFile(
+      cwd,
+      filePath,
+      'utf-8',
+      { maxBytes: MAX_HOOK_FILE_BYTES },
+    );
   } catch {
     return null;
   }
@@ -235,9 +241,12 @@ function shellCopiedFileContent(command, cwd) {
   if (!isInsideProject(sourcePath, cwd)) return '';
   if (SENSITIVE_PATH.test(sourcePath) || GENERATED_PATH.test(sourcePath)) return '';
   try {
-    const stat = fs.statSync(sourcePath);
-    if (!stat.isFile() || stat.size > 1024 * 1024) return '';
-    return fs.readFileSync(sourcePath, 'utf-8');
+    return readContainedFile(
+      cwd,
+      sourcePath,
+      'utf-8',
+      { maxBytes: MAX_HOOK_FILE_BYTES },
+    );
   } catch {
     return '';
   }
@@ -345,7 +354,10 @@ async function detectProposedHtml(detector, content, filePath, scanOptions) {
   const tmpFile = path.join(dir, path.basename(filePath));
   try {
     fs.writeFileSync(tmpFile, content);
-    const findings = await detector.detectHtml(tmpFile, scanOptions);
+    const findings = await detector.detectHtml(
+      tmpFile,
+      { ...scanOptions, projectRoot: dir },
+    );
     // Findings carry the temp path; remap so file-scoped ignores still match.
     return (findings || []).map((f) => (f && typeof f === 'object' ? { ...f, file: filePath } : f));
   } finally {

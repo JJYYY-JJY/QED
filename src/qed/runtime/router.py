@@ -7,6 +7,7 @@ from typing import Protocol, cast
 
 from .app_server import AppServerRuntime
 from .exec import ExecRuntime
+from .isolation import prepare_codex_home
 from .models import (
     CapabilityRequest,
     RunRequest,
@@ -130,12 +131,26 @@ class RoutedCodexRuntime:
         )
 
 
-def create_codex_runtime(executable: str | Path | None = None) -> RoutedCodexRuntime:
+def create_codex_runtime(
+    codex_home: Path,
+    executable: str | Path | None = None,
+) -> RoutedCodexRuntime:
+    server_codex_home = prepare_codex_home(codex_home)
     resolved = resolve_codex_executable(executable)
     runtime_version = probe_codex_version(resolved)
-    app_server = AppServerRuntime(StdioAppServerTransport(resolved))
-    sdk = SdkRuntime(capability_runtime=app_server, executable=resolved)
-    exec_runtime = ExecRuntime(resolved, capability_runtime=app_server)
+    app_server = AppServerRuntime(
+        StdioAppServerTransport(resolved, codex_home=server_codex_home)
+    )
+    sdk = SdkRuntime(
+        capability_runtime=app_server,
+        executable=resolved,
+        codex_home=server_codex_home,
+    )
+    exec_runtime = ExecRuntime(
+        resolved,
+        capability_runtime=app_server,
+        codex_home=server_codex_home,
+    )
     return RoutedCodexRuntime(
         app_server,
         sdk,

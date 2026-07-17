@@ -63,7 +63,7 @@ class SearchPolicy(ConfigModel):
 class SandboxPolicy(ConfigModel):
     literature: Literal["read-only"] = "read-only"
     planner: Literal["read-only"] = "read-only"
-    prover: Literal["read-only", "workspace-write"] = "read-only"
+    prover: Literal["read-only"] = "read-only"
     verifier: Literal["read-only"] = "read-only"
     adjudicator: Literal["read-only"] = "read-only"
     approval: Literal["never"] = "never"

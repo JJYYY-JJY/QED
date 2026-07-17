@@ -437,7 +437,7 @@ function manualEditLocatorMatchesSelection(op, originalLines) {
   ));
 }
 
-function applyBufferedManualEditToLines(originalLines, selectionStartLine, op) {
+function applyBufferedManualEditToLines(originalLines, _selectionStartLine, op) {
   if (
     !op
     || typeof op.originalText !== 'string'
@@ -447,39 +447,177 @@ function applyBufferedManualEditToLines(originalLines, selectionStartLine, op) {
     return { lines: originalLines, changed: false };
   }
 
-  const replaceLine = (lineIndex) => ({
-    lines: originalLines.map((line, index) => (
-      index === lineIndex ? replaceOnce(line, op.originalText, op.newText) : line
-    )),
-    changed: true,
-  });
-
-  const hintedLine = Number(op.sourceHint?.line);
-  if (Number.isFinite(hintedLine)) {
-    const hintedIndex = hintedLine - 1 - selectionStartLine;
-    if (hintedIndex >= 0 && hintedIndex < originalLines.length && originalLines[hintedIndex].includes(op.originalText)) {
-      return replaceLine(hintedIndex);
+  const originalBlock = originalLines.join('\n');
+  const matches = [];
+  for (const range of visibleTextRanges(originalBlock)) {
+    let offset = range.start;
+    while (offset < range.end) {
+      const index = originalBlock.indexOf(op.originalText, offset);
+      if (index === -1 || index + op.originalText.length > range.end) break;
+      matches.push(index);
+      offset = index + op.originalText.length;
     }
   }
+  if (matches.length !== 1) return { lines: originalLines, changed: false };
 
-  const locatorMatches = [];
-  for (let index = 0; index < originalLines.length; index += 1) {
-    const line = originalLines[index];
-    if (!line.includes(op.originalText)) continue;
-    if (!lineMatchesManualEditLocator(line, op)) continue;
-    locatorMatches.push(index);
+  const index = matches[0];
+  const escapedNewText = escapeVisibleSourceText(op.newText);
+  return {
+    lines: (
+      originalBlock.slice(0, index)
+      + escapedNewText
+      + originalBlock.slice(index + op.originalText.length)
+    ).split('\n'),
+    changed: true,
+  };
+}
+
+function escapeVisibleSourceText(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\{/g, '&#123;')
+    .replace(/\}/g, '&#125;');
+}
+
+const NON_RENDERED_TEXT_TAGS = new Set(['script', 'style', 'template', 'noscript']);
+const VOID_HTML_TAGS = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link',
+  'meta', 'param', 'source', 'track', 'wbr',
+]);
+
+function visibleTextRanges(source) {
+  const ranges = [];
+  let cursor = 0;
+  let textStart = 0;
+  let elementDepth = 0;
+  let blockedTag = null;
+
+  while (cursor < source.length) {
+    if (blockedTag) {
+      const closeStart = source.toLowerCase().indexOf(`</${blockedTag}`, cursor);
+      if (closeStart === -1) return ranges;
+      cursor = closeStart;
+      textStart = closeStart;
+    }
+    if (source[cursor] !== '<') {
+      cursor += 1;
+      continue;
+    }
+
+    if (!blockedTag && elementDepth > 0 && textStart < cursor) {
+      appendVisibleLiteralRanges(source, textStart, cursor, ranges);
+    }
+    const tagEnd = findSourceTagEnd(source, cursor);
+    if (tagEnd === -1) return [];
+    const tagSource = source.slice(cursor, tagEnd + 1);
+    const tag = parseSourceTag(tagSource);
+    if (tag) {
+      if (tag.closing) {
+        elementDepth = Math.max(0, elementDepth - 1);
+        if (blockedTag === tag.name) blockedTag = null;
+      } else if (!tag.selfClosing && !VOID_HTML_TAGS.has(tag.name)) {
+        elementDepth += 1;
+        if (NON_RENDERED_TEXT_TAGS.has(tag.name)) blockedTag = tag.name;
+      }
+    }
+    cursor = tagEnd + 1;
+    textStart = cursor;
   }
-  if (locatorMatches.length === 1) return replaceLine(locatorMatches[0]);
 
-  const originalBlock = originalLines.join('\n');
-  if (countOccurrences(originalBlock, op.originalText) === 1) {
-    return {
-      lines: replaceOnce(originalBlock, op.originalText, op.newText).split('\n'),
-      changed: true,
-    };
+  if (!blockedTag && elementDepth > 0 && textStart < source.length) {
+    appendVisibleLiteralRanges(source, textStart, source.length, ranges);
   }
+  return ranges;
+}
 
-  return { lines: originalLines, changed: false };
+function findSourceTagEnd(source, start) {
+  if (source.startsWith('<!--', start)) {
+    const commentEnd = source.indexOf('-->', start + 4);
+    return commentEnd === -1 ? -1 : commentEnd + 2;
+  }
+  let quote = null;
+  let braceDepth = 0;
+  for (let index = start + 1; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (char === '\\') {
+        index += 1;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '{') {
+      braceDepth += 1;
+      continue;
+    }
+    if (char === '}' && braceDepth > 0) {
+      braceDepth -= 1;
+      continue;
+    }
+    if (char === '>' && braceDepth === 0) return index;
+  }
+  return -1;
+}
+
+function parseSourceTag(tagSource) {
+  if (/^<!--/.test(tagSource) || /^<![^-]/.test(tagSource) || /^<\?/.test(tagSource)) return null;
+  const match = /^<\s*(\/?)\s*([A-Za-z][A-Za-z0-9:.-]*)/.exec(tagSource);
+  if (!match) return null;
+  return {
+    closing: match[1] === '/',
+    name: match[2].toLowerCase(),
+    selfClosing: /\/\s*>$/.test(tagSource),
+  };
+}
+
+function appendVisibleLiteralRanges(source, start, end, ranges) {
+  let literalStart = start;
+  let cursor = start;
+  while (cursor < end) {
+    if (source[cursor] !== '{') {
+      cursor += 1;
+      continue;
+    }
+    if (literalStart < cursor) ranges.push({ start: literalStart, end: cursor });
+    const expressionEnd = findBalancedSourceExpressionEnd(source, cursor, end);
+    if (expressionEnd === -1) return;
+    cursor = expressionEnd + 1;
+    literalStart = cursor;
+  }
+  if (literalStart < end) ranges.push({ start: literalStart, end });
+}
+
+function findBalancedSourceExpressionEnd(source, start, end) {
+  let depth = 0;
+  let quote = null;
+  for (let index = start; index < end; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (char === '\\') {
+        index += 1;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '{') depth += 1;
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
 }
 
 function lineMatchesManualEditLocator(line, op) {
@@ -500,24 +638,6 @@ function lineMatchesManualEditLocator(line, op) {
   }
 
   return true;
-}
-
-function replaceOnce(value, needle, replacement) {
-  const index = value.indexOf(needle);
-  if (index === -1) return value;
-  return value.slice(0, index) + replacement + value.slice(index + needle.length);
-}
-
-function countOccurrences(value, needle) {
-  if (!needle) return 0;
-  let count = 0;
-  let index = 0;
-  while (true) {
-    index = value.indexOf(needle, index);
-    if (index === -1) return count;
-    count += 1;
-    index += needle.length;
-  }
 }
 
 function escapeRegExp(value) {
@@ -904,4 +1024,5 @@ export {
   detectStyleMode,
   buildCssAuthoring,
   buildCssSelectorPrefixExamples,
+  applyBufferedManualEditToLines,
 };

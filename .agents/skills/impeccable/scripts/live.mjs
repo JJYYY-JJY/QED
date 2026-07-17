@@ -18,12 +18,12 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadContext, resolveTargetSelection } from './context.mjs';
 import { resolveFiles } from './live-inject.mjs';
 import { readLiveServerInfo } from './lib/impeccable-paths.mjs';
+import { walkContainedFiles } from './lib/safe-fs.mjs';
 import { resolveLiveTarget } from './live-target.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -113,7 +113,7 @@ The agent should then:
   // 3. Inject the script tag at the current port
   const injectOut = runScript(
     'live-inject.mjs',
-    ['--port', String(serverInfo.port), '--token', serverInfo.token],
+    ['--port', String(serverInfo.port)],
     { cwd: activeCwd },
   );
   const injectResult = safeParse(injectOut);
@@ -170,7 +170,7 @@ function missingLiveContext(ctx) {
  * Skipped if config.files already contains at least one glob pattern
  * covering everything in practice (signaled by the orphan count being 0).
  */
-function scanForDrift(rootDir, resolvedFiles, config) {
+export function scanForDrift(rootDir, resolvedFiles, config) {
   const SCAN_ROOTS = ['public', 'src', 'app', 'pages'];
   const IGNORE_DIRS = new Set([
     'node_modules', '.git', '.next', '.nuxt', '.svelte-kit', '.astro',
@@ -186,28 +186,33 @@ function scanForDrift(rootDir, resolvedFiles, config) {
   const isUserExcluded = (rel) => userExcludeRegexes.some((re) => re.test(rel));
 
   const orphans = [];
-
-  const walk = (dir, relBase) => {
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-    catch { return; }
-    for (const e of entries) {
-      const rel = relBase ? `${relBase}/${e.name}` : e.name;
-      if (e.isDirectory()) {
-        if (IGNORE_DIRS.has(e.name) || e.name.startsWith('.')) continue;
-        walk(path.join(dir, e.name), rel);
-      } else if (e.isFile() && e.name.endsWith('.html')) {
-        if (resolvedSet.has(rel)) continue;
-        if (isUserExcluded(rel)) continue;
-        orphans.push(rel);
-      }
-    }
-  };
+  const seen = new Set();
+  const MAX_DRIFT_ITEMS = 5_000;
+  const MAX_DRIFT_DEPTH = 8;
+  const MAX_DRIFT_BYTES_PER_ROOT = 128 * 1024 * 1024;
 
   for (const root of SCAN_ROOTS) {
+    if (orphans.length >= MAX_DRIFT_ITEMS) break;
     const abs = path.join(rootDir, root);
-    if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) {
-      walk(abs, root);
+    let files;
+    try {
+      files = walkContainedFiles(rootDir, abs, {
+        maxDepth: MAX_DRIFT_DEPTH,
+        maxItems: MAX_DRIFT_ITEMS,
+        maxBytes: MAX_DRIFT_BYTES_PER_ROOT,
+        skipDirectories: IGNORE_DIRS,
+      });
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (orphans.length >= MAX_DRIFT_ITEMS) break;
+      if (!file.endsWith('.html')) continue;
+      const rel = path.relative(rootDir, file).split(path.sep).join('/');
+      if (seen.has(rel)) continue;
+      seen.add(rel);
+      if (resolvedSet.has(rel) || isUserExcluded(rel)) continue;
+      orphans.push(rel);
     }
   }
 

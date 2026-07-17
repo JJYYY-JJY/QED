@@ -17,8 +17,12 @@ from qed.runtime import (
     TurnCompleted,
     TurnRef,
     TurnStarted,
+    WebSearchMode,
     build_exec_argv,
 )
+from qed.runtime.isolation import server_config_overrides
+
+_CODEX_HOME = Path("/var/lib/qed/codex-home")
 
 
 def _request(**overrides: object) -> RunRequest:
@@ -51,6 +55,8 @@ def test_exec_argv_is_strict_read_only_structured_and_has_no_escape_flags() -> N
         "/var/lib/qed/output-schema.json",
     ):
         assert required in argv
+    for override in server_config_overrides(WebSearchMode.DISABLED):
+        assert override in argv
     rendered = " ".join(argv)
     assert "danger" not in rendered
     assert "bypass" not in rendered
@@ -70,7 +76,9 @@ def test_exec_prompt_cannot_be_reinterpreted_as_a_cli_option() -> None:
 
 
 def test_exec_fallback_rejects_controls_it_cannot_safely_represent() -> None:
-    runtime = ExecRuntime(Path("/opt/codex/bin/codex"))
+    runtime = ExecRuntime(
+        Path("/opt/codex/bin/codex"), codex_home=_CODEX_HOME
+    )
 
     assert runtime.supports(_request()) is True
     assert runtime.supports(_request(thread=ForkThread(thread_id="source"))) is False
@@ -165,11 +173,13 @@ async def test_exec_fallback_maps_jsonl_and_usage() -> None:
             },
         ]
     )
-    launches: list[tuple[tuple[str, ...], Path]] = []
+    launches: list[tuple[tuple[str, ...], Path, Path]] = []
     captured_schema: list[dict[str, object]] = []
 
-    async def spawn(argv: tuple[str, ...], cwd: Path) -> FakeProcess:
-        launches.append((argv, cwd))
+    async def spawn(
+        argv: tuple[str, ...], cwd: Path, codex_home: Path
+    ) -> FakeProcess:
+        launches.append((argv, cwd, codex_home))
         schema_path = Path(argv[argv.index("--output-schema") + 1])
         value = json.loads(await asyncio.to_thread(schema_path.read_text))
         assert isinstance(value, dict)
@@ -178,6 +188,7 @@ async def test_exec_fallback_maps_jsonl_and_usage() -> None:
 
     runtime = ExecRuntime(
         Path("/opt/codex/bin/codex"),
+        codex_home=_CODEX_HOME,
         process_factory=spawn,
         turn_id_factory=lambda: "local-turn-1",
     )
@@ -194,14 +205,21 @@ async def test_exec_fallback_maps_jsonl_and_usage() -> None:
         turn=turn, status="completed", output='{"verdict":"PASS"}'
     )
     assert launches[0][1] == Path("/workspace")
+    assert launches[0][2] == _CODEX_HOME
     assert captured_schema == [_request().output_schema]
 
 
 async def test_exec_fallback_fails_if_cli_exits_without_terminal_event() -> None:
-    async def spawn(argv: tuple[str, ...], cwd: Path) -> FakeProcess:
+    async def spawn(
+        _argv: tuple[str, ...], _cwd: Path, _codex_home: Path
+    ) -> FakeProcess:
         return FakeProcess([{"type": "thread.started", "thread_id": "thread-1"}])
 
-    runtime = ExecRuntime(Path("/opt/codex/bin/codex"), process_factory=spawn)
+    runtime = ExecRuntime(
+        Path("/opt/codex/bin/codex"),
+        codex_home=_CODEX_HOME,
+        process_factory=spawn,
+    )
 
     with pytest.raises(RuntimeProtocolError, match="terminal"):
         _ = [event async for event in runtime.stream(_request())]
@@ -210,11 +228,14 @@ async def test_exec_fallback_fails_if_cli_exits_without_terminal_event() -> None
 async def test_exec_interrupt_escalates_and_completes_stream_as_interrupted() -> None:
     process = StubbornProcess()
 
-    async def spawn(argv: tuple[str, ...], cwd: Path) -> StubbornProcess:
+    async def spawn(
+        _argv: tuple[str, ...], _cwd: Path, _codex_home: Path
+    ) -> StubbornProcess:
         return process
 
     runtime = ExecRuntime(
         Path("/opt/codex/bin/codex"),
+        codex_home=_CODEX_HOME,
         process_factory=spawn,
         turn_id_factory=lambda: "local-turn-1",
         terminate_timeout_seconds=0.01,
