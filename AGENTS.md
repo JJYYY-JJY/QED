@@ -20,9 +20,10 @@ artifacts. Do not add Claude, Gemini, or generic provider dispatch.
   store-assigned monotonic sequence numbers.
 - Sealed proof candidates and verifier reports are immutable. A resumed run adds
   new attempts; it never edits frozen inputs or earlier reports.
-- Verifiers start on fresh threads with frozen inputs, a read-only sandbox, no
-  command network, and no approval escape path.
-- Literature work is the only role allowed search or restricted network access.
+- Structural and detailed verifiers start on fresh threads with frozen inputs,
+  a read-only sandbox, no command network, and no approval escape path.
+- Literature and citation work are the only roles allowed search or restricted
+  network access. Structural and detailed verification stays offline.
 - Application code computes PASS from structured reports. Agents and skills do
   not write verdicts or mutate run state.
 - Never add full-access sandboxes, raw Codex config overrides, unsafe approval or
@@ -53,11 +54,12 @@ npm ci
 npm run lint
 npm run typecheck
 npm run test
+npm run test:impeccable
 npm run build
+npm run test:e2e
 ```
 
 Real Codex smoke tests are opt-in and must never run in the default test suite.
 Frontend changes also run the checked-in Impeccable detector and Playwright
 tests. Update architecture, configuration, migration, and threat-model documents
 when their contracts change.
-

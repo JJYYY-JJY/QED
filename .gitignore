@@ -261,10 +261,14 @@ node_modules/
 dist/
 frontend/test-results/
 frontend/playwright-report/
+test-results/
+playwright-report/
 
 ## Local Impeccable consent and runtime state
 .impeccable/config.local.json
+.impeccable/hook.cache.json
 .impeccable/live/selection.json
+.impeccable/critique/
 
 # xmpincl
 *.xmpi
