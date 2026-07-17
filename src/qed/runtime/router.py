@@ -55,14 +55,16 @@ class RoutedCodexRuntime:
         return await self._capability_runtime.probe(request)
 
     async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
-        capability = await self.probe(
-            CapabilityRequest(
-                model=request.model,
-                effort=request.effort,
-                proactive=request.proactive,
+        resolved = request
+        if request.effort == "auto":
+            capability = await self.probe(
+                CapabilityRequest(
+                    model=request.model,
+                    effort=request.effort,
+                    proactive=request.proactive,
+                )
             )
-        )
-        resolved = request.model_copy(update={"effort": capability.selected_effort})
+            resolved = request.model_copy(update={"effort": capability.selected_effort})
         runtime = self._select(resolved)
         async for event in runtime.stream(resolved):
             yield event

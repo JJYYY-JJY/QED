@@ -16,7 +16,11 @@ from qed.runtime import (
 
 
 class FakeCapabilityRuntime:
+    def __init__(self) -> None:
+        self.requests: list[CapabilityRequest] = []
+
     async def probe(self, request: CapabilityRequest) -> RuntimeCapabilities:
+        self.requests.append(request)
         return RuntimeCapabilities(
             model=request.model,
             advertised_efforts=("low", "high", "max"),
@@ -49,10 +53,14 @@ class FakeTurnRuntime:
         self.closed = True
 
 
-def _request(runtime: RuntimePreference = RuntimePreference.AUTO) -> RunRequest:
+def _request(
+    runtime: RuntimePreference = RuntimePreference.AUTO,
+    *,
+    effort: str = "auto",
+) -> RunRequest:
     return RunRequest(
         model="gpt-5.6-sol",
-        effort="auto",
+        effort=effort,
         proactive=True,
         prompt="Return a verdict.",
         output_schema={"type": "object", "additionalProperties": False},
@@ -60,11 +68,27 @@ def _request(runtime: RuntimePreference = RuntimePreference.AUTO) -> RunRequest:
     )
 
 
+async def test_explicit_effort_streams_never_reprobe_live_capabilities() -> None:
+    capabilities = FakeCapabilityRuntime()
+    sdk = FakeTurnRuntime(RuntimeBackend.SDK)
+    app = FakeTurnRuntime(RuntimeBackend.APP_SERVER)
+    exec_runtime = FakeTurnRuntime(RuntimeBackend.EXEC)
+    runtime = RoutedCodexRuntime(capabilities, sdk, app, exec_runtime)
+    request = _request(effort="high")
+
+    for _ in range(2):
+        _ = [event async for event in runtime.stream(request)]
+
+    assert capabilities.requests == []
+    assert [sent.effort for sent in sdk.requests] == ["high", "high"]
+
+
 async def test_auto_routes_resolved_controls_to_app_server_when_sdk_cannot() -> None:
+    capabilities = FakeCapabilityRuntime()
     sdk = FakeTurnRuntime(RuntimeBackend.SDK, supported=False)
     app = FakeTurnRuntime(RuntimeBackend.APP_SERVER)
     exec_runtime = FakeTurnRuntime(RuntimeBackend.EXEC)
-    runtime = RoutedCodexRuntime(FakeCapabilityRuntime(), sdk, app, exec_runtime)
+    runtime = RoutedCodexRuntime(capabilities, sdk, app, exec_runtime)
 
     events = [event async for event in runtime.stream(_request())]
 
@@ -72,6 +96,9 @@ async def test_auto_routes_resolved_controls_to_app_server_when_sdk_cannot() -> 
         ThreadStarted(thread_id="app_server-thread", backend=RuntimeBackend.APP_SERVER)
     ]
     assert app.requests[0].effort == "max"
+    assert capabilities.requests == [
+        CapabilityRequest(model="gpt-5.6-sol", effort="auto", proactive=True)
+    ]
     assert sdk.requests == []
     assert exec_runtime.requests == []
 
