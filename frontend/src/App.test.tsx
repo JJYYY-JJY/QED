@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -23,6 +23,14 @@ function errorResponse(message: string, status = 503): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
 }
 
 afterEach(() => {
@@ -229,6 +237,73 @@ describe("QED research console", () => {
     expect(await screen.findByRole("heading", { name: "Run snapshot unavailable" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Retry loading run" }));
     expect(await screen.findByRole("heading", { name: "Candidate 1" })).toBeInTheDocument();
+  });
+
+  it("ignores a deferred snapshot after the researcher selects another run", async () => {
+    const firstRun = {
+      ...runRecord,
+      status: "running" as const,
+      stage: "proving" as const,
+      resumable: false,
+    };
+    const secondRun = {
+      ...runRecord,
+      id: "second-proof-run",
+      updated_at: "2026-07-16T20:17:00Z",
+    };
+    const firstSnapshot = { ...completedSnapshot, run: firstRun };
+    const secondSnapshot = {
+      ...completedSnapshot,
+      run: secondRun,
+      run_input: {
+        ...completedSnapshot.run_input,
+        problem: "Prove that the second selected problem remains visible.",
+      },
+      candidates: [],
+      verifications: [],
+      decisions: [],
+    };
+    const firstResponse = deferred<Response>();
+    const secondResponse = deferred<Response>();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = requestUrl(input);
+      if (url.endsWith("/api/v1/capabilities")) {
+        return Promise.resolve(jsonResponse({ default_model: "gpt-5.6-sol", authentication_required: false }));
+      }
+      if (url.endsWith("/api/v1/runs?limit=100")) {
+        return Promise.resolve(jsonResponse({ items: [firstRun, secondRun], total: 2, offset: 0, limit: 100 }));
+      }
+      if (url.endsWith(`/api/v1/runs/${firstRun.id}/snapshot`)) return firstResponse.promise;
+      if (url.endsWith(`/api/v1/runs/${secondRun.id}/snapshot`)) return secondResponse.promise;
+      throw new Error(`Unexpected request: ${url}`);
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledWith(
+      `/api/v1/runs/${firstRun.id}/snapshot`,
+      expect.any(Object),
+    ));
+
+    await user.click(screen.getByRole("button", { name: new RegExp(secondRun.id) }));
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledWith(
+      `/api/v1/runs/${secondRun.id}/snapshot`,
+      expect.any(Object),
+    ));
+
+    await act(async () => {
+      firstResponse.resolve(jsonResponse(firstSnapshot));
+      await firstResponse.promise;
+    });
+    expect(screen.queryByRole("heading", { name: firstRun.id, level: 1 })).not.toBeInTheDocument();
+
+    await act(async () => {
+      secondResponse.resolve(jsonResponse(secondSnapshot));
+      await secondResponse.promise;
+    });
+    expect(await screen.findByRole("heading", { name: secondRun.id, level: 1 })).toBeInTheDocument();
+    expect(screen.getAllByText("Prove that the second selected problem remains visible.").length).toBeGreaterThan(0);
   });
 
   it("requires confirmation before cancelling an active run", async () => {

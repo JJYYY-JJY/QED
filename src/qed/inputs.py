@@ -27,4 +27,3 @@ class RunInput(StrictModel):
     @property
     def sha256(self) -> str:
         return canonical_sha256(self)
-

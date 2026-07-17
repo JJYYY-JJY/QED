@@ -41,6 +41,32 @@ QED has no separate liveness endpoint. A successful capabilities response
 proves that FastAPI can serve requests; the first run also probes Codex model
 and feature capabilities.
 
+## Opt-in real Codex smoke test
+
+The `real_codex` test makes an authenticated remote model call. It consumes
+network access, model quota, time, and potentially billable usage. Run it only
+after accepting those costs and creating a dedicated persistent credential
+directory; it intentionally refuses the personal `~/.codex` tree.
+
+```bash
+export QED_REAL_CODEX_DATA_ROOT=/absolute/path/to/qed-real-codex
+export QED_REAL_CODEX_HOME="$QED_REAL_CODEX_DATA_ROOT/codex-home"
+mkdir -p "$QED_REAL_CODEX_HOME"
+chmod 700 "$QED_REAL_CODEX_DATA_ROOT" "$QED_REAL_CODEX_HOME"
+
+QED_CODEX="$(uv run python -c \
+  'from codex_cli_bin import bundled_codex_path; print(bundled_codex_path())')"
+CODEX_HOME="$QED_REAL_CODEX_HOME" "$QED_CODEX" login
+
+export QED_RUN_REAL_CODEX=1
+uv run --frozen pytest -m real_codex tests/test_real_codex.py
+```
+
+The test probes the exact `gpt-5.6-sol` catalog entry with the explicitly
+supported `low` effort, then uses QED's official SDK route for one fresh,
+read-only, offline, strict JSON-Schema turn. Without the opt-in switch and both
+existing absolute directories, the test skips before constructing a runtime.
+
 ## Remote bind
 
 A non-loopback bind requires a bearer token of at least 32 characters. Put the

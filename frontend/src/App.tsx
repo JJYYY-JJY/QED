@@ -49,15 +49,22 @@ export default function App() {
   const inspectorModal = useMediaQuery("(max-width: 1180px)");
   const snapshotRefreshTimer = useRef<number | null>(null);
   const streamSequence = useRef(0);
+  const selectedRunIdRef = useRef<string | null>(null);
 
   const replaceRun = useCallback((run: RunRecord) => {
     setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
   }, []);
 
+  const selectRunId = useCallback((runId: string | null) => {
+    selectedRunIdRef.current = runId;
+    setSelectedRunId(runId);
+  }, []);
+
   const refreshSnapshot = useCallback(async (runId: string) => {
     const next = await api.snapshot(runId);
+    if (selectedRunIdRef.current !== runId || next.run.id !== runId) return null;
     streamSequence.current = next.events.at(-1)?.seq ?? 0;
-    setSnapshot((current) => (current?.run.id === runId || current === null ? next : current));
+    setSnapshot(next);
     if (TERMINAL.has(next.run.status)) setStreamState("offline");
     replaceRun(next.run);
     setSelectedCandidateId((current) => {
@@ -74,13 +81,14 @@ export default function App() {
       const [serverCapabilities, records] = await Promise.all([api.capabilities(), api.listRuns()]);
       setCapabilities(serverCapabilities);
       setRuns(records);
-      setSelectedRunId((current) => records.some((run) => run.id === current) ? current : records[0]?.id ?? null);
+      const current = selectedRunIdRef.current;
+      selectRunId(records.some((run) => run.id === current) ? current : records[0]?.id ?? null);
     } catch (caught) {
       setInitializationError(errorMessage(caught));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [selectRunId]);
 
   useEffect(() => {
     let active = true;
@@ -89,7 +97,7 @@ export default function App() {
         if (!active) return;
         setCapabilities(serverCapabilities);
         setRuns(records);
-        setSelectedRunId(records[0]?.id ?? null);
+        selectRunId(records[0]?.id ?? null);
       })
       .catch((caught: unknown) => {
         if (active) setInitializationError(errorMessage(caught));
@@ -98,7 +106,7 @@ export default function App() {
         if (active) setLoading(false);
       });
     return () => { active = false; };
-  }, []);
+  }, [selectRunId]);
 
   useEffect(() => {
     if (!selectedRunId || composerOpen) return;
@@ -122,10 +130,11 @@ export default function App() {
     let cursor = streamSequence.current;
     let stopped = false;
     const follow = async () => {
-      while (!controller.signal.aborted && !stopped) {
+      while (!controller.signal.aborted && !stopped && selectedRunIdRef.current === streamRunId) {
         try {
           setStreamState("live");
           cursor = await streamRunEvents(streamRunId, cursor, controller.signal, (event) => {
+            if (controller.signal.aborted || selectedRunIdRef.current !== streamRunId) return;
             streamSequence.current = event.seq;
             setSnapshot((current) => {
               if (!current || current.run.id !== event.run_id || (current.events.at(-1)?.seq ?? 0) >= event.seq) return current;
@@ -134,15 +143,19 @@ export default function App() {
             if (snapshotRefreshTimer.current === null) {
               snapshotRefreshTimer.current = window.setTimeout(() => {
                 snapshotRefreshTimer.current = null;
-                void refreshSnapshot(streamRunId).catch((caught: unknown) => setError(errorMessage(caught)));
+                void refreshSnapshot(streamRunId).catch((caught: unknown) => {
+                  if (selectedRunIdRef.current === streamRunId) setError(errorMessage(caught));
+                });
               }, 300);
             }
           });
+          if (controller.signal.aborted || selectedRunIdRef.current !== streamRunId) return;
           const latest = await refreshSnapshot(streamRunId);
+          if (!latest || controller.signal.aborted || selectedRunIdRef.current !== streamRunId) return;
           if (TERMINAL.has(latest.run.status)) stopped = true;
           else await new Promise((resolve) => window.setTimeout(resolve, 800));
         } catch {
-          if (controller.signal.aborted) return;
+          if (controller.signal.aborted || selectedRunIdRef.current !== streamRunId) return;
           setStreamState("reconnecting");
           await new Promise((resolve) => window.setTimeout(resolve, 1500));
         }
@@ -159,6 +172,7 @@ export default function App() {
   }, [refreshSnapshot, selectedRunId, snapshot?.run.id, snapshot?.run.status]);
 
   const selectRun = (runId: string) => {
+    selectRunId(runId);
     setComposerOpen(false);
     setSnapshot(null);
     setInspectorTarget(null);
@@ -166,7 +180,6 @@ export default function App() {
     setError(null);
     setSnapshotError(null);
     setStreamState("offline");
-    setSelectedRunId(runId);
     setTab("proofs");
     setNavigationOpen(false);
   };
@@ -179,7 +192,7 @@ export default function App() {
       replaceRun(created);
       setSnapshot(null);
       setInspectorTarget(null);
-      setSelectedRunId(created.id);
+      selectRunId(created.id);
       setComposerOpen(false);
       setTab("proofs");
       await api.command(created.id, "start");

@@ -1,6 +1,6 @@
 # Production rewrite completion matrix
 
-Last updated: 2026-07-16
+Last updated: 2026-07-17
 
 This matrix records the evidence available in the final working tree. `Cleared`
 means the implementation and its scoped check are present. All forty-two rows
@@ -69,32 +69,35 @@ are cleared on the local `codex-native-rewrite` candidate; nothing was pushed.
 | E-03 | Emit structured logs without secrets | Secret-field, bearer-value, exception, and API error-envelope tests | Cleared |
 | E-04 | Import legacy runs without mutating source data | Idempotency, symlink, contained-root, and tamper tests | Cleared |
 | E-05 | Test state, schemas, security, resume, mutation verification, backend, frontend, and Playwright | CI jobs and the working-tree results below | Cleared |
-| E-06 | Keep real-model smoke tests opt-in | `real_codex` marker exclusion and credential-free default CI | Cleared |
+| E-06 | Keep real-model smoke tests opt-in | Default marker exclusion plus one collected, guarded exact-model/schema-turn smoke test; the authenticated call was not run | Cleared; smoke not run |
 | E-07 | Document README, architecture, migration, threat model, config, operations, CI, and contribution flow | Relative-link, command, schema, and style scans | Cleared |
 | E-08 | Work on a branch with logical commits and no push | `codex-native-rewrite`, the local logical commit sequence, and clean-candidate replay; no push was made | Cleared |
 
 ## Verification evidence
 
-These commands ran against the completed working tree on 2026-07-16:
+These commands ran against the current candidate on 2026-07-17:
 
 | Command | Result |
 | --- | --- |
 | `uv run ruff check .` | Passed |
 | `uv run mypy src` | Passed |
-| `uv run pytest` | 209 passed; real Codex tests excluded by marker |
+| `uv run pytest` | 220 passed, 1 opt-in real Codex test deselected |
 | `uv build` | Source distribution and wheel built |
 | `npm run lint` | Passed |
 | `npm run typecheck` | Passed |
-| `npm test` | 3 files and 9 tests passed |
+| `npm test` | 3 files and 10 tests passed |
 | `npm run build` | Passed |
 | `npm run impeccable` | Passed with no anti-pattern findings |
-| `npm run test:impeccable` | 44 passed |
-| `npm run test:e2e` | 4 passed, 2 expected desktop-project skips |
+| `npm run test:impeccable` | 76 passed |
+| `npm run test:e2e` | 5 passed, 3 expected skips |
 
-No real Codex call was made. It remains opt-in because it consumes credentials,
-network access, model quota, and time. GitHub Actions has not run for this local,
-unpushed candidate; the SHA-pinned workflow will exercise Python 3.13 and 3.14
-after a maintainer pushes it.
+The `real_codex` smoke test is present and collectable, but no real Codex call
+was made. Structured-output compatibility for the current account, runtime,
+`gpt-5.6-sol`, and `low` effort therefore remains a release-time operational
+risk. The test remains opt-in because it consumes credentials, network access,
+model quota, time, and potentially billable usage. GitHub Actions has not run
+for this local, unpushed candidate; the SHA-pinned workflow will exercise
+Python 3.13 and 3.14 after a maintainer pushes it.
 
 ## Release checks outside this candidate
 
