@@ -121,6 +121,7 @@ def test_verification_requires_a_fresh_verifier_thread(tmp_path: Path) -> None:
             role="prover",
             model="gpt-5.6-sol",
             provenance=provenance("prover-thread"),
+            external_thread_id="codex-prover-thread",
         )
         store.add_thread(
             "planner-thread",
@@ -167,6 +168,11 @@ def test_verification_requires_a_fresh_verifier_thread(tmp_path: Path) -> None:
             )
 
         def report(thread_id: str, report_id: str) -> VerificationReport:
+            external_thread_ids = {
+                "prover-thread": "codex-prover-thread",
+                "forked-verifier": "codex-forked-verifier",
+                "fresh-verifier": "codex-fresh-verifier",
+            }
             return VerificationReport(
                 id=report_id,
                 candidate_id=proof.id,
@@ -181,6 +187,7 @@ def test_verification_requires_a_fresh_verifier_thread(tmp_path: Path) -> None:
                     ),
                 ),
                 verifier_thread_id=thread_id,
+                verifier_external_thread_id=external_thread_ids[thread_id],
                 provenance=provenance(thread_id),
                 created_at=NOW,
             )

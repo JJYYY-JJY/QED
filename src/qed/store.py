@@ -10,31 +10,60 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from qed.config import QEDConfig
-from qed.decision import CandidateDecision, decide_candidate
+from qed.decision import (
+    CandidateDecision,
+    candidate_decision_sha256,
+    decide_candidate,
+)
 from qed.inputs import RunInput
 from qed.schemas import (
     Adjudication,
     Event,
     Evidence,
+    EvidenceTrust,
     Plan,
     ProofCandidate,
     Provenance,
     Sha256,
     VerificationReport,
+    WebSearchObservation,
     canonical_json,
     canonical_sha256,
+    evidence_sha256,
     sha256_text,
+    verification_report_sha256,
+)
+from qed.state_machine import (
+    RUN_TRANSITIONS,
+    STAGE_TRANSITIONS,
+    THREAD_TRANSITIONS,
+)
+from qed.state_machine import (
+    RunStage as RunStage,
+)
+from qed.state_machine import (
+    RunStatus as RunStatus,
+)
+from qed.state_machine import (
+    ThreadRole as ThreadRole,
+)
+from qed.state_machine import (
+    ThreadStatus as ThreadStatus,
+)
+from qed.store_schema import (
+    DuplicateExternalThreadIdentityError,
+    SchemaVersionError,
+    finalize_schema_migration,
+    prepare_schema_migration,
 )
 
 SCHEMA_VERSION = 1
-DATABASE_SCHEMA_VERSION = 2
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -63,80 +92,6 @@ class ImmutableRecordError(StoreError):
 class StoreIntegrityError(StoreError):
     """Raised when persisted JSON disagrees with its denormalized integrity fields."""
 
-
-class RunStatus(StrEnum):
-    CREATED = "created"
-    RUNNING = "running"
-    PAUSED = "paused"
-    CANCELLING = "cancelling"
-    CANCELLED = "cancelled"
-    FAILED = "failed"
-    COMPLETED = "completed"
-
-
-class RunStage(StrEnum):
-    INTAKE = "intake"
-    LITERATURE = "literature"
-    PLANNING = "planning"
-    PROVING = "proving"
-    VERIFICATION = "verification"
-    ADJUDICATION = "adjudication"
-    EXPORT = "export"
-    COMPLETE = "complete"
-
-
-class ThreadRole(StrEnum):
-    LITERATURE = "literature"
-    PLANNER = "planner"
-    PROVER = "prover"
-    VERIFIER = "verifier"
-    ADJUDICATOR = "adjudicator"
-
-
-class ThreadStatus(StrEnum):
-    ACTIVE = "active"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
-RUN_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
-    RunStatus.CREATED: frozenset(
-        {RunStatus.RUNNING, RunStatus.CANCELLING, RunStatus.FAILED}
-    ),
-    RunStatus.RUNNING: frozenset(
-        {RunStatus.PAUSED, RunStatus.CANCELLING, RunStatus.FAILED, RunStatus.COMPLETED}
-    ),
-    RunStatus.PAUSED: frozenset(
-        {RunStatus.CANCELLING, RunStatus.FAILED}
-    ),
-    RunStatus.CANCELLING: frozenset({RunStatus.CANCELLED, RunStatus.FAILED}),
-    RunStatus.CANCELLED: frozenset(),
-    RunStatus.FAILED: frozenset(),
-    RunStatus.COMPLETED: frozenset(),
-}
-
-STAGE_TRANSITIONS: dict[RunStage, frozenset[RunStage]] = {
-    RunStage.INTAKE: frozenset({RunStage.LITERATURE}),
-    RunStage.LITERATURE: frozenset({RunStage.PLANNING}),
-    RunStage.PLANNING: frozenset({RunStage.PROVING}),
-    RunStage.PROVING: frozenset({RunStage.VERIFICATION}),
-    RunStage.VERIFICATION: frozenset({RunStage.ADJUDICATION}),
-    RunStage.ADJUDICATION: frozenset(
-        {RunStage.LITERATURE, RunStage.PLANNING, RunStage.PROVING, RunStage.EXPORT}
-    ),
-    RunStage.EXPORT: frozenset({RunStage.COMPLETE}),
-    RunStage.COMPLETE: frozenset(),
-}
-
-THREAD_TRANSITIONS: dict[ThreadStatus, frozenset[ThreadStatus]] = {
-    ThreadStatus.ACTIVE: frozenset(
-        {ThreadStatus.COMPLETED, ThreadStatus.FAILED, ThreadStatus.CANCELLED}
-    ),
-    ThreadStatus.COMPLETED: frozenset(),
-    ThreadStatus.FAILED: frozenset(),
-    ThreadStatus.CANCELLED: frozenset(),
-}
 
 RUNTIME_DRAIN_EVENTS = frozenset(
     {
@@ -199,6 +154,20 @@ class CancelCommandResult(StoreModel):
     replayed: bool
     accepted_status: RunStatus
     accepted_execution_version: int
+
+
+class OperatorDecisionRecord(StoreModel):
+    """Immutable operator action reconstructed from the ordered event chain."""
+
+    run_id: str
+    action: Literal["abandon"]
+    idempotency_key: str
+    reason: str
+    status_before: RunStatus
+    status_after: RunStatus
+    event_seq: Annotated[int, Field(ge=1)]
+    created_at: datetime
+    replayed: bool = False
 
 
 class ThreadRecord(StoreModel):
@@ -327,6 +296,7 @@ class RunSnapshot(StoreModel):
     execution_segments: tuple[ExecutionLease, ...] = ()
     runtime_resolutions: tuple[RuntimeResolutionRecord, ...] = ()
     evidence: tuple[Evidence, ...] = ()
+    web_search_observations: tuple[WebSearchObservation, ...] = ()
     plans: tuple[Plan, ...] = ()
     adjudications: tuple[Adjudication, ...] = ()
     decisions: tuple[CandidateDecision, ...] = ()
@@ -461,28 +431,12 @@ class RunStore:
                 self._connection.commit()
 
     def _initialize_schema(self) -> None:
-        metadata_exists = self._connection.execute(
-            """
-            SELECT 1 FROM sqlite_schema
-            WHERE type = 'table' AND name = 'schema_metadata'
-            """
-        ).fetchone()
-        prior_version: int | None = None
-        if metadata_exists is not None:
-            version_row = self._connection.execute(
-                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-            ).fetchone()
-            if version_row is None:
-                raise StoreError("database schema metadata is missing its version")
-            try:
-                prior_version = int(version_row["value"])
-            except (TypeError, ValueError) as error:
-                raise StoreError("database schema version is not an integer") from error
-            if prior_version not in {1, DATABASE_SCHEMA_VERSION}:
-                raise StoreError(
-                    f"unsupported schema version {prior_version}; "
-                    f"expected 1 or {DATABASE_SCHEMA_VERSION}"
-                )
+        try:
+            prior_version = prepare_schema_migration(self._connection)
+        except DuplicateExternalThreadIdentityError as error:
+            raise StoreIntegrityError(str(error)) from error
+        except SchemaVersionError as error:
+            raise StoreError(str(error)) from error
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS schema_metadata (
@@ -585,6 +539,30 @@ class RunStore:
                 evidence_sha256 TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS web_search_observations (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                backend TEXT NOT NULL,
+                external_thread_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                uri_sha256 TEXT NOT NULL CHECK (
+                    length(uri_sha256) = 64
+                    AND uri_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                observation_json TEXT NOT NULL,
+                observation_sha256 TEXT NOT NULL CHECK (
+                    length(observation_sha256) = 64
+                    AND observation_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+                UNIQUE (
+                    run_id, backend, external_thread_id, turn_id, item_id, uri_sha256
+                )
             ) STRICT;
 
             CREATE TABLE IF NOT EXISTS plans (
@@ -766,6 +744,8 @@ class RunStore:
             CREATE INDEX IF NOT EXISTS turn_inputs_run_idx
                 ON turn_inputs(run_id, created_at, id);
             CREATE INDEX IF NOT EXISTS evidence_run_idx ON evidence(run_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS web_search_observations_run_idx
+                ON web_search_observations(run_id, created_at, id);
             CREATE INDEX IF NOT EXISTS plans_run_idx ON plans(run_id, created_at, id);
             CREATE INDEX IF NOT EXISTS threads_run_idx ON threads(run_id, role);
             CREATE UNIQUE INDEX IF NOT EXISTS threads_external_unique_idx
@@ -843,6 +823,14 @@ class RunStore:
             CREATE TRIGGER IF NOT EXISTS evidence_delete_guard
             BEFORE DELETE ON evidence BEGIN
                 SELECT RAISE(ABORT, 'evidence is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS web_search_observations_update_guard
+            BEFORE UPDATE ON web_search_observations BEGIN
+                SELECT RAISE(ABORT, 'web search observation is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS web_search_observations_delete_guard
+            BEFORE DELETE ON web_search_observations BEGIN
+                SELECT RAISE(ABORT, 'web search observation is immutable');
             END;
             CREATE TRIGGER IF NOT EXISTS plans_update_guard
             BEFORE UPDATE ON plans BEGIN
@@ -934,16 +922,7 @@ class RunStore:
             END;
             """
         )
-        if prior_version is None:
-            self._connection.execute(
-                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', ?)",
-                (str(DATABASE_SCHEMA_VERSION),),
-            )
-        elif prior_version == 1:
-            self._connection.execute(
-                "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
-                (str(DATABASE_SCHEMA_VERSION),),
-            )
+        finalize_schema_migration(self._connection, prior_version)
 
     def info(self) -> StoreInfo:
         with self._lock:
@@ -1356,6 +1335,129 @@ class RunStore:
                 "SELECT * FROM runs ORDER BY created_at, id"
             ).fetchall()
             return tuple(self._run_from_row(row) for row in rows)
+
+    def abandon_run(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        idempotency_key: str,
+    ) -> OperatorDecisionRecord:
+        """Record an immutable, non-PASS operator terminal decision.
+
+        This does not invent a runtime terminal event. A late, authentic runtime
+        terminal may still be appended by the fenced execution segment.
+        """
+
+        _validate_run_id(run_id)
+        _validate_id(idempotency_key, field="idempotency_key")
+        _validate_nonempty(reason, field="reason")
+        if len(reason) > 2_000:
+            raise ValueError("reason must not exceed 2000 characters")
+        now = self._now()
+        with self._transaction() as connection:
+            row = self._require_run_row(connection, run_id)
+            prior_rows = connection.execute(
+                """
+                SELECT * FROM events
+                WHERE run_id = ? AND event_type = 'operator.run_abandoned'
+                ORDER BY seq
+                """,
+                (run_id,),
+            ).fetchall()
+            for prior_row in prior_rows:
+                payload = json.loads(prior_row["payload_json"])
+                if not isinstance(payload, dict):
+                    raise StoreIntegrityError(
+                        "operator decision event has an invalid payload"
+                    )
+                if payload.get("idempotency_key") != idempotency_key:
+                    continue
+                if payload.get("reason") != reason:
+                    raise ConflictError(
+                        "operator idempotency key was reused with another reason"
+                    )
+                return OperatorDecisionRecord(
+                    run_id=run_id,
+                    action="abandon",
+                    idempotency_key=idempotency_key,
+                    reason=reason,
+                    status_before=RunStatus(str(payload["from"])),
+                    status_after=RunStatus(str(payload["to"])),
+                    event_seq=int(prior_row["seq"]),
+                    created_at=_parse_time(prior_row["created_at"]),
+                    replayed=True,
+                )
+            if prior_rows:
+                raise ConflictError(
+                    "run already has an immutable operator abandon decision"
+                )
+
+            current = RunStatus(row["status"])
+            if current in {RunStatus.CANCELLED, RunStatus.COMPLETED}:
+                raise InvalidTransitionError(
+                    f"cannot abandon a run while it is {current.value}"
+                )
+            live_execution = connection.execute(
+                """
+                SELECT id FROM execution_segments
+                WHERE run_id = ? AND released_at IS NULL AND lease_expires_at > ?
+                ORDER BY version DESC LIMIT 1
+                """,
+                (run_id, _render_time(now)),
+            ).fetchone()
+            if live_execution is not None:
+                raise ConflictError(
+                    "cannot abandon a run with a live execution lease: "
+                    f"{live_execution['id']}"
+                )
+
+            target = RunStatus.FAILED
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = ?, cancellation_requested = 0, resumable = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                (target.value, _render_time(now), run_id),
+            )
+            decision_event = self._append_event(
+                connection,
+                run_id,
+                event_type="operator.run_abandoned",
+                stage=RunStage(row["stage"]),
+                payload={
+                    "action": "abandon",
+                    "idempotency_key": idempotency_key,
+                    "reason": reason,
+                    "from": current.value,
+                    "to": target.value,
+                },
+                created_at=now,
+            )
+            if current is not target:
+                self._append_event(
+                    connection,
+                    run_id,
+                    event_type="run.status_changed",
+                    stage=RunStage(row["stage"]),
+                    payload={
+                        "from": current.value,
+                        "to": target.value,
+                        "operator_decision_seq": decision_event.seq,
+                    },
+                    created_at=now,
+                )
+        return OperatorDecisionRecord(
+            run_id=run_id,
+            action="abandon",
+            idempotency_key=idempotency_key,
+            reason=reason,
+            status_before=current,
+            status_after=target,
+            event_seq=decision_event.seq,
+            created_at=decision_event.created_at,
+        )
 
     def transition_run(
         self,
@@ -1906,6 +2008,184 @@ class RunStore:
             execution=execution,
         )[0]
 
+    def add_web_search_observation(
+        self,
+        observation: WebSearchObservation,
+        *,
+        execution: ExecutionToken,
+    ) -> WebSearchObservation:
+        """Persist one URL-bearing native web-search action observed by QED."""
+
+        _validate_id(observation.id, field="observation.id")
+        _validate_id(observation.run_id, field="observation.run_id")
+        rendered = canonical_json(observation)
+        now = self._now()
+        try:
+            with self._transaction() as connection:
+                run = self._require_run_row(connection, observation.run_id)
+                self._authorize_runtime_lifecycle(
+                    connection,
+                    observation.run_id,
+                    execution,
+                )
+                stage = RunStage(run["stage"])
+                if stage not in {RunStage.LITERATURE, RunStage.VERIFICATION}:
+                    raise InvalidTransitionError(
+                        "web-search observations require literature or verification"
+                    )
+                thread = self._require_thread_row(
+                    connection,
+                    observation.local_thread_id,
+                )
+                expected_role = (
+                    ThreadRole.LITERATURE
+                    if stage is RunStage.LITERATURE
+                    else ThreadRole.VERIFIER
+                )
+                if (
+                    thread["run_id"] != observation.run_id
+                    or ThreadRole(thread["role"]) is not expected_role
+                    or thread["external_thread_id"]
+                    != observation.external_thread_id
+                ):
+                    raise ConflictError(
+                        "web-search observation thread identity does not match"
+                    )
+                turn_rows = connection.execute(
+                    """
+                    SELECT payload_json
+                    FROM events
+                    WHERE run_id = ? AND event_type = 'runtime.turn_started'
+                    ORDER BY seq
+                    """,
+                    (observation.run_id,),
+                ).fetchall()
+                turn_observed = any(
+                    (
+                        (payload := json.loads(row["payload_json"])).get(
+                            "thread_id"
+                        )
+                        == observation.external_thread_id
+                        and payload.get("turn_id") == observation.turn_id
+                        and payload.get("backend") == observation.backend
+                    )
+                    for row in turn_rows
+                )
+                if not turn_observed:
+                    raise ConflictError(
+                        "web-search observation requires its runtime turn identity"
+                    )
+                action = observation.payload.get("action")
+                action_types = {
+                    "openPage": "open_page",
+                    "open_page": "open_page",
+                    "findInPage": "find_in_page",
+                    "find_in_page": "find_in_page",
+                }
+                runtime_action_type = (
+                    action.get("type") if isinstance(action, dict) else None
+                )
+                if (
+                    observation.payload.get("id") != observation.item_id
+                    or observation.payload.get("type")
+                    not in {"webSearch", "web_search", "web_search_call"}
+                    or not isinstance(action, dict)
+                    or not isinstance(runtime_action_type, str)
+                    or action_types.get(runtime_action_type)
+                    != observation.action_type
+                    or action.get("url") != observation.uri
+                ):
+                    raise ConflictError(
+                        "web-search observation does not match its runtime payload"
+                    )
+                existing = connection.execute(
+                    "SELECT * FROM web_search_observations WHERE id = ?",
+                    (observation.id,),
+                ).fetchone()
+                if existing is not None:
+                    persisted = self._web_search_observation_from_row(existing)
+                    if persisted != observation:
+                        raise ImmutableRecordError(
+                            "web-search observation is immutable"
+                        )
+                    return persisted
+                connection.execute(
+                    """
+                    INSERT INTO web_search_observations (
+                        id, run_id, schema_version, backend,
+                        external_thread_id, turn_id, item_id, uri_sha256,
+                        observation_json, observation_sha256, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        observation.id,
+                        observation.run_id,
+                        observation.schema_version,
+                        observation.backend,
+                        observation.external_thread_id,
+                        observation.turn_id,
+                        observation.item_id,
+                        observation.uri_sha256,
+                        rendered,
+                        canonical_sha256(observation),
+                        _render_time(now),
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    observation.run_id,
+                    event_type="runtime.web_search_observed",
+                    stage=stage,
+                    payload={
+                        "observation_id": observation.id,
+                        "backend": observation.backend,
+                        "thread_id": observation.external_thread_id,
+                        "turn_id": observation.turn_id,
+                        "item_id": observation.item_id,
+                        "uri_sha256": observation.uri_sha256,
+                        "payload_sha256": observation.payload_sha256,
+                    },
+                    created_at=now,
+                )
+        except sqlite3.IntegrityError as error:
+            raise ConflictError(
+                "web-search observation identity already exists"
+            ) from error
+        return self.get_web_search_observation(observation.id)
+
+    def get_web_search_observation(
+        self,
+        observation_id: str,
+    ) -> WebSearchObservation:
+        _validate_id(observation_id, field="observation_id")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM web_search_observations WHERE id = ?",
+                (observation_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"web-search observation not found: {observation_id}"
+                )
+            return self._web_search_observation_from_row(row)
+
+    def list_web_search_observations(
+        self,
+        run_id: str,
+    ) -> tuple[WebSearchObservation, ...]:
+        with self._lock:
+            self._require_run_row(self._connection, run_id)
+            rows = self._connection.execute(
+                """
+                SELECT * FROM web_search_observations
+                WHERE run_id = ? ORDER BY created_at, id
+                """,
+                (run_id,),
+            ).fetchall()
+            return tuple(
+                self._web_search_observation_from_row(row) for row in rows
+            )
+
     def add_evidence_batch(
         self,
         run_id: str,
@@ -1933,6 +2213,12 @@ class RunStore:
                         "typed evidence may be added only in literature"
                     )
                 for item, item_json in zip(evidence, rendered, strict=True):
+                    if item.source_trust is EvidenceTrust.RUNTIME_OBSERVED:
+                        self._require_evidence_observations(
+                            connection,
+                            run_id,
+                            item,
+                        )
                     connection.execute(
                         """
                         INSERT INTO evidence (
@@ -1945,7 +2231,7 @@ class RunStore:
                             run_id,
                             item.schema_version,
                             item_json,
-                            canonical_sha256(item),
+                            evidence_sha256(item),
                             _render_time(now),
                         ),
                     )
@@ -2167,7 +2453,23 @@ class RunStore:
             candidate_row = self._require_candidate_row(connection, candidate_id)
             if candidate_row["run_id"] != run_id or candidate_row["sealed_at"] is None:
                 raise ConflictError("decision requires a sealed candidate from this run")
-            candidate = self._candidate_from_row(candidate_row).candidate
+            candidate_record = self._candidate_from_row(candidate_row)
+            candidate = candidate_record.candidate
+            if candidate_record.thread_id is None:
+                raise ConflictError("decision requires a prover thread identity")
+            prover_thread = self._require_thread_row(
+                connection,
+                candidate_record.thread_id,
+            )
+            prover_external_thread_id = prover_thread["external_thread_id"]
+            if (
+                ThreadRole(prover_thread["role"]) is not ThreadRole.PROVER
+                or not isinstance(prover_external_thread_id, str)
+                or not prover_external_thread_id
+            ):
+                raise ConflictError(
+                    "decision requires a prover external thread identity"
+                )
             report_rows = connection.execute(
                 """
                 SELECT * FROM verifications
@@ -2176,23 +2478,35 @@ class RunStore:
                 (run_id, candidate_id),
             ).fetchall()
             reports = tuple(self._verification_from_row(row).report for row in report_rows)
-            evidence_ids = tuple(
-                str(evidence_row["id"])
+            evidence = tuple(
+                self._evidence_from_row(evidence_row)
                 for evidence_row in connection.execute(
-                    "SELECT id FROM evidence WHERE run_id = ? ORDER BY id",
+                    "SELECT * FROM evidence WHERE run_id = ? ORDER BY id",
                     (run_id,),
                 ).fetchall()
             )
-            citation_required = bool(evidence_ids)
+            citation_required = bool(evidence)
             if require_citation is not None and require_citation != citation_required:
                 raise ConflictError(
                     "citation policy must be derived from the frozen evidence ledger"
                 )
+            input_row = connection.execute(
+                "SELECT input_json FROM run_inputs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if input_row is None:
+                raise ConflictError("decision requires the frozen run input")
+            run_input = RunInput.model_validate_json(input_row["input_json"])
+            required_rule_ids = tuple(
+                rule.id for rule in run_input.frozen_verification_rules
+            )
             decision = decide_candidate(
                 candidate,
                 reports,
+                prover_external_thread_id=prover_external_thread_id,
                 require_citation=citation_required,
-                required_evidence_ids=evidence_ids,
+                required_evidence=evidence,
+                required_rule_ids=required_rule_ids,
             )
             rendered = canonical_json(decision)
             existing = connection.execute(
@@ -2215,7 +2529,7 @@ class RunStore:
                     run_id,
                     decision.schema_version,
                     rendered,
-                    canonical_sha256(decision),
+                    candidate_decision_sha256(decision),
                     _render_time(now),
                 ),
             )
@@ -2859,6 +3173,21 @@ class RunStore:
                     raise ConflictError("verification requires a sealed candidate")
                 if candidate["proof_sha256"] != report.candidate_sha256:
                     raise ConflictError("verification candidate hash does not match sealed proof")
+                prover_thread_id = candidate["thread_id"]
+                if not isinstance(prover_thread_id, str):
+                    raise ConflictError(
+                        "verification candidate is missing its prover thread identity"
+                    )
+                prover_thread = self._require_thread_row(connection, prover_thread_id)
+                prover_external_thread_id = prover_thread["external_thread_id"]
+                if (
+                    ThreadRole(prover_thread["role"]) is not ThreadRole.PROVER
+                    or not isinstance(prover_external_thread_id, str)
+                    or not prover_external_thread_id
+                ):
+                    raise ConflictError(
+                        "verification candidate is missing its prover external thread identity"
+                    )
                 thread = self._require_thread_row(connection, report.verifier_thread_id)
                 if thread["run_id"] != run_id:
                     raise ConflictError("verification thread belongs to another run")
@@ -2871,16 +3200,63 @@ class RunStore:
                 if report.provenance.source_id != report.verifier_thread_id:
                     raise ConflictError("verification provenance must bind its verifier thread")
                 external_thread_id = str(thread["external_thread_id"])
-                if (
-                    report.verifier_external_thread_id is not None
-                    and report.verifier_external_thread_id != external_thread_id
-                ):
+                if report.verifier_external_thread_id is None:
+                    raise ConflictError(
+                        "verification report requires an external thread identity"
+                    )
+                if report.verifier_external_thread_id != external_thread_id:
                     raise ConflictError(
                         "verification external thread id does not match the stored thread"
                     )
-                if report.verifier_external_thread_id is None:
-                    report = report.model_copy(
-                        update={"verifier_external_thread_id": external_thread_id}
+                if external_thread_id == prover_external_thread_id:
+                    raise ConflictError(
+                        "verification external thread identity reuses the candidate prover"
+                    )
+                required_kinds = {"structural", "detailed", "citation"}
+                if report.kind in required_kinds:
+                    prior_rows = connection.execute(
+                        """
+                        SELECT report_json
+                        FROM verifications
+                        WHERE run_id = ? AND candidate_id = ?
+                        """,
+                        (run_id, report.candidate_id),
+                    ).fetchall()
+                    for prior_row in prior_rows:
+                        prior = VerificationReport.model_validate_json(
+                            prior_row["report_json"]
+                        )
+                        if (
+                            prior.kind in required_kinds
+                            and prior.verifier_external_thread_id
+                            == report.verifier_external_thread_id
+                        ):
+                            raise ConflictError(
+                                "required verification reports must use distinct "
+                                "external thread identities"
+                            )
+                input_row = connection.execute(
+                    "SELECT input_json FROM run_inputs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if input_row is None:
+                    raise ConflictError(
+                        "verification requires the frozen run input"
+                    )
+                run_input = RunInput.model_validate_json(input_row["input_json"])
+                known_rule_ids = {
+                    rule.id for rule in run_input.frozen_verification_rules
+                }
+                referenced_rule_ids = {
+                    rule_id
+                    for check in report.checks
+                    for rule_id in check.rule_ids
+                }
+                unknown_rule_ids = referenced_rule_ids - known_rule_ids
+                if unknown_rule_ids:
+                    names = ", ".join(sorted(unknown_rule_ids))
+                    raise ConflictError(
+                        f"verification references unknown verification rule: {names}"
                     )
                 evidence_ids = {
                     str(evidence_row["id"])
@@ -2889,6 +3265,15 @@ class RunStore:
                         (run_id,),
                     ).fetchall()
                 }
+                citation_support = tuple(
+                    support
+                    for check in report.checks
+                    for support in check.citation_support
+                )
+                if report.kind != "citation" and citation_support:
+                    raise ConflictError(
+                        "structured citation support is allowed only in citation reports"
+                    )
                 referenced_evidence = {
                     evidence_id
                     for check in report.checks
@@ -2897,6 +3282,8 @@ class RunStore:
                     evidence_id
                     for finding in report.findings
                     for evidence_id in finding.evidence_ids
+                } | {
+                    support.evidence_id for support in citation_support
                 }
                 unknown_evidence = referenced_evidence - evidence_ids
                 if unknown_evidence:
@@ -2905,13 +3292,47 @@ class RunStore:
                         f"verification references unknown evidence: {names}"
                     )
                 if report.kind == "citation":
-                    missing_evidence = evidence_ids - referenced_evidence
+                    supported_evidence = {
+                        support.evidence_id for support in citation_support
+                    }
+                    missing_evidence = evidence_ids - supported_evidence
                     if missing_evidence:
                         names = ", ".join(sorted(missing_evidence))
                         raise ConflictError(
                             "citation report does not cover the frozen evidence ledger: "
                             f"{names}"
                         )
+                    frozen_candidate = ProofCandidate.model_validate_json(
+                        candidate["candidate_json"]
+                    )
+                    evidence_by_id = {
+                        str(evidence_row["id"]): self._evidence_from_row(evidence_row)
+                        for evidence_row in connection.execute(
+                            "SELECT * FROM evidence WHERE run_id = ?",
+                            (run_id,),
+                        ).fetchall()
+                    }
+                    for support in citation_support:
+                        frozen_evidence = evidence_by_id[support.evidence_id]
+                        if support.proof_span not in frozen_candidate.proof:
+                            raise ConflictError(
+                                "citation support proof span is absent from the "
+                                "frozen candidate"
+                            )
+                        if support.evidence_excerpt not in frozen_evidence.content:
+                            raise ConflictError(
+                                "citation support evidence excerpt is absent from "
+                                "the frozen evidence"
+                            )
+                        expected_locator = (
+                            frozen_evidence.source_uri
+                            or f"evidence:{frozen_evidence.id}"
+                        )
+                        if support.source_locator != expected_locator:
+                            raise ConflictError(
+                                "citation support source locator does not match "
+                                "the frozen evidence identity"
+                            )
                 report_json = canonical_json(report)
                 provenance_json = canonical_json(report.provenance)
                 connection.execute(
@@ -2930,7 +3351,7 @@ class RunStore:
                         report.kind,
                         report.schema_version,
                         report_json,
-                        canonical_sha256(report),
+                        verification_report_sha256(report),
                         report.candidate_sha256,
                         provenance_json,
                         canonical_sha256(report.provenance),
@@ -2971,7 +3392,7 @@ class RunStore:
                     """,
                     (
                         canonical_json(report),
-                        canonical_sha256(report),
+                        verification_report_sha256(report),
                         report.candidate_sha256,
                         report.id,
                     ),
@@ -3151,6 +3572,13 @@ class RunStore:
             evidence_rows = connection.execute(
                 "SELECT * FROM evidence WHERE run_id = ? ORDER BY created_at, id", (run_id,)
             ).fetchall()
+            observation_rows = connection.execute(
+                """
+                SELECT * FROM web_search_observations
+                WHERE run_id = ? ORDER BY created_at, id
+                """,
+                (run_id,),
+            ).fetchall()
             plan_rows = self._plan_rows_in_event_order(connection, run_id)
             adjudication_rows = self._adjudication_rows_in_event_order(
                 connection,
@@ -3193,6 +3621,10 @@ class RunStore:
                     for row in resolution_rows
                 ),
                 evidence=tuple(self._evidence_from_row(row) for row in evidence_rows),
+                web_search_observations=tuple(
+                    self._web_search_observation_from_row(row)
+                    for row in observation_rows
+                ),
                 plans=tuple(self._plan_from_row(row) for row in plan_rows),
                 adjudications=tuple(
                     self._adjudication_from_row(row) for row in adjudication_rows
@@ -3335,6 +3767,18 @@ class RunStore:
             self._require_run_row(self._connection, run_id)
             return bool(self._unconfirmed_runtime_turns(self._connection, run_id))
 
+    def pending_runtime_identities(
+        self,
+        run_id: str,
+    ) -> tuple[tuple[str, ...], ...]:
+        """Expose exact unresolved attempt/turn identities for read-only diagnosis."""
+
+        with self._lock:
+            self._require_run_row(self._connection, run_id)
+            return tuple(
+                sorted(self._unconfirmed_runtime_turns(self._connection, run_id))
+            )
+
     def _append_event(
         self,
         connection: sqlite3.Connection,
@@ -3444,6 +3888,33 @@ class RunStore:
             if row is None or row["run_id"] != run_id:
                 raise ConflictError(
                     f"unknown evidence id for run {run_id}: {evidence_id}"
+                )
+
+    @staticmethod
+    def _require_evidence_observations(
+        connection: sqlite3.Connection,
+        run_id: str,
+        evidence: Evidence,
+    ) -> None:
+        for observation_id in evidence.observation_ids:
+            row = connection.execute(
+                "SELECT * FROM web_search_observations WHERE id = ?",
+                (observation_id,),
+            ).fetchone()
+            if row is None:
+                raise ConflictError(
+                    f"unknown web-search observation: {observation_id}"
+                )
+            observation = RunStore._web_search_observation_from_row(row)
+            if (
+                observation.run_id != run_id
+                or observation.local_thread_id
+                != evidence.provenance.source_id
+                or observation.uri != evidence.source_uri
+            ):
+                raise ConflictError(
+                    "runtime_observed evidence does not match its web-search "
+                    f"observation: {observation_id}"
                 )
 
     @staticmethod
@@ -3897,6 +4368,7 @@ class RunStore:
                 if (
                     adjudication.outcome != "accept"
                     or decision_row is None
+                    or self._decision_from_row(decision_row).schema_version != 3
                     or not self._decision_from_row(decision_row).passed
                 ):
                     raise InvalidTransitionError(
@@ -3943,7 +4415,11 @@ class RunStore:
         decision_rows = connection.execute(
             "SELECT * FROM candidate_decisions WHERE run_id = ?", (run_id,)
         ).fetchall()
-        if not any(self._decision_from_row(row).passed for row in decision_rows):
+        if not any(
+            self._decision_from_row(row).schema_version == 3
+            and self._decision_from_row(row).passed
+            for row in decision_rows
+        ):
             raise InvalidTransitionError("completed run requires a code-passed decision")
         kinds = {
             row["kind"]
@@ -4008,6 +4484,17 @@ class RunStore:
             candidate_row = self._require_candidate_row(connection, candidate_id)
             if candidate_row["run_id"] != run_id or candidate_row["sealed_at"] is None:
                 continue
+            prover_thread_id = candidate_row["thread_id"]
+            if not isinstance(prover_thread_id, str):
+                continue
+            prover_thread = self._require_thread_row(connection, prover_thread_id)
+            prover_external_thread_id = prover_thread["external_thread_id"]
+            if (
+                ThreadRole(prover_thread["role"]) is not ThreadRole.PROVER
+                or not isinstance(prover_external_thread_id, str)
+                or not prover_external_thread_id
+            ):
+                continue
             reports = tuple(
                 self._verification_from_row(row).report
                 for row in report_rows
@@ -4020,7 +4507,11 @@ class RunStore:
                 if report.kind in required_kinds
                 and report.verifier_external_thread_id is not None
             }
-            if required_kinds.issubset(kinds) and len(external_ids) >= len(required_kinds):
+            if (
+                required_kinds.issubset(kinds)
+                and len(external_ids) >= len(required_kinds)
+                and prover_external_thread_id not in external_ids
+            ):
                 return True
         return False
 
@@ -4139,7 +4630,7 @@ class RunStore:
         report = VerificationReport.model_validate_json(row["report_json"])
         provenance = Provenance.model_validate_json(row["provenance_json"])
         _require_integrity(
-            canonical_sha256(report) == row["report_sha256"],
+            verification_report_sha256(report) == row["report_sha256"],
             f"verification hash mismatch: {row['id']}",
         )
         _require_integrity(
@@ -4272,10 +4763,29 @@ class RunStore:
     def _evidence_from_row(row: sqlite3.Row) -> Evidence:
         evidence = Evidence.model_validate_json(row["evidence_json"])
         _require_integrity(
-            canonical_sha256(evidence) == row["evidence_sha256"],
+            evidence_sha256(evidence) == row["evidence_sha256"],
             f"evidence hash mismatch: {row['id']}",
         )
         return evidence
+
+    @staticmethod
+    def _web_search_observation_from_row(
+        row: sqlite3.Row,
+    ) -> WebSearchObservation:
+        observation = WebSearchObservation.model_validate_json(
+            row["observation_json"]
+        )
+        _require_integrity(
+            observation.run_id == row["run_id"]
+            and observation.backend == row["backend"]
+            and observation.external_thread_id == row["external_thread_id"]
+            and observation.turn_id == row["turn_id"]
+            and observation.item_id == row["item_id"]
+            and observation.uri_sha256 == row["uri_sha256"]
+            and canonical_sha256(observation) == row["observation_sha256"],
+            f"web-search observation hash mismatch: {row['id']}",
+        )
+        return observation
 
     @staticmethod
     def _plan_from_row(row: sqlite3.Row) -> Plan:
@@ -4299,7 +4809,7 @@ class RunStore:
     def _decision_from_row(row: sqlite3.Row) -> CandidateDecision:
         decision = CandidateDecision.model_validate_json(row["decision_json"])
         _require_integrity(
-            canonical_sha256(decision) == row["decision_sha256"],
+            candidate_decision_sha256(decision) == row["decision_sha256"],
             f"candidate decision hash mismatch: {row['candidate_id']}",
         )
         return decision

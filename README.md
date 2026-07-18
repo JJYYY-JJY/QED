@@ -1,16 +1,21 @@
 # QED
 
+> **Release status:** `codex-native-rewrite` is a QED v2 alpha candidate. Review
+> the [alpha release boundary](docs/release-v2-alpha.md) before treating it as a
+> replacement for `main`.
+
 QED is a Codex-only mathematical research system for producing auditable proof
 candidates. It freezes the problem and run policy, records literature evidence,
-generates parallel candidates, sends each candidate to fresh verifier threads,
-and exports a proof, verification report, and machine-readable manifest.
+generates parallel candidates, sends each candidate to fresh
+conversation-isolated verifier threads, and exports a proof, verification
+report, and machine-readable manifest.
 
 This fork is maintained by Junye Ji and preserves the
 [upstream proofQED attribution](#upstream-attribution) and research archive.
 
 SQLite owns every transition and event sequence. Model output cannot mark a run
-complete. Application code computes PASS from immutable structured reports and
-checks their candidate and verifier lineage before export.
+complete. Application code computes QED policy PASS from immutable structured
+reports and checks their candidate and verifier lineage before export.
 
 ## Trust model
 
@@ -26,6 +31,16 @@ restricted literature network policy. Every turn attempt receives a distinct
 server-owned empty Git working directory. QED disables local shell, file,
 browser, code-mode, plugin, and hook capabilities and never requests
 full-access sandboxes or an approval bypass.
+
+A citation check counts only when its structured output binds an exact frozen
+proof span to an exact excerpt from a registered evidence record and its
+registered locator. Listing an evidence ID or mentioning a source in prose does
+not satisfy the gate. The byte binding is code-checked; semantic support remains
+an LLM judgment, and current evidence content is model-reported.
+
+Fresh threads isolate conversation state; they do not provide independent model
+weights. SHA-256 values provide content integrity and addressing, not an author
+signature or trusted timestamp.
 
 See [Architecture](docs/architecture.md) and the
 [Threat model](docs/threat-model.md) for the full boundary map.
@@ -125,11 +140,15 @@ A completed run writes:
 The manifest binds hashes for the input, configuration, evidence, plans,
 candidates, verifier reports, adjudications, code decisions, frozen turn
 inputs, thread provenance, proof-linked findings, and exported proof and report.
-It records the terminal `completed` run status and explicit code-derived `PASS`,
-plus output-schema hashes, turn/backend lineage, prompt versions, canonical
-runtime resolutions, execution segments, detailed usage and timing, and the
-ordered event-chain hash. Usage separates input, output, cached-input, and
-reasoning-output tokens, and records turn, search-query, and execution-time totals.
+It also records the run status and stage at the selected event-chain boundary.
+A normal export-intent bundle says `running/export`; SQLite remains authoritative
+for the later artifact registration and `complete/completed` transitions.
+The manifest separately records the code-derived machine verdict `PASS`,
+rendered for readers as QED policy PASS, plus output-schema hashes,
+turn/backend lineage, prompt versions, canonical runtime resolutions, execution
+segments, detailed usage and timing, and the ordered event-chain hash. Usage
+separates input, output, cached-input, and reasoning-output tokens, and records
+turn, search-query, and execution-time totals.
 
 ## Serve the API
 
@@ -205,7 +224,7 @@ flowchart LR
     A -->|new evidence| L
     A -->|new plan| P
     A -->|new attempt| C
-    A -->|code PASS| E[export]
+    A -->|QED policy PASS| E[export]
     E --> D[complete]
 ```
 
@@ -247,6 +266,30 @@ QED copies regular files into a content-addressed `legacy_untrusted` archive,
 rejects symbolic links, and leaves the source unchanged. It does not promote an
 old provider verdict into current state. Read [Migration](docs/migration.md)
 before changing retention for historical runs.
+
+## Reliability benchmark
+
+The frozen benchmark under [`benchmarks/reliability/`](benchmarks/reliability/)
+measures false QED policy PASS, true-proof acceptance, semantic-mutation detection,
+UNCERTAIN, and citation-support precision. Validate and run its credential-free
+demo fixture with:
+
+```bash
+uv run python benchmarks/reliability/run.py validate
+uv run python benchmarks/reliability/run.py summarize \
+  --results benchmarks/reliability/fixtures/demo-results.jsonl \
+  --expected-repetitions 1 \
+  --output-dir /tmp/qed-reliability-demo
+```
+
+The demo verdicts are fixture data, not model output or a product guarantee.
+For an authenticated repeated run, first use `run.py prepare`, then invoke the
+explicitly gated `qed_adapter.py` with a dedicated data root and either the SDK
+or App Server backend. The adapter preserves each supplied candidate as a
+synthetic-author benchmark fixture and exercises QED's normal verifier and
+decision path. See [Reliability benchmark](docs/reliability-benchmark.md).
+Use the adapter contract and reporting limits in
+[Reliability benchmark](docs/reliability-benchmark.md) for real repeated runs.
 
 ## Development
 
@@ -291,7 +334,7 @@ statements, expert commentary, and original mathematical skill artifact at
 | [`pde-Mar-23-2026`](proved_statements/pde-Mar-23-2026/) | The Carleman-weight result, workflow, and expert statement; its underlying proof remains unreleased. |
 
 These archives are historical evidence. QED does not import an upstream verdict
-as a current PASS.
+as a current QED policy PASS.
 
 The [legacy preservation map](docs/research/legacy-preservation-map.md) records
 the retained assets and the removed provider runtime.

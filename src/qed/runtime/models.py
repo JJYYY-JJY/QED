@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self, TypeVar
@@ -203,6 +204,7 @@ class ItemCompleted(_FrozenModel):
     item_id: str = Field(min_length=1)
     item_type: str = Field(min_length=1)
     payload: dict[str, Any]
+    completed_at: datetime | None = None
 
 
 class RuntimeErrorEvent(_FrozenModel):

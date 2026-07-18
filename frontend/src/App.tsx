@@ -545,7 +545,7 @@ function EmptyWorkspace({ navigationOpen, onMenu, onNew }: { navigationOpen: boo
       <button type="button" className="icon-button mobile-menu" onClick={onMenu} aria-label="Open run navigation" aria-controls="run-navigation" aria-expanded={navigationOpen}>☰</button>
       <div className="empty-record-mark" aria-hidden="true">QED</div>
       <h1>Begin with a mathematical problem</h1>
-      <p>Create a durable record that keeps literature, proof attempts, independent checks, and the final code decision together.</p>
+      <p>Create a durable record that keeps literature, proof attempts, thread-isolated checks, and the final code decision together.</p>
       <button type="button" className="primary-button" onClick={onNew}>Start a research run</button>
     </main>
   );

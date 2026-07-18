@@ -21,7 +21,10 @@ export function ActivityTimeline({ events, threads }: ActivityTimelineProps) {
       <header className="view-heading">
         <div>
           <h2>Activity and threads</h2>
-          <p>Store-assigned event sequence and independent Codex thread lifecycle.</p>
+          <p>
+            Store-assigned event sequence and Codex thread lifecycle.
+            Fresh means separate conversation state, not independent model weights.
+          </p>
         </div>
         <span>{events.length} durable event{events.length === 1 ? "" : "s"}</span>
       </header>

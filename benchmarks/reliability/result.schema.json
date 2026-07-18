@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/JJYYY-JJY/QED/benchmarks/reliability/result.schema.json",
+  "title": "QED reliability benchmark per-run result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "case_sha256",
+    "repetition",
+    "verdict",
+    "citation_support",
+    "runtime",
+    "started_at",
+    "finished_at",
+    "usage"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "case_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "repetition": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "verdict": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "UNCERTAIN"
+      ]
+    },
+    "citation_support": {
+      "enum": [
+        "SUPPORTED",
+        "UNSUPPORTED",
+        "UNCERTAIN",
+        "NOT_APPLICABLE"
+      ]
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtime"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finished_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "usage": {
+      "$ref": "#/$defs/usage"
+    },
+    "result_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adapter",
+        "backend",
+        "model",
+        "model_version",
+        "configuration_sha256",
+        "fixture"
+      ],
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "minLength": 1
+        },
+        "backend": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "configuration_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "fixture": {
+          "type": "boolean"
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "search_queries",
+        "execution_seconds",
+        "cost_amount",
+        "cost_currency",
+        "cost_source"
+      ],
+      "properties": {
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cached_input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reasoning_output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "search_queries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "execution_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cost_amount": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cost_currency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost_source": {
+          "enum": [
+            "provider_reported",
+            "operator_supplied",
+            "unavailable"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
@@ -241,6 +242,19 @@ class ExecRuntime:
                             item_id=item_id,
                             item_type=item_type,
                             payload=item,
+                            completed_at=(
+                                datetime.fromtimestamp(
+                                    completed_at_ms / 1000,
+                                    tz=UTC,
+                                )
+                                if isinstance(
+                                    completed_at_ms := event.get("completed_at_ms"),
+                                    int,
+                                )
+                                and not isinstance(completed_at_ms, bool)
+                                and completed_at_ms >= 0
+                                else None
+                            ),
                         )
                         continue
                     if event_type == "turn.completed":

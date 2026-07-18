@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -320,6 +321,78 @@ async def test_stream_enforces_controls_and_maps_terminal_output(
     assert turn_params["effort"] == "max"
     assert turn_params["cwd"] == str(TURN_CWD)
     assert "multiAgentMode" not in repr(transport.requests)
+
+
+async def test_stream_preserves_observed_web_search_uri_and_completion_time() -> None:
+    transport = FakeTransport(
+        {
+            "thread/start": [{"thread": {"id": "thread-search"}}],
+            "turn/start": [{"turn": {"id": "turn-search"}}],
+        },
+        notifications=[
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-search",
+                    "turnId": "turn-search",
+                    "completedAtMs": 1_000,
+                    "item": {
+                        "id": "item-search",
+                        "type": "webSearch",
+                        "query": "primary source",
+                        "action": {
+                            "type": "openPage",
+                            "url": "https://example.test/source",
+                        },
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-search",
+                    "turnId": "turn-search",
+                    "completedAtMs": 2_000,
+                    "item": {
+                        "id": "item-final",
+                        "type": "agentMessage",
+                        "text": "{}",
+                        "phase": "final_answer",
+                    },
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-search",
+                    "turn": {"id": "turn-search", "status": "completed"},
+                },
+            },
+        ],
+    )
+    runtime = AppServerRuntime(transport)
+    request = RunRequest(
+        model="gpt-5.6-sol",
+        effort="high",
+        prompt="Find a primary source.",
+        output_schema={"type": "object", "additionalProperties": False},
+        role=WorkRole.LITERATURE,
+        web_search=WebSearchMode.LIVE,
+        cwd=TURN_CWD,
+    )
+
+    events = [event async for event in runtime.stream(request)]
+    observed = next(
+        event
+        for event in events
+        if isinstance(event, ItemCompleted) and event.item_type == "webSearch"
+    )
+
+    assert observed.payload["action"] == {
+        "type": "openPage",
+        "url": "https://example.test/source",
+    }
+    assert observed.completed_at == datetime(1970, 1, 1, 0, 0, 1, tzinfo=UTC)
 
 
 async def test_interrupt_addresses_the_exact_app_server_turn() -> None:

@@ -14,7 +14,7 @@ from qed.cli import app
 from qed.config import QEDConfig
 from qed.inputs import RunInput
 from qed.logging import configure_logging, get_logger
-from qed.service import _default_mock_runtime, build_service
+from qed.service import _default_mock_runtime, build_mock_service
 from qed.service_settings import ServiceSettings
 
 _RUNNER = CliRunner()
@@ -65,7 +65,7 @@ def test_init_creates_managed_sqlite_store(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 4
     assert payload["journal_mode"] == "wal"
     assert (data_root / "qed.sqlite3").is_file()
 
@@ -101,7 +101,18 @@ def test_help_exposes_required_operational_commands() -> None:
     result = _RUNNER.invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    for command in ("init", "run", "status", "cancel", "resume", "serve", "migrate"):
+    for command in (
+        "init",
+        "run",
+        "status",
+        "cancel",
+        "resume",
+        "serve",
+        "migrate",
+        "doctor",
+        "reconcile",
+        "abandon",
+    ):
         assert command in result.stdout
 
 
@@ -128,6 +139,13 @@ def test_mock_run_completes_and_exports_a_reproducible_bundle(tmp_path: Path) ->
         "proof.md",
         "report.md",
     }
+    manifest_path = next(path for path in exported if path.name == "manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["runtime_version"] == "mock-runtime/1"
+    assert {item["runtime_version"] for item in manifest["execution_segments"]} == {
+        "mock-runtime/1"
+    }
+    assert {item["backend"] for item in manifest["turns"]} == {"mock"}
 
 
 def test_codex_run_scopes_runtime_state_to_managed_data_root(
@@ -151,8 +169,6 @@ def test_codex_run_scopes_runtime_state_to_managed_data_root(
             "Prove P.",
             "--run-id",
             "run-codex-home",
-            "--runtime",
-            "codex",
             "--data-root",
             str(tmp_path),
         ],
@@ -163,13 +179,20 @@ def test_codex_run_scopes_runtime_state_to_managed_data_root(
 
 
 def test_cancel_and_resume_commands_share_durable_service_state(tmp_path: Path) -> None:
-    service = build_service(ServiceSettings(data_root=tmp_path))
+    service = build_mock_service(ServiceSettings(data_root=tmp_path))
     service.create_run(RunInput(problem="Prove P."), QEDConfig(), run_id="run-cli")
     asyncio.run(service.close())
 
     cancelled = _RUNNER.invoke(
         app,
-        ["cancel", "run-cli", "--data-root", str(tmp_path)],
+        [
+            "cancel",
+            "run-cli",
+            "--runtime",
+            "mock",
+            "--data-root",
+            str(tmp_path),
+        ],
     )
     resumed = _RUNNER.invoke(
         app,
@@ -182,6 +205,61 @@ def test_cancel_and_resume_commands_share_durable_service_state(tmp_path: Path) 
     resumed_run = json.loads(resumed.stdout)["run"]
     assert resumed_run["resume_count"] == 1
     assert resumed_run["status"] == "completed"
+
+
+def test_doctor_reconcile_and_abandon_are_explicit_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    service = build_mock_service(ServiceSettings(data_root=tmp_path))
+    service.create_run(RunInput(problem="Prove P."), QEDConfig(), run_id="run-ops")
+    asyncio.run(service.close())
+
+    doctor = _RUNNER.invoke(
+        app,
+        ["doctor", "run-ops", "--data-root", str(tmp_path)],
+    )
+    reconcile = _RUNNER.invoke(
+        app,
+        ["reconcile", "run-ops", "--data-root", str(tmp_path)],
+    )
+    abandon = _RUNNER.invoke(
+        app,
+        [
+            "abandon",
+            "run-ops",
+            "--reason",
+            "Operator ended the exceptional run.",
+            "--idempotency-key",
+            "operator-ops-1",
+            "--data-root",
+            str(tmp_path),
+        ],
+    )
+    replay = _RUNNER.invoke(
+        app,
+        [
+            "abandon",
+            "run-ops",
+            "--reason",
+            "Operator ended the exceptional run.",
+            "--idempotency-key",
+            "operator-ops-1",
+            "--data-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert doctor.exit_code == 0, doctor.output
+    diagnosis = json.loads(doctor.stdout)
+    assert diagnosis["run"]["id"] == "run-ops"
+    assert diagnosis["reconciliation"]["available"] is False
+    assert diagnosis["blockers"]
+    assert reconcile.exit_code == 3, reconcile.output
+    assert json.loads(reconcile.stdout)["reconciliation"]["available"] is False
+    assert abandon.exit_code == 0, abandon.output
+    assert json.loads(abandon.stdout)["status_after"] == "failed"
+    assert replay.exit_code == 0, replay.output
+    assert json.loads(replay.stdout)["replayed"] is True
 
 
 def test_serve_rejects_non_loopback_bind_without_bearer_token(tmp_path: Path) -> None:

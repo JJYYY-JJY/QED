@@ -17,6 +17,16 @@ def test_run_input_is_strict_and_content_addressed() -> None:
 
     assert run_input.sha256 == canonical_sha256(run_input)
     assert run_input.sha256 == RunInput.model_validate_json(run_input.model_dump_json()).sha256
+    assert tuple(rule.id for rule in run_input.frozen_verification_rules) == (
+        "rule-001-50594f59ec05c66b",
+    )
+    assert run_input.frozen_verification_rules[0].text == (
+        "Check every quantified claim."
+    )
+    assert (
+        RunInput.model_validate_json(run_input.model_dump_json()).frozen_verification_rules
+        == run_input.frozen_verification_rules
+    )
 
     with pytest.raises(ValidationError):
         RunInput(

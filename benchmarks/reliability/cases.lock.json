@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "case_schema_sha256": "68fe1b9e7fb1ddfb3d924d77d35d44cd19bfd24b2a643574377136495f6efcd4",
+  "cases_file_sha256": "3b07ce9bc0af5c75b2f39288ba349eed4bb4ab25aeded6e4eb2877876bb3ab65",
+  "case_count": 19,
+  "case_hashes": {
+    "true-odd-sum-induction": "39771c2f74f18a6889382d8bcd2134f83aa97067632dbb815e4a303eb22abe6e",
+    "false-every-prime-odd": "60da39dee0d40a2f372a19fa3423a26166e7554190e8f3ca44c23c97f3fb6a06",
+    "missing-integral-domain-assumption": "5625f969869908a9260e5ae0733316e47a410d85609b568db11dade224948eaf",
+    "quantifier-swap-unbounded-integers": "23743ec8971cc0d2dd873655e7221e3cbaf27ef4219bb39f5dae1b6b1d851c9c",
+    "domain-error-square-root": "d777b8d8d11de7c2a78690efde553b809f4152fb1b32d0c41ea6513abea5a328",
+    "invalid-proof-sqrt-two": "02471849716c051ba6f81f9aa97bfd703c0088464d20182df43439bbe0a22b52",
+    "circular-infinitely-many-primes": "e6cd2f29793c8c4a2ca7cad4580a9704090be59630b784a1a99c94f98d8ae6c5",
+    "unproved-lemma-primes-one-mod-four": "cab1eb36745ac9f89dfe58c10716f8a887ddeae830792ae1e138553899f00763",
+    "invalid-limit-exchange-density": "76e9169f5cd0cfe25e48aedb0fec36fd570f5e0e1afe6b36432c846c8c69f570",
+    "wrong-inequality-harmonic-bound": "def4bc6f8c1ad4be4816ca85135a766e6795d4424d8cbdee7ecda602c4cbba40",
+    "omitted-zero-boundary-square": "107a7292e6a3d2cd34c7aab91775628ed4b9d65ec5638242282538fec26391d9",
+    "mutation-delete-induction-step": "afa873b6f34379b3ba970ed6978ed14f4bd9bbf683dbc4b8ac6711fbd45d31a8",
+    "mutation-swap-induction-quantifier": "3249036485685392ecdad2d7bc9354b54f72fe6bfc9287349dc4171df8b2c172",
+    "mutation-change-next-odd-symbol": "4a8f7c2a9ea786453598727edcd79f939404ae39f4e1bf662da34bab804e0392",
+    "mutation-replace-induction-assumption": "3a6e53f3e37d1dc753e86b71ab567423223a33f08517eb46b1b85d8dea166a29",
+    "citation-correct-zeta-two": "d856c4bcb20f2ebf4c07b4ef4753da1f906b24e6c0c9057a6c8b11c3b7dc42ed",
+    "citation-incorrect-zeta-value": "fd3c926d3edabb425ab1fd3d476e3bee3b07a343e5e1d234e42fb0feb7b12b89",
+    "citation-unrelated-square-root": "d7035e02040d082be9afa51a7d1b0d9c178f006bb264bd1fba01e88604c01524",
+    "citation-fabricated-evidence-id": "ef81f9bc36fcec8eac764342aae5d4f8dd50cb05e15686e22d12115bb2dd4e85"
+  }
+}

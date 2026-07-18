@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import errno
-import hashlib
 import os
 import re
 import stat
@@ -13,23 +12,38 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
+from typing import Literal
 
-from qed.decision import CandidateDecision, CandidateIntegrityError, decide_candidate
+from qed.decision import (
+    CandidateDecision,
+    CandidateIntegrityError,
+    candidate_decision_sha256,
+    decide_candidate,
+)
 from qed.schemas import (
     Event,
     Manifest,
     ManifestArtifact,
+    ManifestCitationSupport,
+    ManifestEvidenceProvenance,
     ManifestExecutionSegment,
     ManifestFinding,
+    ManifestOperatorDecision,
     ManifestRecord,
+    ManifestRuleCoverage,
     ManifestRuntimeResolution,
     ManifestThread,
     ManifestTurn,
     ManifestTurnInput,
     ManifestUsage,
+    ManifestVerificationRule,
+    ManifestWebSearchObservation,
     canonical_json,
     canonical_sha256,
+    event_chain_sha256,
+    evidence_sha256,
     sha256_text,
+    verification_report_sha256,
 )
 from qed.store import (
     CandidateRecord,
@@ -249,9 +263,40 @@ def _verify_snapshot(
     evidence_by_id = {item.id: item for item in snapshot.evidence}
     if len(evidence_by_id) != len(snapshot.evidence):
         raise ExportIntegrityError("snapshot contains duplicate evidence identities")
+    observations_by_id = {
+        item.id: item for item in snapshot.web_search_observations
+    }
+    if len(observations_by_id) != len(snapshot.web_search_observations):
+        raise ExportIntegrityError(
+            "snapshot contains duplicate web-search observation identities"
+        )
+    for observation in snapshot.web_search_observations:
+        if observation.run_id != run.id:
+            raise ExportIntegrityError(
+                f"web-search observation belongs to another run: {observation.id}"
+            )
+        if observation.uri_sha256 != sha256_text(observation.uri):
+            raise ExportIntegrityError(
+                f"web-search observation URI hash does not match: {observation.id}"
+            )
+        if observation.payload_sha256 != canonical_sha256(observation.payload):
+            raise ExportIntegrityError(
+                f"web-search observation payload hash does not match: {observation.id}"
+            )
     for item in snapshot.evidence:
         if item.content_sha256 != sha256_text(item.content):
             raise ExportIntegrityError(f"referenced evidence hash does not match: {item.id}")
+        for observation_id in item.observation_ids:
+            bound_observation = observations_by_id.get(observation_id)
+            if (
+                bound_observation is None
+                or bound_observation.uri != item.source_uri
+                or bound_observation.local_thread_id
+                != item.provenance.source_id
+            ):
+                raise ExportIntegrityError(
+                    f"evidence observation binding does not match: {item.id}"
+                )
 
     plans_by_id = {plan.id: plan for plan in snapshot.plans}
     if len(plans_by_id) != len(snapshot.plans):
@@ -310,7 +355,7 @@ def _verify_snapshot(
             raise ExportIntegrityError(f"report identity does not match record: {record.id}")
         if record.thread_id != report.verifier_thread_id or record.kind != report.kind:
             raise ExportIntegrityError(f"report metadata does not match record: {record.id}")
-        if record.report_sha256 != canonical_sha256(report):
+        if record.report_sha256 != verification_report_sha256(report):
             raise ExportIntegrityError(f"report hash does not match frozen report: {record.id}")
         if record.candidate_sha256 != frozen.proof_sha256:
             raise ExportIntegrityError(f"report candidate hash does not match: {record.id}")
@@ -397,6 +442,7 @@ def _render_report(
     snapshot: RunSnapshot,
     candidate: CandidateRecord,
     reports: tuple[VerificationRecord, ...],
+    decision: CandidateDecision,
 ) -> str:
     frozen = candidate.candidate
     required = (
@@ -408,14 +454,68 @@ def _render_report(
         )
     )
     lines = [
-        "# Verification report",
+        "# QED policy verification report",
         "",
         f"Run: `{snapshot.run.id}`  ",
         f"Candidate: `{frozen.id}`  ",
         f"Candidate SHA-256: `{candidate.candidate_sha256}`  ",
-        "Code-computed verdict: **PASS**  ",
+        "Code-computed verdict: **QED policy PASS**  ",
         "Required reports: " + ", ".join(f"`{kind}`" for kind in required),
+        "",
+        (
+            "This status means the candidate satisfied the configured code gates and "
+            "fresh-thread LLM checks. It is not peer review, formal or Lean verification, "
+            "or a guarantee of mathematical truth."
+        ),
+        (
+            "The manifest records the run state observed at its event-chain boundary; "
+            "QED policy PASS is not itself a completion receipt."
+        ),
+        (
+            "Fresh threads isolate conversation state, not model weights. SHA-256 values "
+            "provide integrity addressing, not signatures or trusted timestamps."
+        ),
     ]
+    if snapshot.evidence:
+        lines.extend(
+            [
+                "",
+                "## Evidence provenance",
+                "",
+                (
+                    "`runtime_observed` means QED observed the runtime open/find action "
+                    "for the exact URL. The locked Codex interfaces do not expose fetched "
+                    "page bodies or final redirect URLs, so evidence text remains "
+                    "`model_reported`; no source is labeled `server_captured`."
+                ),
+            ]
+        )
+        for evidence in snapshot.evidence:
+            lines.append(
+                f"- `{evidence.id}`: source `{evidence.source_trust.value}`; "
+                f"content `{evidence.content_trust.value}`"
+            )
+            if evidence.source_uri_sha256 is not None:
+                lines.append(
+                    f"  - Source URI SHA-256: `{evidence.source_uri_sha256}`"
+                )
+            if evidence.observation_ids:
+                lines.append(
+                    "  - Runtime observations: "
+                    + ", ".join(f"`{item}`" for item in evidence.observation_ids)
+                )
+    if snapshot.run_input is not None and snapshot.run_input.frozen_verification_rules:
+        lines.extend(["", "## Frozen verification rules", ""])
+        for rule in snapshot.run_input.frozen_verification_rules:
+            lines.append(f"- `{rule.id}`: {rule.text}")
+            coverage = tuple(
+                item for item in decision.rule_coverage if item.rule_id == rule.id
+            )
+            for item in coverage:
+                lines.append(
+                    f"  - `{item.report_id}` / `{item.check_id}`: "
+                    f"**{item.status.value.upper()}**"
+                )
     for record in reports:
         report = record.report
         lines.extend(
@@ -441,6 +541,19 @@ def _render_report(
                 lines.append("  - Proof spans: " + "; ".join(check.proof_spans))
             if check.evidence_ids:
                 lines.append("  - Evidence: " + ", ".join(check.evidence_ids))
+            if check.rule_ids:
+                lines.append(
+                    "  - Verification rules: " + ", ".join(check.rule_ids)
+                )
+            for support in check.citation_support:
+                lines.extend(
+                    [
+                        f"  - Citation support `{support.evidence_id}`:",
+                        f"    - Proof span: {support.proof_span}",
+                        f"    - Evidence excerpt: {support.evidence_excerpt}",
+                        f"    - Source locator: {support.source_locator}",
+                    ]
+                )
         if report.findings:
             lines.extend(["", "### Findings", ""])
             for finding in report.findings:
@@ -497,6 +610,9 @@ def _manifest_window(
     tuple[ExecutionLease, ...],
     tuple[RuntimeResolutionRecord, ...],
     datetime,
+    RunStatus,
+    RunStage,
+    Literal["snapshot", "export_intent"],
 ]:
     intents = tuple(
         output
@@ -511,6 +627,9 @@ def _manifest_window(
             snapshot.execution_segments,
             snapshot.runtime_resolutions,
             generated_at,
+            snapshot.run.status,
+            snapshot.run.stage,
+            "snapshot",
         )
     intent = intents[-1]
     marker = next(
@@ -536,15 +655,15 @@ def _manifest_window(
         for item in snapshot.runtime_resolutions
         if item.segment_id in segment_ids
     )
-    return events, segments, resolutions, intent.created_at
-
-
-def _event_chain_sha256(events: tuple[Event, ...]) -> str:
-    digest = hashlib.sha256()
-    for event in events:
-        digest.update(canonical_json(event).encode())
-        digest.update(b"\n")
-    return digest.hexdigest()
+    return (
+        events,
+        segments,
+        resolutions,
+        intent.created_at,
+        RunStatus.RUNNING,
+        RunStage.EXPORT,
+        "export_intent",
+    )
 
 
 def _manifest_usage(
@@ -723,7 +842,7 @@ def build_export_bundle(
     candidate_id: str,
     generated_at: datetime,
 ) -> ExportBundle:
-    """Build a verified proof/report/manifest bundle without filesystem effects."""
+    """Build a policy-checked proof/report/manifest bundle without filesystem effects."""
 
     if generated_at.tzinfo is None or generated_at.utcoffset() is None:
         raise ExportIntegrityError("generated_at must be timezone-aware")
@@ -735,12 +854,29 @@ def build_export_bundle(
         )
     )
     _verify_snapshot(snapshot, candidate, reports)
+    writer = next(
+        (
+            thread
+            for thread in snapshot.threads
+            if thread.id == candidate.thread_id
+        ),
+        None,
+    )
+    if writer is None or writer.external_thread_id is None:
+        raise ExportIntegrityError("candidate writer external identity is missing")
+    if snapshot.run_input is None:
+        raise ExportIntegrityError("snapshot is missing the typed run input")
+    required_rule_ids = tuple(
+        rule.id for rule in snapshot.run_input.frozen_verification_rules
+    )
     try:
         decision = decide_candidate(
             candidate.candidate,
             tuple(record.report for record in reports),
+            prover_external_thread_id=writer.external_thread_id,
             require_citation=bool(snapshot.evidence),
-            required_evidence_ids=tuple(item.id for item in snapshot.evidence),
+            required_evidence=snapshot.evidence,
+            required_rule_ids=required_rule_ids,
         )
     except CandidateIntegrityError as error:
         raise ExportIntegrityError(str(error)) from error
@@ -750,23 +886,61 @@ def build_export_bundle(
     _verify_acceptance(snapshot, candidate, decision)
 
     proof_md = _render_proof(candidate)
-    report_md = _render_report(snapshot, candidate, reports)
-    manifest_events, manifest_segments, manifest_resolutions, observed_at = (
-        _manifest_window(snapshot, generated_at)
-    )
+    report_md = _render_report(snapshot, candidate, reports, decision)
+    (
+        manifest_events,
+        manifest_segments,
+        manifest_resolutions,
+        observed_at,
+        observed_status,
+        observed_stage,
+        publication_phase,
+    ) = _manifest_window(snapshot, generated_at)
     manifest_turns = _manifest_turns(manifest_events)
     selected_turn_inputs = {turn.turn_input_id for turn in manifest_turns}
     manifest = Manifest(
         run_id=snapshot.run.id,
-        run_status=RunStatus.COMPLETED.value,
+        run_status=observed_status.value,
+        run_stage=observed_stage.value,
+        publication_phase=publication_phase,
         code_verdict="PASS",
         input_sha256=snapshot.run.input_sha256,
         config_sha256=snapshot.run.config_sha256,
         runtime_version=snapshot.run.runtime_version,
         prompt_versions=_prompt_versions(snapshot, candidate, reports),
         evidence_records=tuple(
-            ManifestRecord(id=item.id, sha256=canonical_sha256(item))
+            ManifestRecord(id=item.id, sha256=evidence_sha256(item))
             for item in sorted(snapshot.evidence, key=lambda item: item.id)
+        ),
+        evidence_provenance=tuple(
+            ManifestEvidenceProvenance(
+                evidence_id=item.id,
+                schema_version=item.schema_version,
+                source_trust=item.source_trust,
+                content_trust=item.content_trust,
+                observation_ids=item.observation_ids,
+                source_uri_sha256=item.source_uri_sha256,
+            )
+            for item in sorted(snapshot.evidence, key=lambda item: item.id)
+        ),
+        web_search_observations=tuple(
+            ManifestWebSearchObservation(
+                id=item.id,
+                backend=item.backend,
+                local_thread_id=item.local_thread_id,
+                external_thread_id=item.external_thread_id,
+                turn_id=item.turn_id,
+                item_id=item.item_id,
+                action_type=item.action_type,
+                uri=item.uri,
+                uri_sha256=item.uri_sha256,
+                payload_sha256=item.payload_sha256,
+                captured_at=item.captured_at,
+            )
+            for item in sorted(
+                snapshot.web_search_observations,
+                key=lambda item: (item.captured_at, item.id),
+            )
         ),
         plan_records=tuple(
             ManifestRecord(id=item.id, sha256=canonical_sha256(item))
@@ -788,7 +962,10 @@ def build_export_bundle(
             for item in sorted(snapshot.adjudications, key=lambda item: item.id)
         ),
         decision_records=tuple(
-            ManifestRecord(id=item.candidate_id, sha256=canonical_sha256(item))
+            ManifestRecord(
+                id=item.candidate_id,
+                sha256=candidate_decision_sha256(item),
+            )
             for item in sorted(snapshot.decisions, key=lambda item: item.candidate_id)
         ),
         runtime_resolutions=tuple(
@@ -845,6 +1022,51 @@ def build_export_bundle(
             for record in sorted(snapshot.verifications, key=lambda item: item.id)
             for finding in sorted(record.report.findings, key=lambda item: item.id)
         ),
+        citation_support=tuple(
+            ManifestCitationSupport(
+                report_id=record.id,
+                check_id=check.id,
+                evidence_id=support.evidence_id,
+                proof_span=support.proof_span,
+                evidence_excerpt=support.evidence_excerpt,
+                source_locator=support.source_locator,
+                sha256=canonical_sha256(support),
+            )
+            for record in sorted(snapshot.verifications, key=lambda item: item.id)
+            for check in sorted(record.report.checks, key=lambda item: item.id)
+            for support in check.citation_support
+        ),
+        operator_decisions=tuple(
+            ManifestOperatorDecision(
+                action="abandon",
+                idempotency_key=str(event.payload["idempotency_key"]),
+                reason=str(event.payload["reason"]),
+                status_before=str(event.payload["from"]),  # type: ignore[arg-type]
+                status_after=str(event.payload["to"]),  # type: ignore[arg-type]
+                event_seq=event.seq,
+                event_sha256=canonical_sha256(event),
+                created_at=event.created_at,
+            )
+            for event in manifest_events
+            if event.event_type == "operator.run_abandoned"
+        ),
+        verification_rules=tuple(
+            ManifestVerificationRule(
+                id=rule.id,
+                text=rule.text,
+                responsible_report_kinds=decision.required_kinds,
+                coverage=tuple(
+                    ManifestRuleCoverage(
+                        report_id=coverage.report_id,
+                        check_id=coverage.check_id,
+                        status=coverage.status,
+                    )
+                    for coverage in decision.rule_coverage
+                    if coverage.rule_id == rule.id
+                ),
+            )
+            for rule in snapshot.run_input.frozen_verification_rules
+        ),
         usage=_manifest_usage(
             manifest_events,
             manifest_segments,
@@ -879,7 +1101,7 @@ def build_export_bundle(
         ),
         first_event_seq=manifest_events[0].seq,
         last_event_seq=manifest_events[-1].seq,
-        event_chain_sha256=_event_chain_sha256(manifest_events),
+        event_chain_sha256=event_chain_sha256(manifest_events),
         generated_at=generated_at,
     )
     manifest_json = f"{canonical_json(manifest)}\n"

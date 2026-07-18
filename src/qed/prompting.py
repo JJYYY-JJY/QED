@@ -26,13 +26,23 @@ ROLE_POLICY: dict[TurnRole, str] = {
     "planning": "Build a dependency-aware proof plan from the frozen problem and evidence.",
     "proof": "Produce one proof candidate. Do not claim verification or final acceptance.",
     "structural_verifier": (
-        "Independently check target alignment, coverage, dependencies, and proof architecture."
+        "Independently check target alignment, coverage, dependencies, and proof architecture. "
+        "For every frozen verification rule you actually test, attach its application-assigned "
+        "rule ID to the corresponding structured check."
     ),
     "detailed_verifier": (
-        "Independently check each inference, hypothesis, quantifier, estimate, and edge case."
+        "Independently check each inference, hypothesis, quantifier, estimate, and edge case. "
+        "For every frozen verification rule you actually test, attach its application-assigned "
+        "rule ID to the corresponding structured check."
     ),
     "citation_verifier": (
-        "Independently check that cited sources support the exact claims attributed to them."
+        "Independently check that cited sources support the exact claims attributed to them. "
+        "For each supported claim, emit structured citation_support containing an exact "
+        "proof span, an exact excerpt from the registered evidence content, that evidence ID, "
+        "and its registered source URI (or evidence:<id> when no URI is registered). "
+        "Evidence IDs or free-text summaries without this structured link do not count. "
+        "For every frozen verification rule you actually test, attach its application-assigned "
+        "rule ID to the corresponding structured check."
     ),
     "adjudication": (
         "Recommend a revision path from frozen reports. You cannot set the final PASS value."

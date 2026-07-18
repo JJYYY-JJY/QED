@@ -2,6 +2,7 @@ import { titleCase } from "../format";
 
 interface StatusBadgeProps {
   value: string;
+  label?: string;
   tone?: "neutral" | "progress" | "success" | "warning" | "danger";
 }
 
@@ -18,6 +19,6 @@ function inferredTone(value: string): NonNullable<StatusBadgeProps["tone"]> {
   return "neutral";
 }
 
-export function StatusBadge({ value, tone = inferredTone(value) }: StatusBadgeProps) {
-  return <span className={`status-badge status-${tone}`}>{titleCase(value)}</span>;
+export function StatusBadge({ value, label, tone = inferredTone(value) }: StatusBadgeProps) {
+  return <span className={`status-badge status-${tone}`}>{label ?? titleCase(value)}</span>;
 }

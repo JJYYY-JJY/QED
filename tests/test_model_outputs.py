@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -19,7 +20,16 @@ from qed.model_outputs import (
     materialize_plan,
     materialize_report,
 )
-from qed.schemas import CheckStatus, Provenance, sha256_text
+from qed.schemas import (
+    CheckStatus,
+    Evidence,
+    EvidenceTrust,
+    Provenance,
+    WebSearchObservation,
+    canonical_sha256,
+    evidence_sha256,
+    sha256_text,
+)
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 PROBLEM_SHA = sha256_text("Prove that there are infinitely many primes.")
@@ -125,6 +135,94 @@ def test_application_materializes_stable_evidence_plan_and_candidate_authority()
     assert candidate.proof_sha256 == sha256_text(proof_draft.proof)
 
 
+def test_evidence_trust_requires_an_exact_runtime_observed_uri_match() -> None:
+    payload = {
+        "id": "item-open",
+        "type": "webSearch",
+        "query": "Euclid primary source",
+        "action": {
+            "type": "openPage",
+            "url": "https://example.test/euclid",
+        },
+    }
+    observation = WebSearchObservation(
+        id="observation-1",
+        run_id="run-1",
+        backend="app_server",
+        local_thread_id="literature-thread",
+        external_thread_id="codex-literature-thread",
+        turn_id="turn-1",
+        item_id="item-open",
+        action_type="open_page",
+        uri="https://example.test/euclid",
+        uri_sha256=sha256_text("https://example.test/euclid"),
+        payload=payload,
+        payload_sha256=canonical_sha256(payload),
+        captured_at=NOW,
+    )
+    batch = EvidenceBatch(
+        items=(
+            EvidenceDraft(
+                kind="source",
+                title="Observed source",
+                content="Model-reported excerpt from the source.",
+                source_uri="https://example.test/euclid",
+            ),
+            EvidenceDraft(
+                kind="source",
+                title="Unobserved source",
+                content="Another model-reported excerpt.",
+                source_uri="https://example.test/unobserved",
+            ),
+        )
+    )
+
+    observed, unobserved = materialize_evidence(
+        batch,
+        provenance("literature-thread"),
+        observations=(observation,),
+    )
+
+    assert observed.source_trust is EvidenceTrust.RUNTIME_OBSERVED
+    assert observed.content_trust is EvidenceTrust.MODEL_REPORTED
+    assert observed.observation_ids == ("observation-1",)
+    assert observed.source_uri_sha256 == sha256_text(observed.source_uri or "")
+    assert unobserved.source_trust is EvidenceTrust.MODEL_REPORTED
+    assert unobserved.content_trust is EvidenceTrust.MODEL_REPORTED
+    assert unobserved.observation_ids == ()
+    with pytest.raises(
+        ValidationError,
+        match="cannot produce server_captured evidence",
+    ):
+        Evidence.model_validate(
+            {
+                **observed.model_dump(mode="python"),
+                "source_trust": EvidenceTrust.SERVER_CAPTURED,
+            }
+        )
+
+
+def test_schema_v1_evidence_remains_legacy_untrusted_and_keeps_its_old_hash() -> None:
+    payload = {
+        "schema_version": 1,
+        "id": "legacy-evidence",
+        "kind": "note",
+        "title": "Imported record",
+        "content": "Historical model-reported content.",
+        "content_sha256": sha256_text("Historical model-reported content."),
+        "provenance": provenance("legacy-thread").model_dump(mode="json"),
+        "source_uri": "https://example.test/legacy",
+        "citation": None,
+    }
+
+    evidence = Evidence.model_validate_json(json.dumps(payload), strict=True)
+
+    assert evidence.source_trust is EvidenceTrust.LEGACY_UNTRUSTED
+    assert evidence.content_trust is EvidenceTrust.LEGACY_UNTRUSTED
+    assert evidence.observation_ids == ()
+    assert evidence_sha256(evidence) == canonical_sha256(payload)
+
+
 def test_application_materializes_report_and_code_derives_verdict() -> None:
     proof = ProofDraft(proof="A proposed proof.")
     candidate = materialize_candidate(
@@ -143,6 +241,7 @@ def test_application_materializes_report_and_code_derives_verdict() -> None:
                 status=CheckStatus.FAIL,
                 summary="The main implication is reversed.",
                 proof_spans=("therefore",),
+                rule_ids=("rule-001-50594f59ec05c66b",),
             ),
         ),
         findings=(
@@ -168,4 +267,5 @@ def test_application_materializes_report_and_code_derives_verdict() -> None:
 
     assert report.id.startswith("verification-detailed-")
     assert report.candidate_sha256 == candidate.proof_sha256
+    assert report.checks[0].rule_ids == ("rule-001-50594f59ec05c66b",)
     assert report.verdict.value == "fail"

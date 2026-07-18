@@ -17,14 +17,14 @@ export function ArtifactList({ artifacts }: ArtifactListProps) {
       <header className="view-heading">
         <div>
           <h2>Reproducible artifacts</h2>
-          <p>Proof, independent report, and manifest files registered in the durable run record.</p>
+          <p>Proof, verifier report, and manifest files registered in the durable run record.</p>
         </div>
         <span>{artifacts.length} file{artifacts.length === 1 ? "" : "s"}</span>
       </header>
       {artifacts.length === 0 ? (
         <div className="view-empty">
           <h3>Export has not completed</h3>
-          <p>Accepted runs register content hashes and relative paths after the bundle is written atomically.</p>
+          <p>Completed exports register content hashes and relative paths after the bundle is written atomically.</p>
         </div>
       ) : (
         <ul className="artifact-list">

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
@@ -191,6 +192,14 @@ class SdkRuntime:
                         item_id=item_id,
                         item_type=item_type,
                         payload=completed.item,
+                        completed_at=(
+                            datetime.fromtimestamp(
+                                completed.completed_at_ms / 1000,
+                                tz=UTC,
+                            )
+                            if completed.completed_at_ms is not None
+                            else None
+                        ),
                     )
                     continue
                 if method == "thread/tokenUsage/updated":

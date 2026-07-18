@@ -17,11 +17,13 @@ from qed.config import QEDConfig
 from qed.inputs import RunInput
 from qed.logging import get_logger
 from qed.migration import ImportedLegacyRun, import_legacy_run
+from qed.operations import RunDiagnosis, diagnose_run
 from qed.runtime import CodexRuntime, MockRuntime, RuntimeCapabilities
 from qed.schemas import Event
 from qed.service_settings import ServiceSettings
 from qed.store import (
     ConflictError,
+    OperatorDecisionRecord,
     RunRecord,
     RunSnapshot,
     RunStatus,
@@ -55,13 +57,25 @@ class WorkflowService(Protocol):
 
 def _default_mock_runtime() -> MockRuntime:
     def verification_response(request: Any) -> dict[str, Any]:
+        start = request.prompt.index('<frozen-input encoding="canonical-json">')
+        start = request.prompt.index("\n", start) + 1
+        end = request.prompt.index("\n</frozen-input>", start)
+        payload = json.loads(request.prompt[start:end])
+        rule_ids = [item["id"] for item in payload["verification_rules"]]
         evidence_ids: list[str] = []
+        citation_support: list[dict[str, str]] = []
         if request.role.value == "citation":
-            start = request.prompt.index('<frozen-input encoding="canonical-json">')
-            start = request.prompt.index("\n", start) + 1
-            end = request.prompt.index("\n</frozen-input>", start)
-            payload = json.loads(request.prompt[start:end])
             evidence_ids = [item["id"] for item in payload["evidence"]]
+            proof_span = payload["candidate"]["proof"]
+            citation_support = [
+                {
+                    "evidence_id": item["id"],
+                    "proof_span": proof_span,
+                    "evidence_excerpt": item["content"],
+                    "source_locator": item.get("source_uri") or f"evidence:{item['id']}",
+                }
+                for item in payload["evidence"]
+            ]
         return {
             "schema_version": 1,
             "checks": [
@@ -73,6 +87,8 @@ def _default_mock_runtime() -> MockRuntime:
                         "The deterministic mock fixture is internally consistent."
                     ),
                     "evidence_ids": evidence_ids,
+                    "rule_ids": rule_ids,
+                    "citation_support": citation_support,
                 }
             ],
         }
@@ -129,21 +145,17 @@ def build_service(
     runtime_factory: RuntimeFactory | None = None,
     runtime_version: str | None = None,
 ) -> ApplicationService:
-    """Construct managed state with a mock runtime unless a factory is explicit."""
+    """Construct managed state around an explicitly selected production runtime."""
 
     if runtime_factory is None:
-        runtime: CodexRuntime = _default_mock_runtime()
-        selected_version = runtime_version or "mock-runtime/1"
-    else:
-        runtime = runtime_factory(settings.codex_home)
-        observed_version = getattr(runtime, "runtime_version", None)
-        if runtime_version is None and (
-            not isinstance(observed_version, str) or not observed_version.strip()
-        ):
-            raise ValueError(
-                "a non-mock runtime must report its observed runtime_version"
-            )
-        selected_version = cast(str, runtime_version or observed_version)
+        raise ValueError("runtime_factory is required for production service construction")
+    runtime = runtime_factory(settings.codex_home)
+    observed_version = getattr(runtime, "runtime_version", None)
+    if runtime_version is None and (
+        not isinstance(observed_version, str) or not observed_version.strip()
+    ):
+        raise ValueError("a production runtime must report its observed runtime_version")
+    selected_version = cast(str, runtime_version or observed_version)
     store = RunStore(settings.database_path)
     workflow = ResearchWorkflow(
         store,
@@ -155,6 +167,29 @@ def build_service(
         store=store,
         workflow=workflow,
         runtime=runtime,
+        managed_root=settings.data_root,
+    )
+
+
+def build_mock_service(
+    settings: ServiceSettings,
+) -> ApplicationService:
+    """Construct the deterministic test/development service explicitly."""
+
+    return build_service(
+        settings,
+        runtime_factory=lambda _codex_home: _default_mock_runtime(),
+        runtime_version="mock-runtime/1",
+    )
+
+
+def build_management_service(settings: ServiceSettings) -> ApplicationService:
+    """Construct the same application layer without enabling research execution."""
+
+    return ApplicationService(
+        store=RunStore(settings.database_path),
+        workflow=None,
+        runtime=None,
         managed_root=settings.data_root,
     )
 
@@ -192,8 +227,8 @@ class ApplicationService:
         self,
         *,
         store: RunStore,
-        workflow: WorkflowService,
-        runtime: CodexRuntime,
+        workflow: WorkflowService | None,
+        runtime: CodexRuntime | None,
         managed_root: str | Path | None = None,
     ) -> None:
         self._store = store
@@ -208,6 +243,13 @@ class ApplicationService:
         self._executing_run_limits: dict[str, int] = {}
         self._queued_runs: set[str] = set()
 
+    def _require_workflow(self) -> WorkflowService:
+        if self._workflow is None:
+            raise RuntimeError(
+                "research execution is unavailable from a management-only service"
+            )
+        return self._workflow
+
     def create_run(
         self,
         run_input: RunInput,
@@ -215,7 +257,11 @@ class ApplicationService:
         *,
         run_id: str,
     ) -> RunRecord:
-        created = self._workflow.create_run(run_input, config, run_id=run_id)
+        created = self._require_workflow().create_run(
+            run_input,
+            config,
+            run_id=run_id,
+        )
         _LOGGER.info("run.created", run_id=run_id)
         return created
 
@@ -239,6 +285,28 @@ class ApplicationService:
             file_count=len(imported.manifest.files),
         )
         return imported
+
+    def diagnose_run(self, run_id: str) -> RunDiagnosis:
+        return diagnose_run(self._store, run_id)
+
+    def abandon_run(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        idempotency_key: str,
+    ) -> OperatorDecisionRecord:
+        decision = self._store.abandon_run(
+            run_id,
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+        _LOGGER.warning(
+            "run.operator_abandoned",
+            run_id=run_id,
+            event_seq=decision.event_seq,
+        )
+        return decision
 
     async def stream_events(
         self,
@@ -288,16 +356,18 @@ class ApplicationService:
     async def start_run(self, run_id: str, *, idempotency_key: str) -> CommandReceipt:
         """Schedule one worker, returning the same receipt for a repeated command."""
 
+        workflow = self._require_workflow()
         return await self._schedule(
             run_id,
             command="start",
             idempotency_key=idempotency_key,
-            operation_factory=lambda: self._workflow.execute(run_id),
+            operation_factory=lambda: workflow.execute(run_id),
         )
 
     async def cancel_run(self, run_id: str, *, idempotency_key: str) -> CommandReceipt:
         """Ask orchestration to interrupt active turns and persist cancellation."""
 
+        workflow = self._require_workflow()
         if _COMMAND_KEY.fullmatch(idempotency_key) is None:
             raise ValueError("idempotency_key has an invalid format")
         self._store.get_run(run_id)
@@ -331,7 +401,7 @@ class ApplicationService:
                 self._queued_runs.discard(run_id)
                 queued.cancel()
                 await asyncio.gather(queued, return_exceptions=True)
-            cancelled = await self._workflow.cancel(run_id)
+            cancelled = await workflow.cancel(run_id)
             if cancelled.status is not RunStatus.CANCELLED:
                 raise RuntimeError(
                     f"cancel command did not reach cancelled state: {cancelled.status.value}"
@@ -343,11 +413,12 @@ class ApplicationService:
     async def resume_run(self, run_id: str, *, idempotency_key: str) -> CommandReceipt:
         """Schedule one durable resume attempt through orchestration."""
 
+        workflow = self._require_workflow()
         return await self._schedule(
             run_id,
             command="resume",
             idempotency_key=idempotency_key,
-            operation_factory=lambda: self._workflow.execute(run_id),
+            operation_factory=lambda: workflow.execute(run_id),
         )
 
     async def wait(self, run_id: str) -> RunRecord:
@@ -498,7 +569,8 @@ class ApplicationService:
                 await workflow_close()
         finally:
             try:
-                await self._runtime.close()
+                if self._runtime is not None:
+                    await self._runtime.close()
             finally:
                 self._store.close()
         _LOGGER.info("service.closed")

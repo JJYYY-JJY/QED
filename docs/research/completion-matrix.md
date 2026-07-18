@@ -2,6 +2,13 @@
 
 Last updated: 2026-07-17
 
+> **Archived baseline.** The historical body below is preserved as recorded at
+> `0e25ceded8c3f0d2181ef8009d99787e0f21783d` before the v2 alpha closeout.
+> Its “final working tree” wording and test counts describe that earlier
+> snapshot, not the current candidate. Use the
+> [v2 alpha release boundary](../release-v2-alpha.md) and a fresh verification
+> log for current review evidence.
+
 This matrix records the evidence available in the final working tree. `Cleared`
 means the implementation and its scoped check are present. All forty-two rows
 are cleared on the local `codex-native-rewrite` candidate; nothing was pushed.

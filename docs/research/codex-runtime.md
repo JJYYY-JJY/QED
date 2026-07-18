@@ -149,6 +149,35 @@ OpenAI documents the item lifecycle as `item/started`, zero or more deltas, then
 
 `turn/interrupt` returns after App Server accepts the request. Wait for `turn/completed` with status `interrupted` before committing QED's cancellation transition.
 
+### Web-search evidence available to the locked adapters
+
+The locked `openai-codex 0.1.0b3` models and CLI `0.137.0a4` events expose a
+web-search query/action payload. Open/find actions can include a URL. The
+published types do not expose the fetched response body, a verified excerpt, or
+the final redirect URI. The App Server and exec adapters preserve the same
+action payload rather than claiming fields that the protocol did not return.
+
+QED can therefore register the observed backend, external thread, turn, item,
+action, URL, capture time, and application-computed URL/payload hashes. It labels
+a model evidence URI `runtime_observed` only when that exact URL appeared in an
+open/find action from the same literature turn. Titles, citation strings, and
+evidence content remain `model_reported`. QED does not use
+`server_captured` under this interface. A future upgrade may use that label only
+after an official event supplies fetched bytes or a service-authenticated
+excerpt and the application hashes those bytes.
+
+Citation verification therefore uses a narrower code-enforced contract. A
+citation check must name a registered evidence ID and include an exact proof
+span, exact excerpt from that evidence record, and the registered URI (or its
+ledger locator when no URI exists). QED validates those byte anchors and exports
+their hashes. It does not promote the evidence content above `model_reported`,
+and the verifier's judgment that the excerpt supports the proof claim remains
+an LLM judgment rather than server-attested entailment.
+
+This boundary follows the official item lifecycle and the installed,
+version-locked generated types. It does not infer undocumented fetch state from
+an assistant message.
+
 ## Structured outputs
 
 **Documented.** Python `Thread.run(..., output_schema=<dict>)`, App Server `turn/start.outputSchema`, and `codex exec --output-schema <file>` constrain the final assistant message to a JSON Schema. See the [App Server turn example](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#example-start-a-turn-send-user-input) and [non-interactive structured outputs](https://learn.chatgpt.com/docs/non-interactive-mode#create-structured-outputs-with-a-schema).

@@ -29,8 +29,8 @@ export function CandidateWorkspace({
         <div className="empty-glyph" aria-hidden="true">∎</div>
         <h2>No sealed proof candidate yet</h2>
         <p>
-          QED will preserve each completed attempt here, then attach fresh structural,
-          detailed, and citation reports to the frozen proof.
+          QED will preserve each completed attempt here, then attach structural,
+          detailed, and citation reports from fresh verifier threads to the sealed proof.
         </p>
         {latestPlan && (
           <div className="pending-plan">
@@ -62,7 +62,14 @@ export function CandidateWorkspace({
                 onClick={() => onSelectCandidate(item.id)}
               >
                 <span>Candidate {item.attempt}</span>
-                {itemDecision ? <StatusBadge value={itemDecision.passed ? "pass" : "fail"} /> : <span className="candidate-state">Awaiting decision</span>}
+                {itemDecision
+                  ? (
+                    <StatusBadge
+                      value={itemDecision.passed ? "pass" : "fail"}
+                      label={itemDecision.passed ? "QED policy PASS" : "QED policy NOT PASSED"}
+                    />
+                  )
+                  : <span className="candidate-state">Awaiting decision</span>}
               </button>
             );
           })}
@@ -88,10 +95,12 @@ export function CandidateWorkspace({
         <div>
           <span className="decision-mark" aria-hidden="true">{decision?.passed ? "✓" : decision ? "×" : "·"}</span>
           <div>
-            <strong>{decision ? (decision.passed ? "PASS" : "NOT PASSED") : "Decision pending"}</strong>
+            <strong>{decision ? (decision.passed ? "QED policy PASS" : "QED policy NOT PASSED") : "Decision pending"}</strong>
             <span>
               {decision
-                ? `${decision.report_ids.length} independent reports · code-computed from frozen inputs`
+                ? decision.passed
+                  ? `${decision.report_ids.length} required reports · Passed configured thread-isolated LLM checks and code gates. This is not peer review, formal verification, Lean verification, or a guarantee of mathematical truth.`
+                  : `${decision.report_ids.length} required reports · Did not pass the configured LLM checks and code gates. This is not a mathematical truth verdict.`
                 : "QED has not recorded the code-computed decision."}
             </span>
           </div>
@@ -99,11 +108,18 @@ export function CandidateWorkspace({
         {decision && decision.reasons.length > 0 && <span>{decision.reasons.length} blocking reason{decision.reasons.length === 1 ? "" : "s"}</span>}
       </section>
 
-      <section className="verification-bar" aria-label="Independent verification reports">
+      <section className="verification-bar" aria-label="Thread-isolated verifier reports">
         <div className="verification-heading">
-          <h3>Independent verification</h3>
-          <span>{reports.length} independent report{reports.length === 1 ? "" : "s"}</span>
+          <h3>Thread-isolated verification</h3>
+          <span>
+            {decision
+              ? `${decision.report_ids.length} required reports`
+              : `${reports.length} verifier report${reports.length === 1 ? "" : "s"}`}
+          </span>
         </div>
+        <p className="verification-scope">
+          Fresh verifier threads isolate conversation state; they do not imply independent model weights.
+        </p>
         <div className="report-buttons">
           {reports.length === 0 ? (
             <p className="inline-empty">Fresh verifier threads have not reported yet.</p>
@@ -167,7 +183,7 @@ export function CandidateWorkspace({
       <section className="cited-evidence">
         <div className="section-row-heading">
           <h3>Cited evidence</h3>
-          <span>{evidence.length} source{evidence.length === 1 ? "" : "s"}</span>
+          <span>{evidence.length} evidence record{evidence.length === 1 ? "" : "s"}</span>
         </div>
         {evidence.length === 0 ? (
           <p className="inline-empty">This candidate does not claim external evidence.</p>
@@ -179,7 +195,7 @@ export function CandidateWorkspace({
                   <span className="evidence-kind">{titleCase(item.kind)}</span>
                   <span>
                     <strong>{item.title}</strong>
-                    <small>{item.citation ?? item.provenance.source}</small>
+                    <small>{item.citation ?? "No citation recorded"}</small>
                   </span>
                   <span className="mono">{shortHash(item.content_sha256)}</span>
                 </button>

@@ -41,7 +41,7 @@ QED has no separate liveness endpoint. A successful capabilities response
 proves that FastAPI can serve requests; the first run also probes Codex model
 and feature capabilities.
 
-## Opt-in real Codex smoke test
+## Opt-in real Codex tests
 
 The `real_codex` test makes an authenticated remote model call. It consumes
 network access, model quota, time, and potentially billable usage. Run it only
@@ -59,13 +59,55 @@ QED_CODEX="$(uv run python -c \
 CODEX_HOME="$QED_REAL_CODEX_HOME" "$QED_CODEX" login
 
 export QED_RUN_REAL_CODEX=1
-uv run --frozen pytest -m real_codex tests/test_real_codex.py
+uv run --frozen pytest -m real_codex \
+  tests/test_real_codex.py \
+  -k schema_constrained_offline_turn
 ```
 
-The test probes the exact `gpt-5.6-sol` catalog entry with the explicitly
-supported `low` effort, then uses QED's official SDK route for one fresh,
-read-only, offline, strict JSON-Schema turn. Without the opt-in switch and both
-existing absolute directories, the test skips before constructing a runtime.
+The minimal cases probe the exact `gpt-5.6-sol` catalog entry with the supported
+`low` effort, then run one fresh, read-only, offline,
+JSON-Schema-constrained turn through the SDK and App Server routes. The exec
+fallback requires another switch:
+
+```bash
+export QED_RUN_REAL_CODEX_EXEC=1
+uv run --frozen pytest -m real_codex \
+  tests/test_real_codex.py \
+  -k authenticated_exec
+```
+
+The full lifecycle case runs literature, planning, two proof candidates,
+structural, detailed, and citation verification, adjudication, and export. It
+recomputes proof, report, research-record, manifest, and event-chain hashes and
+checks the persisted external thread identities:
+
+```bash
+export QED_RUN_REAL_CODEX_LIFECYCLE=1
+export QED_REAL_CODEX_LIFECYCLE_BACKEND=sdk  # or app-server
+uv run --frozen pytest -m real_codex \
+  tests/test_real_codex.py \
+  -k full_research_lifecycle
+```
+
+These cases spend quota and may incur cost. Without the base opt-in switch and
+both existing absolute directories, they skip before runtime construction.
+The lifecycle and exec cases require their own switches in addition to
+`QED_RUN_REAL_CODEX=1`.
+
+The reliability benchmark has a separate spend guard because it runs the
+frozen case grid, often with several repetitions:
+
+```bash
+QED_RUN_REAL_RELIABILITY_BENCHMARK=1 \
+  uv run python benchmarks/reliability/qed_adapter.py \
+  --requests /tmp/qed-reliability-requests.jsonl \
+  --output /tmp/qed-reliability-sdk-results.jsonl \
+  --data-root /tmp/qed-reliability-sdk \
+  --backend sdk
+```
+
+Use a different dedicated data root for the App Server adapter. No benchmark
+command reads personal `~/.codex`.
 
 ## Remote bind
 
@@ -148,6 +190,34 @@ Reuse a command's idempotency key when a transport failure leaves its response
 unknown. Choose a new key when you intend a new resume attempt. The service
 queues accepted run workers when active run configurations leave no capacity.
 
+Inspect a run that cannot resume:
+
+```bash
+uv run qed doctor odd-square-001 --data-root .qed
+uv run qed reconcile odd-square-001 --data-root .qed
+```
+
+`doctor` is read-only. It prints a diagnostic manifest with execution leases,
+thread and turn identities, unconfirmed runtime events, budget consumption, the
+event-chain hash, and concrete resume blockers. `reconcile` exits with a
+conflict because the current runtime interface has no authoritative
+cross-backend exact-turn lookup. It never invents `turn.completed`.
+
+After the execution lease expires and you decide to stop recovery, record the
+operator decision:
+
+```bash
+uv run qed abandon odd-square-001 \
+  --reason 'Runtime terminal status cannot be recovered from backend records.' \
+  --idempotency-key odd-square-abandon-1 \
+  --data-root .qed
+```
+
+The store appends the reason to the ordered event chain and sets a
+non-resumable `failed` status. Reusing the key and reason returns the same
+decision. Reusing the key with different text fails. A late runtime terminal
+can still enter the audit chain under the original fencing identity.
+
 ## Event streaming
 
 The event route replays stored events and then follows the run until a terminal
@@ -196,16 +266,17 @@ stream or protocol ends without a terminal event, QED records
 `runtime.turn_terminal_unconfirmed`. Either ambiguous state fails closed: QED
 will not acknowledge cancellation, release the execution, resume, or allow a
 replacement execution even after lease expiry. Preserve the database and
-runtime logs and treat a state that cannot be reconciled as an incident. Do not
-edit SQLite to force a resume; normal resume is available only after the
-attempt is proven not started or its matching terminal is durably recorded.
+runtime logs and run `qed doctor`. Do not edit SQLite to force a resume.
+`qed abandon` records a terminal operator disposition when the backend cannot
+supply the missing evidence.
 
 QED marks schema, runtime, output, integrity, and exhausted-budget failures as
 `failed`. A failed run keeps its events and artifacts for audit. Paused,
-cancelled, and failed runs may resume from their current durable stage. Resume
-requires no unconfirmed runtime turn or live execution lease. It does not
-restore exhausted budgets or discard earlier attempts, so correct the underlying
-runtime or policy problem before retrying a failed run.
+cancelled, and non-abandoned failed runs may resume from their current durable
+stage. An operator-abandoned run is terminal and cannot resume. Resume requires
+no unconfirmed runtime turn or live execution lease. It does not restore
+exhausted budgets or discard earlier attempts, so correct the underlying runtime
+or policy problem before retrying a failed run.
 
 ## Backups
 
@@ -225,8 +296,11 @@ it when a backup may have been exposed.
 
 Restore into a new empty path, start QED against that path, and inspect runs with
 `qed status` or the API before opening it to users. The current release opens
-SQLite schema version 2 and automatically upgrades version 1; it rejects other
-database schema versions. Typed records retain their separate schema version 1.
+SQLite schema versions 1 through 4 and upgrades supported older versions to 4.
+The migration rejects duplicate external thread identities and reports the
+conflicting run, external ID, and local thread IDs. Typed research records use
+their own schema versions; legacy v1 reports and decisions remain readable but
+cannot grant current QED policy PASS authority.
 The project has no retention task, remote backup task, or manual schema
 migration command, so the operator owns backup rotation and upgrade sequencing.
 
@@ -260,5 +334,6 @@ The durable event log provides the audit timeline. Use
 `manifest.json` for research-record and turn-input hashes, thread/turn lineage,
 proof-linked findings, runtime resolutions, execution segments, input/output
 and cached-input/reasoning-output token totals, turn and search-query counts,
-execution timing, terminal `completed` status, explicit code-derived `PASS`,
+execution timing, the status and stage observed at the export boundary, QED
+policy PASS,
 and the canonical event-chain hash.

@@ -22,6 +22,7 @@ from qed.schemas import (
     canonical_json,
     canonical_sha256,
     sha256_text,
+    verification_report_sha256,
 )
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
@@ -44,6 +45,62 @@ def test_canonical_json_and_sha256_match_known_vectors() -> None:
     assert canonical_json({"b": 2, "a": 1}) == '{"a":1,"b":2}'
     assert canonical_sha256({"b": 2, "a": 1}) == MAPPING_SHA256
     assert sha256_text("abc") == ABC_SHA256
+
+
+def test_schema_v1_verification_hash_omits_v2_rule_coverage_fields() -> None:
+    report = VerificationReport(
+        schema_version=1,
+        id="legacy-report",
+        candidate_id="candidate-1",
+        candidate_sha256=ABC_SHA256,
+        kind="structural",
+        checks=(
+            VerificationCheck(
+                id="legacy-check",
+                category="legacy",
+                status=CheckStatus.PASS,
+                summary="Legacy structured check.",
+            ),
+        ),
+        verifier_thread_id="legacy-thread",
+        verifier_external_thread_id="legacy-external-thread",
+        provenance=provenance(),
+        created_at=NOW,
+    )
+    legacy_payload = report.model_dump(mode="json", exclude_computed_fields=True)
+    for check in legacy_payload["checks"]:
+        check.pop("rule_ids")
+        check.pop("citation_support")
+
+    assert verification_report_sha256(report) == canonical_sha256(legacy_payload)
+
+
+def test_schema_v2_verification_hash_omits_v3_citation_support_field() -> None:
+    report = VerificationReport(
+        schema_version=2,
+        id="rule-aware-report",
+        candidate_id="candidate-1",
+        candidate_sha256=ABC_SHA256,
+        kind="detailed",
+        checks=(
+            VerificationCheck(
+                id="rule-aware-check",
+                category="legacy",
+                status=CheckStatus.PASS,
+                summary="Rule-aware legacy structured check.",
+                rule_ids=("rule-1",),
+            ),
+        ),
+        verifier_thread_id="legacy-thread",
+        verifier_external_thread_id="legacy-external-thread",
+        provenance=provenance(),
+        created_at=NOW,
+    )
+    legacy_payload = report.model_dump(mode="json", exclude_computed_fields=True)
+    for check in legacy_payload["checks"]:
+        check.pop("citation_support")
+
+    assert verification_report_sha256(report) == canonical_sha256(legacy_payload)
 
 
 def test_config_is_codex_only_strict_and_safe_by_default() -> None:

@@ -27,6 +27,14 @@ function MetadataRow({ label, value, mono = false }: { label: string; value: str
   );
 }
 
+function HashScopeNote() {
+  return (
+    <p className="inspector-note">
+      SHA-256 provides integrity addressing only; it is not an author signature or trusted timestamp.
+    </p>
+  );
+}
+
 function ProvenanceBlock({ source, sourceId, model, runtime, prompt, capturedAt }: {
   source: string;
   sourceId: string | null;
@@ -38,8 +46,8 @@ function ProvenanceBlock({ source, sourceId, model, runtime, prompt, capturedAt 
   return (
     <section className="inspector-section">
       <h3>Provenance</h3>
-      <MetadataRow label="Source" value={source} />
-      <MetadataRow label="Source ID" value={sourceId ?? "Not recorded"} mono />
+      <MetadataRow label="Record origin" value={source} />
+      <MetadataRow label="Origin ID" value={sourceId ?? "Not recorded"} mono />
       <MetadataRow label="Model" value={model ?? "Not applicable"} />
       <MetadataRow label="Runtime" value={runtime} mono />
       <MetadataRow label="Prompt" value={prompt ?? "Not applicable"} mono />
@@ -104,6 +112,7 @@ function RunInspector({ snapshot }: { snapshot: RunSnapshot }) {
         <MetadataRow label="Execution" value={`v${run.execution_version}`} />
         <MetadataRow label="Resumes" value={String(run.resume_count)} />
         <MetadataRow label="Runtime" value={run.runtime_version} mono />
+        <HashScopeNote />
       </section>
       <section className="inspector-section">
         <h3>Frozen policy</h3>
@@ -129,7 +138,10 @@ function CandidateInspector({ candidate, snapshot }: { candidate: CandidateRecor
   return (
     <>
       <section className="inspector-lead">
-        <StatusBadge value={decision ? (decision.passed ? "pass" : "fail") : "pending"} />
+        <StatusBadge
+          value={decision ? (decision.passed ? "pass" : "fail") : "pending"}
+          label={decision ? (decision.passed ? "QED policy PASS" : "QED policy NOT PASSED") : undefined}
+        />
         <h2>Candidate {candidate.attempt}</h2>
         <p>Immutable proof attempt bound to {candidate.plan_id}.</p>
       </section>
@@ -140,12 +152,17 @@ function CandidateInspector({ candidate, snapshot }: { candidate: CandidateRecor
         <MetadataRow label="Proof SHA-256" value={shortHash(candidate.proof_sha256, 18)} mono />
         <MetadataRow label="Sealed" value={candidate.sealed_at ? formatDate(candidate.sealed_at) : "Not sealed"} />
         <MetadataRow label="Evidence refs" value={String(candidate.candidate.evidence_ids.length)} />
+        <HashScopeNote />
       </section>
       {decision && (
         <section className="inspector-section">
-          <h3>Code decision</h3>
-          <MetadataRow label="Passed" value={decision.passed ? "Yes" : "No"} />
+          <h3>QED policy decision</h3>
+          <MetadataRow label="Result" value={decision.passed ? "QED policy PASS" : "QED policy NOT PASSED"} />
           <MetadataRow label="Required" value={decision.required_kinds.map(titleCase).join(", ")} />
+          <p className="inspector-note">
+            This result reflects configured thread-isolated LLM checks and code gates. It is not peer review,
+            formal or Lean verification, or a guarantee of mathematical truth.
+          </p>
           {decision.reasons.length > 0 && <ul className="finding-list compact">{decision.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
         </section>
       )}
@@ -167,14 +184,14 @@ function EvidenceInspector({ evidence }: { evidence: Evidence }) {
       <section className="inspector-lead">
         <StatusBadge value={evidence.kind} tone="neutral" />
         <h2>{evidence.title}</h2>
-        <p>{evidence.citation ?? "No formal citation supplied."}</p>
+        <p>{evidence.citation ?? "No citation recorded."}</p>
       </section>
       <section className="inspector-section">
-        <h3>Frozen source content</h3>
+        <h3>Recorded evidence content</h3>
         <p className="evidence-content">{evidence.content}</p>
         {evidence.source_uri && (
           <a href={evidence.source_uri} target="_blank" rel="noreferrer" className="source-link">
-            Open source URI <span aria-hidden="true">↗</span>
+            Open recorded URI <span aria-hidden="true">↗</span>
           </a>
         )}
       </section>
@@ -182,6 +199,7 @@ function EvidenceInspector({ evidence }: { evidence: Evidence }) {
         <h3>Content identity</h3>
         <MetadataRow label="Evidence ID" value={evidence.id} mono />
         <MetadataRow label="Content SHA-256" value={shortHash(evidence.content_sha256, 18)} mono />
+        <HashScopeNote />
       </section>
       <ProvenanceBlock
         source={evidence.provenance.source}
@@ -206,14 +224,18 @@ function ReportInspector({ report: record, snapshot, onInspectEvidence }: {
       <section className="inspector-lead">
         <StatusBadge value={report.verdict} />
         <h2>{titleCase(report.kind)} report</h2>
-        <p>Fresh verifier thread checking the exact sealed candidate hash.</p>
+        <p>
+          This verifier checked the exact sealed candidate hash in a fresh conversation thread.
+          Fresh means conversation-state isolation, not independent model weights.
+        </p>
       </section>
       <section className="inspector-section">
-        <h3>Independent identity</h3>
+        <h3>Verifier identity</h3>
         <MetadataRow label="Report SHA-256" value={shortHash(record.report_sha256, 18)} mono />
         <MetadataRow label="Candidate SHA-256" value={shortHash(report.candidate_sha256, 18)} mono />
         <MetadataRow label="Local thread" value={report.verifier_thread_id} mono />
         <MetadataRow label="Codex thread" value={report.verifier_external_thread_id ?? "Missing"} mono />
+        <HashScopeNote />
       </section>
       <section className="inspector-section">
         <h3>Checks</h3>

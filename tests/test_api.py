@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.types import Message, Scope
 
+import qed.api as api_module
 from qed.api import create_app
 from qed.config import QEDConfig
 from qed.inputs import RunInput
@@ -74,7 +75,28 @@ def test_run_can_be_created_and_read_through_typed_api(tmp_path: Path) -> None:
     ]
 
 
-def test_app_factory_defaults_to_managed_mock_service(tmp_path: Path) -> None:
+def test_app_factory_defaults_to_managed_codex_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_homes: list[Path] = []
+
+    def runtime_factory(codex_home: Path) -> MockRuntime:
+        codex_homes.append(codex_home)
+        runtime = MockRuntime(
+            capabilities=RuntimeCapabilities(
+                model="gpt-5.6-sol",
+                advertised_efforts=("high",),
+                default_effort="high",
+                selected_effort="high",
+                multi_agent=False,
+                proactive_multi_agent=False,
+            )
+        )
+        runtime.runtime_version = "test-codex/1"
+        return runtime
+
+    monkeypatch.setattr(api_module, "create_codex_runtime", runtime_factory)
     app = create_app(settings=ServiceSettings(data_root=tmp_path))
 
     with TestClient(app) as client:
@@ -84,6 +106,7 @@ def test_app_factory_defaults_to_managed_mock_service(tmp_path: Path) -> None:
         )
 
     assert created.status_code == 201
+    assert codex_homes == [tmp_path / "codex-home"]
     assert (tmp_path / "qed.sqlite3").is_file()
 
 

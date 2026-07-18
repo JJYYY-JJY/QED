@@ -22,6 +22,7 @@ from qed.inputs import RunInput
 from qed.schemas import (
     Adjudication,
     CheckStatus,
+    CitationSupport,
     Evidence,
     Finding,
     Plan,
@@ -31,6 +32,7 @@ from qed.schemas import (
     VerificationCheck,
     VerificationReport,
     canonical_sha256,
+    evidence_sha256,
     sha256_text,
 )
 from qed.store import RunSnapshot, RunStage, RunStatus, RunStore, ThreadStatus
@@ -40,6 +42,10 @@ GENERATED_AT = datetime(2026, 7, 16, 13, 0, tzinfo=UTC)
 PROOF = "For every integer $n > 1$, a prime divisor of $n! + 1$ exceeds $n$."
 EVIDENCE_CONTENT = "Euclid's construction produces a prime outside any finite list."
 VerificationKind = Literal["structural", "detailed", "citation"]
+RUN_INPUT = RunInput(
+    problem="Prove that there are infinitely many primes.",
+    verification_rules=("Every divisibility inference must be justified.",),
+)
 
 
 def _provenance(source_id: str, prompt_version: str) -> Provenance:
@@ -85,6 +91,23 @@ def _report(
                 summary=f"The {kind} review found no defect.",
                 proof_spans=("prime divisor",),
                 evidence_ids=("evidence-1",) if kind == "citation" else (),
+                citation_support=(
+                    (
+                        CitationSupport(
+                            evidence_id="evidence-1",
+                            proof_span=PROOF,
+                            evidence_excerpt=EVIDENCE_CONTENT,
+                            source_locator="evidence:evidence-1",
+                        ),
+                    )
+                    if kind == "citation"
+                    else ()
+                ),
+                rule_ids=(
+                    (RUN_INPUT.frozen_verification_rules[0].id,)
+                    if kind == "detailed"
+                    else ()
+                ),
             ),
         ),
         findings=findings,
@@ -101,10 +124,7 @@ def _snapshot(
     evidence_ids: tuple[str, ...] = ("evidence-1",),
     complete: bool = False,
 ) -> RunSnapshot:
-    run_input = RunInput(
-        problem="Prove that there are infinitely many primes.",
-        verification_rules=("Every divisibility inference must be justified.",),
-    )
+    run_input = RUN_INPUT
     evidence = Evidence(
         id="evidence-1",
         kind="theorem",
@@ -253,7 +273,11 @@ def test_builds_a_deterministic_verified_bundle(tmp_path) -> None:
         f"Proof SHA-256: `{sha256_text(PROOF)}`\n\n"
         f"{PROOF}\n"
     )
-    assert "Code-computed verdict: **PASS**" in first.report_md
+    assert "Code-computed verdict: **QED policy PASS**" in first.report_md
+    assert "not peer review, formal or Lean verification" in first.report_md
+    assert RUN_INPUT.frozen_verification_rules[0].id in first.report_md
+    assert f"Evidence excerpt: {EVIDENCE_CONTENT}" in first.report_md
+    assert "Source locator: evidence:evidence-1" in first.report_md
     assert first.report_md.index("## Citation") < first.report_md.index("## Detailed")
     assert first.report_md.index("## Detailed") < first.report_md.index("## Structural")
 
@@ -262,8 +286,28 @@ def test_builds_a_deterministic_verified_bundle(tmp_path) -> None:
     assert snapshot.run.stage is RunStage.EXPORT
     assert snapshot.run.status is RunStatus.RUNNING
     assert manifest["run_id"] == "run-1"
-    assert manifest["run_status"] == "completed"
+    assert manifest["run_status"] == "running"
+    assert manifest["run_stage"] == "export"
+    assert manifest["publication_phase"] == "snapshot"
     assert manifest["code_verdict"] == "PASS"
+    assert manifest["verification_rules"] == [
+        {
+            "id": RUN_INPUT.frozen_verification_rules[0].id,
+            "text": "Every divisibility inference must be justified.",
+            "responsible_report_kinds": [
+                "structural",
+                "detailed",
+                "citation",
+            ],
+            "coverage": [
+                {
+                    "report_id": "report-detailed",
+                    "check_id": "check-detailed",
+                    "status": "pass",
+                }
+            ],
+        }
+    ]
     assert manifest["input_sha256"] == snapshot.run_input.sha256
     assert manifest["config_sha256"] == QEDConfig().sha256
     assert manifest["runtime_version"] == "0.144.5"
@@ -289,7 +333,35 @@ def test_builds_a_deterministic_verified_bundle(tmp_path) -> None:
         )
     ]
     assert manifest["evidence_records"] == [
-        {"id": "evidence-1", "sha256": canonical_sha256(snapshot.evidence[0])}
+        {"id": "evidence-1", "sha256": evidence_sha256(snapshot.evidence[0])}
+    ]
+    assert manifest["evidence_provenance"] == [
+        {
+            "content_trust": "legacy_untrusted",
+            "evidence_id": "evidence-1",
+            "observation_ids": [],
+            "schema_version": 1,
+            "source_trust": "legacy_untrusted",
+            "source_uri_sha256": None,
+        }
+    ]
+    assert manifest["web_search_observations"] == []
+    assert manifest["citation_support"] == [
+        {
+            "report_id": "report-citation",
+            "check_id": "check-citation",
+            "evidence_id": "evidence-1",
+            "proof_span": PROOF,
+            "evidence_excerpt": EVIDENCE_CONTENT,
+            "source_locator": "evidence:evidence-1",
+            "sha256": canonical_sha256(
+                next(
+                    record
+                    for record in snapshot.verifications
+                    if record.kind == "citation"
+                ).report.checks[0].citation_support[0]
+            ),
+        }
     ]
     assert manifest["plan_records"] == [
         {"id": "plan-1", "sha256": canonical_sha256(snapshot.plans[0])}

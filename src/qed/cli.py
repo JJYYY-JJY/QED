@@ -22,18 +22,24 @@ from qed.schemas import canonical_json
 from qed.service import (
     ApplicationService,
     RunAlreadyActiveError,
-    RuntimeFactory,
+    build_management_service,
+    build_mock_service,
     build_service,
 )
 from qed.service_settings import ServiceSettings
-from qed.store import ConflictError, InvalidTransitionError, NotFoundError, RunStatus
+from qed.store import (
+    ConflictError,
+    InvalidTransitionError,
+    NotFoundError,
+    RunStatus,
+)
 from qed.workflow import WorkflowExecutionError
 
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
     pretty_exceptions_enable=False,
-    help="Codex-native, independently verified mathematical research.",
+    help="Codex-native mathematical research with thread-isolated policy checks.",
 )
 
 
@@ -84,12 +90,17 @@ def main(
     )
 
 
-def _runtime_factory(mode: RuntimeMode) -> RuntimeFactory | None:
-    return create_codex_runtime if mode is RuntimeMode.CODEX else None
-
-
 def _settings(data_root: Path) -> ServiceSettings:
     return ServiceSettings(data_root=data_root)
+
+
+def _build_runtime_service(
+    settings: ServiceSettings,
+    mode: RuntimeMode,
+) -> ApplicationService:
+    if mode is RuntimeMode.MOCK:
+        return build_mock_service(settings)
+    return build_service(settings, runtime_factory=create_codex_runtime)
 
 
 def _write(value: object, *, error: bool = False) -> None:
@@ -140,7 +151,7 @@ def init(
 
     service: ApplicationService | None = None
     try:
-        service = build_service(_settings(data_root))
+        service = build_management_service(_settings(data_root))
         _write(service.store_info())
     except Exception as error:
         _abort(error)
@@ -158,7 +169,7 @@ def status(
 
     service: ApplicationService | None = None
     try:
-        service = build_service(_settings(data_root))
+        service = build_management_service(_settings(data_root))
         _write(service.get_run(run_id))
     except Exception as error:
         _abort(error)
@@ -175,10 +186,7 @@ async def _run_research(
     config: QEDConfig,
     runtime_mode: RuntimeMode,
 ) -> RunStatus:
-    service = build_service(
-        _settings(data_root),
-        runtime_factory=_runtime_factory(runtime_mode),
-    )
+    service = _build_runtime_service(_settings(data_root), runtime_mode)
     try:
         created = service.create_run(run_input, config, run_id=run_id)
         receipt = await service.start_run(
@@ -249,8 +257,9 @@ async def _cancel(
     data_root: Path,
     run_id: str,
     idempotency_key: str,
+    runtime_mode: RuntimeMode,
 ) -> None:
-    service = build_service(_settings(data_root))
+    service = _build_runtime_service(_settings(data_root), runtime_mode)
     try:
         _write(await service.cancel_run(run_id, idempotency_key=idempotency_key))
     finally:
@@ -264,6 +273,9 @@ def cancel(
         str | None,
         typer.Option(help="Stable command key for safe retries."),
     ] = None,
+    runtime: Annotated[RuntimeMode, typer.Option(help="Runtime implementation.")] = (
+        RuntimeMode.CODEX
+    ),
     data_root: Annotated[Path, typer.Option(help="Managed QED data directory.")] = Path(".qed"),
 ) -> None:
     """Interrupt active Codex turns and persist cancellation."""
@@ -274,6 +286,7 @@ def cancel(
                 data_root=data_root,
                 run_id=run_id,
                 idempotency_key=idempotency_key or f"cli-cancel-{uuid4().hex}",
+                runtime_mode=runtime,
             )
         )
     except Exception as error:
@@ -287,10 +300,7 @@ async def _resume(
     idempotency_key: str,
     runtime_mode: RuntimeMode,
 ) -> RunStatus:
-    service = build_service(
-        _settings(data_root),
-        runtime_factory=_runtime_factory(runtime_mode),
-    )
+    service = _build_runtime_service(_settings(data_root), runtime_mode)
     try:
         receipt = await service.resume_run(run_id, idempotency_key=idempotency_key)
         completed = await service.wait(run_id)
@@ -344,7 +354,7 @@ def migrate(
 
     service: ApplicationService | None = None
     try:
-        service = build_service(_settings(data_root))
+        service = build_management_service(_settings(data_root))
         imported = service.migrate_legacy(source)
         _write(
             {
@@ -353,6 +363,78 @@ def migrate(
                 "manifest": imported.manifest.model_dump(mode="json"),
             }
         )
+    except Exception as error:
+        _abort(error)
+    finally:
+        if service is not None:
+            asyncio.run(_close(service))
+
+
+@app.command()
+def doctor(
+    run_id: Annotated[str, typer.Argument(help="Durable run identifier.")],
+    data_root: Annotated[Path, typer.Option(help="Managed QED data directory.")] = Path(".qed"),
+) -> None:
+    """Read one run's execution, runtime identity, budget, and resume blockers."""
+
+    service: ApplicationService | None = None
+    try:
+        service = build_management_service(_settings(data_root))
+        _write(service.diagnose_run(run_id))
+    except Exception as error:
+        _abort(error)
+    finally:
+        if service is not None:
+            asyncio.run(_close(service))
+
+
+@app.command()
+def reconcile(
+    run_id: Annotated[str, typer.Argument(help="Durable run identifier.")],
+    data_root: Annotated[Path, typer.Option(help="Managed QED data directory.")] = Path(".qed"),
+) -> None:
+    """Explain why authoritative automatic runtime reconciliation is unavailable."""
+
+    service: ApplicationService | None = None
+    try:
+        service = build_management_service(_settings(data_root))
+        diagnosis = service.diagnose_run(run_id)
+        _write(
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "reconciliation": diagnosis.reconciliation.model_dump(mode="json"),
+            }
+        )
+    except Exception as error:
+        _abort(error)
+    finally:
+        if service is not None:
+            asyncio.run(_close(service))
+    raise typer.Exit(code=int(ExitCode.CONFLICT))
+
+
+@app.command()
+def abandon(
+    run_id: Annotated[str, typer.Argument(help="Durable run identifier.")],
+    reason: Annotated[str, typer.Option(help="Required immutable operator rationale.")],
+    idempotency_key: Annotated[
+        str | None,
+        typer.Option(help="Stable command key for safe retries."),
+    ] = None,
+    data_root: Annotated[Path, typer.Option(help="Managed QED data directory.")] = Path(".qed"),
+) -> None:
+    """Record a terminal non-PASS operator decision without inventing runtime events."""
+
+    service: ApplicationService | None = None
+    try:
+        service = build_management_service(_settings(data_root))
+        decision = service.abandon_run(
+            run_id,
+            reason=reason,
+            idempotency_key=idempotency_key or f"cli-abandon-{uuid4().hex}",
+        )
+        _write(decision)
     except Exception as error:
         _abort(error)
     finally:
@@ -387,7 +469,7 @@ def serve(
             )
         application = create_app(
             settings=settings,
-            runtime_factory=_runtime_factory(runtime),
+            service=_build_runtime_service(settings, runtime),
         )
     except Exception as error:
         _abort(error)

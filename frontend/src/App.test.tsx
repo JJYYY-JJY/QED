@@ -39,7 +39,7 @@ afterEach(() => {
 });
 
 describe("QED research console", () => {
-  it("puts a sealed proof and independent checks at the center of a completed run", async () => {
+  it("puts a sealed proof and scoped QED policy decision at the center of a completed run", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
       const url = requestUrl(input);
       if (url.endsWith("/api/v1/capabilities")) {
@@ -69,8 +69,12 @@ describe("QED research console", () => {
 
     expect(await screen.findByRole("heading", { name: "Candidate 1" })).toBeInTheDocument();
     expect(screen.getByText(/Every finite subgroup of/)).toBeInTheDocument();
-    expect(screen.getByText("PASS")).toBeInTheDocument();
-    expect(screen.getByText("3 independent reports")).toBeInTheDocument();
+    expect(screen.getByText("QED policy PASS")).toBeInTheDocument();
+    expect(screen.getByText(/Passed configured thread-isolated LLM checks and code gates/)).toBeInTheDocument();
+    expect(screen.getByText(/not peer review, formal verification, Lean verification, or a guarantee of mathematical truth/i)).toBeInTheDocument();
+    expect(screen.getByText("3 required reports")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Thread-isolated verification" })).toBeInTheDocument();
+    expect(screen.getByText(/Fresh verifier threads isolate conversation state; they do not imply independent model weights/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Structural/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Detailed/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Citation/ })).toBeInTheDocument();
@@ -94,8 +98,17 @@ describe("QED research console", () => {
 
     await user.click(screen.getByRole("tab", { name: "Evidence" }));
     expect(screen.getByRole("heading", { name: "Evidence ledger" })).toBeInTheDocument();
+    expect(screen.getByText(/A content hash records bytes; it does not establish source authenticity or citation support/)).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Evidence record" })).toBeInTheDocument();
     expect(screen.getByText("Classical group result")).toBeInTheDocument();
     expect(screen.getAllByText(/1f2e3d/).length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Inspect" }));
+    expect(screen.getByRole("heading", { name: "Recorded evidence content" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Open recorded URI/ })).toBeInTheDocument();
+    expect(screen.getByText("Record origin")).toBeInTheDocument();
+    expect(screen.getByText("Origin ID")).toBeInTheDocument();
+    expect(screen.getByText(/SHA-256 provides integrity addressing only; it is not an author signature or trusted timestamp/)).toBeInTheDocument();
 
     await user.click(screen.getByRole("tab", { name: "Activity" }));
     const timeline = screen.getByLabelText("Run event timeline");

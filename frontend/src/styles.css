@@ -946,6 +946,13 @@ a {
   font-size: 10px;
 }
 
+.verification-scope {
+  max-width: 70ch;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
 .report-buttons {
   display: flex;
   gap: 7px;
@@ -1604,6 +1611,13 @@ td small {
 .inspector-section h3 {
   margin-bottom: 9px;
   font-size: 11px;
+}
+
+.inspector-note {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 .metadata-row {

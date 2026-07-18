@@ -9,13 +9,16 @@ from qed.inputs import RunInput
 from qed.schemas import (
     Adjudication,
     CheckStatus,
+    CitationSupport,
     Evidence,
+    EvidenceTrust,
     Plan,
     PlanStep,
     ProofCandidate,
     Provenance,
     VerificationCheck,
     VerificationReport,
+    WebSearchObservation,
     canonical_sha256,
     sha256_text,
 )
@@ -29,6 +32,7 @@ from qed.store import (
     RunStatus,
     RunStore,
     StoreIntegrityError,
+    ThreadStatus,
 )
 
 ABC_SHA256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -53,6 +57,7 @@ REQUIRED_TABLES = {
     "threads",
     "turn_inputs",
     "verifications",
+    "web_search_observations",
 }
 
 
@@ -81,6 +86,20 @@ def candidate(proof: str) -> ProofCandidate:
     )
 
 
+def citation_support(
+    proof: ProofCandidate,
+    evidence: Evidence,
+) -> tuple[CitationSupport, ...]:
+    return (
+        CitationSupport(
+            evidence_id=evidence.id,
+            proof_span=proof.proof,
+            evidence_excerpt=evidence.content,
+            source_locator=evidence.source_uri or f"evidence:{evidence.id}",
+        ),
+    )
+
+
 def verification(summary: str) -> VerificationReport:
     return VerificationReport(
         id="verification-1",
@@ -96,9 +115,69 @@ def verification(summary: str) -> VerificationReport:
             ),
         ),
         verifier_thread_id="thread-verifier-1",
+        verifier_external_thread_id="codex-verifier-1",
         provenance=provenance("thread-verifier-1"),
         created_at=NOW,
     )
+
+
+def prepare_store_for_verification(
+    store: RunStore,
+    *,
+    run_input: RunInput,
+) -> ProofCandidate:
+    evidence_text = "Frozen evidence."
+    evidence = Evidence(
+        id="evidence-1",
+        kind="note",
+        title="Frozen evidence",
+        content=evidence_text,
+        content_sha256=sha256_text(evidence_text),
+        provenance=provenance("literature-thread"),
+    )
+    plan = Plan(
+        id="plan-1",
+        problem_sha256=run_input.sha256,
+        strategy="Direct proof.",
+        steps=(
+            PlanStep(
+                id="step-1",
+                statement="Prove the target.",
+                rationale="This is the requested result.",
+                success_criteria=("The target follows.",),
+                evidence_ids=(evidence.id,),
+            ),
+        ),
+        provenance=provenance("planner-thread"),
+        created_at=NOW,
+    )
+    proof = candidate("A complete proof.").model_copy(
+        update={"provenance": provenance("prover-thread")}
+    )
+    store.create_run(
+        "run-1",
+        config=QEDConfig(),
+        run_input=run_input,
+        provenance=provenance(),
+    )
+    store.transition_run("run-1", RunStatus.RUNNING)
+    store.transition_stage("run-1", RunStage.LITERATURE)
+    store.add_evidence("run-1", evidence)
+    store.transition_stage("run-1", RunStage.PLANNING)
+    store.add_plan("run-1", plan)
+    store.transition_stage("run-1", RunStage.PROVING)
+    store.add_thread(
+        "prover-thread",
+        run_id="run-1",
+        role="prover",
+        model="gpt-5.6-sol",
+        provenance=provenance("prover-thread"),
+        external_thread_id="codex-prover-1",
+    )
+    store.transition_thread("prover-thread", ThreadStatus.COMPLETED)
+    store.create_candidate(proof, thread_id="prover-thread", sealed=True)
+    store.transition_stage("run-1", RunStage.VERIFICATION)
+    return proof
 
 
 def test_store_persists_schema_lifecycle_and_monotonic_events(tmp_path) -> None:
@@ -108,7 +187,7 @@ def test_store_persists_schema_lifecycle_and_monotonic_events(tmp_path) -> None:
 
     with RunStore(database) as store:
         info = store.info()
-        assert info.schema_version == 2
+        assert info.schema_version == 4
         assert info.journal_mode == "wal"
         assert info.foreign_keys is True
         assert set(info.tables) == REQUIRED_TABLES
@@ -155,7 +234,7 @@ def test_store_persists_schema_lifecycle_and_monotonic_events(tmp_path) -> None:
         assert [event.seq for event in reopened.list_events("run-1", after_seq=3)] == [4, 5]
 
 
-def test_store_migrates_additive_database_schema_v1_to_v2(tmp_path) -> None:
+def test_store_migrates_additive_database_schema_v1_to_v4(tmp_path) -> None:
     database = tmp_path / "qed.sqlite3"
     with RunStore(database):
         pass
@@ -171,8 +250,55 @@ def test_store_migrates_additive_database_schema_v1_to_v2(tmp_path) -> None:
         )
 
     with RunStore(database) as migrated:
-        assert migrated.info().schema_version == 2
+        assert migrated.info().schema_version == 4
         assert set(migrated.info().tables) == REQUIRED_TABLES
+
+
+def test_store_migration_rejects_duplicate_external_thread_identities(
+    tmp_path,
+) -> None:
+    database = tmp_path / "qed.sqlite3"
+    with RunStore(database) as store:
+        store.create_run(
+            "run-1",
+            config=QEDConfig(),
+            run_input=RunInput(problem="A frozen problem."),
+            provenance=provenance(),
+        )
+        store.add_thread(
+            "prover-thread",
+            run_id="run-1",
+            role="prover",
+            model="gpt-5.6-sol",
+            provenance=provenance("prover-thread"),
+            external_thread_id="codex-shared-thread",
+        )
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX threads_external_unique_idx")
+        connection.execute(
+            """
+            INSERT INTO threads (
+                id, run_id, role, parent_thread_id, external_thread_id, model,
+                status, schema_version, provenance_json, provenance_sha256,
+                created_at, updated_at
+            )
+            SELECT
+                'verifier-thread', run_id, 'verifier', NULL, external_thread_id, model,
+                status, schema_version, provenance_json, provenance_sha256,
+                created_at, updated_at
+            FROM threads WHERE id = 'prover-thread'
+            """
+        )
+        connection.execute(
+            "UPDATE schema_metadata SET value = '2' WHERE key = 'schema_version'"
+        )
+
+    with pytest.raises(
+        StoreIntegrityError,
+        match="duplicate external thread identities.*codex-shared-thread",
+    ):
+        RunStore(database)
 
 
 def test_invalid_transitions_are_rejected_and_cancelled_run_resumes_after_reopen(
@@ -303,6 +429,7 @@ def test_sealed_candidates_and_verifications_remain_immutable_across_resume(tmp_
             role="prover",
             model="gpt-5.6-sol",
             provenance=provenance("thread-prover-1"),
+            external_thread_id="codex-prover-1",
         )
         store.add_thread(
             "thread-verifier-1",
@@ -343,6 +470,142 @@ def test_sealed_candidates_and_verifications_remain_immutable_across_resume(tmp_
         assert reopened.list_candidates("run-1") == (sealed,)
         assert reopened.get_verification("verification-1") == report
         assert reopened.list_verifications("run-1") == (report,)
+
+
+def test_verification_rejects_missing_external_identity_and_unknown_rule(
+    tmp_path,
+) -> None:
+    run_input = RunInput(
+        problem="Prove the target.",
+        verification_rules=("Check the quantified conclusion.",),
+    )
+    required_rule_id = run_input.frozen_verification_rules[0].id
+    with RunStore(tmp_path / "qed.sqlite3") as store:
+        proof = prepare_store_for_verification(store, run_input=run_input)
+        store.add_thread(
+            "verifier-thread",
+            run_id="run-1",
+            role="verifier",
+            model="gpt-5.6-sol",
+            provenance=provenance("verifier-thread"),
+            external_thread_id="codex-verifier-1",
+        )
+
+        def report(
+            *,
+            external_thread_id: str | None,
+            rule_ids: tuple[str, ...],
+        ) -> VerificationReport:
+            return VerificationReport(
+                id=f"report-{rule_ids[0]}",
+                candidate_id=proof.id,
+                candidate_sha256=proof.proof_sha256,
+                kind="structural",
+                checks=(
+                    VerificationCheck(
+                        id="check-1",
+                        category="correctness",
+                        status=CheckStatus.PASS,
+                        summary="The structured check passed.",
+                        rule_ids=rule_ids,
+                    ),
+                ),
+                verifier_thread_id="verifier-thread",
+                verifier_external_thread_id=external_thread_id,
+                provenance=provenance("verifier-thread"),
+                created_at=NOW,
+            )
+
+        with pytest.raises(ConflictError, match="external thread identity"):
+            store.add_verification(
+                "run-1",
+                report(
+                    external_thread_id=None,
+                    rule_ids=(required_rule_id,),
+                ),
+            )
+        with pytest.raises(ConflictError, match="unknown verification rule"):
+            store.add_verification(
+                "run-1",
+                report(
+                    external_thread_id="codex-verifier-1",
+                    rule_ids=("rule-unknown",),
+                ),
+            )
+
+
+@pytest.mark.parametrize(
+    ("support", "message"),
+    [
+        (
+            CitationSupport(
+                evidence_id="evidence-unknown",
+                proof_span="A complete proof.",
+                evidence_excerpt="Frozen evidence.",
+                source_locator="evidence:evidence-unknown",
+            ),
+            "unknown evidence",
+        ),
+        (
+            CitationSupport(
+                evidence_id="evidence-1",
+                proof_span="A claim absent from the frozen proof.",
+                evidence_excerpt="Frozen evidence.",
+                source_locator="evidence:evidence-1",
+            ),
+            "proof span",
+        ),
+        (
+            CitationSupport(
+                evidence_id="evidence-1",
+                proof_span="A complete proof.",
+                evidence_excerpt="An excerpt absent from frozen evidence.",
+                source_locator="evidence:evidence-1",
+            ),
+            "evidence excerpt",
+        ),
+    ],
+)
+def test_store_rejects_unverifiable_structured_citation_support(
+    tmp_path,
+    support: CitationSupport,
+    message: str,
+) -> None:
+    with RunStore(tmp_path / "qed.sqlite3") as store:
+        proof = prepare_store_for_verification(
+            store,
+            run_input=RunInput(problem="Prove the target."),
+        )
+        store.add_thread(
+            "citation-thread",
+            run_id="run-1",
+            role="verifier",
+            model="gpt-5.6-sol",
+            provenance=provenance("citation-thread"),
+            external_thread_id="codex-citation-1",
+        )
+        report = VerificationReport(
+            id=f"citation-report-{message.replace(' ', '-')}",
+            candidate_id=proof.id,
+            candidate_sha256=proof.proof_sha256,
+            kind="citation",
+            checks=(
+                VerificationCheck(
+                    id="citation-check",
+                    category="citation-support",
+                    status=CheckStatus.PASS,
+                    summary="The source supports the proof span.",
+                    citation_support=(support,),
+                ),
+            ),
+            verifier_thread_id="citation-thread",
+            verifier_external_thread_id="codex-citation-1",
+            provenance=provenance("citation-thread"),
+            created_at=NOW,
+        )
+
+        with pytest.raises(ConflictError, match=message):
+            store.add_verification("run-1", report)
 
 
 def test_snapshot_exposes_versioned_hashed_provenance_for_export(tmp_path) -> None:
@@ -399,6 +662,163 @@ def test_snapshot_exposes_versioned_hashed_provenance_for_export(tmp_path) -> No
         assert snapshot.events == reopened.list_events("run-1")
         assert reopened.list_stage_outputs("run-1") == (stage_output,)
         assert reopened.list_artifacts("run-1") == (artifact,)
+
+
+def test_store_binds_runtime_observed_evidence_to_the_exact_web_action(
+    tmp_path,
+) -> None:
+    payload = {
+        "id": "item-open",
+        "type": "webSearch",
+        "query": "primary source",
+        "action": {
+            "type": "openPage",
+            "url": "https://example.test/source",
+        },
+    }
+    observation = WebSearchObservation(
+        id="observation-1",
+        run_id="run-observation",
+        backend="app_server",
+        local_thread_id="thread-literature",
+        external_thread_id="codex-literature",
+        turn_id="turn-literature",
+        item_id="item-open",
+        action_type="open_page",
+        uri="https://example.test/source",
+        uri_sha256=sha256_text("https://example.test/source"),
+        payload=payload,
+        payload_sha256=canonical_sha256(payload),
+        captured_at=NOW,
+    )
+    evidence = Evidence(
+        schema_version=2,
+        id="evidence-observed",
+        kind="source",
+        title="Observed source",
+        content="Model-reported source excerpt.",
+        content_sha256=sha256_text("Model-reported source excerpt."),
+        provenance=provenance("thread-literature"),
+        source_uri="https://example.test/source",
+        source_trust=EvidenceTrust.RUNTIME_OBSERVED,
+        content_trust=EvidenceTrust.MODEL_REPORTED,
+        observation_ids=(observation.id,),
+        source_uri_sha256=sha256_text("https://example.test/source"),
+    )
+
+    with RunStore(tmp_path / "qed.sqlite3", clock=lambda: NOW) as store:
+        store.create_run(
+            "run-observation",
+            config=QEDConfig(),
+            run_input=RunInput(problem="Prove P."),
+            provenance=provenance(),
+        )
+        store.transition_run("run-observation", RunStatus.RUNNING)
+        lease = store.acquire_execution(
+            "run-observation",
+            segment_id="segment-observation",
+            worker_id="worker-observation",
+            lease_token="observation-secret",
+            runtime_version="0.137.0-alpha.4",
+        )
+        execution = ExecutionToken(
+            segment_id=lease.id,
+            version=lease.version,
+            lease_token="observation-secret",
+        )
+        store.transition_stage(
+            "run-observation",
+            RunStage.LITERATURE,
+            execution=execution,
+        )
+        store.add_thread(
+            "thread-literature",
+            run_id="run-observation",
+            role="literature",
+            model="gpt-5.6-sol",
+            provenance=provenance("thread-literature"),
+            external_thread_id="codex-literature",
+            execution=execution,
+            runtime_lifecycle=True,
+        )
+        store.append_event(
+            "run-observation",
+            event_type="runtime.turn_started",
+            stage=RunStage.LITERATURE,
+            payload={
+                "thread_id": "codex-literature",
+                "turn_id": "turn-literature",
+                "backend": "app_server",
+                "turn_input_id": "input-literature",
+                "attempt": 1,
+            },
+            execution=execution,
+        )
+
+        assert (
+            store.add_web_search_observation(
+                observation,
+                execution=execution,
+            )
+            == observation
+        )
+        unknown_observation = Evidence(
+            schema_version=2,
+            id="evidence-unknown-observation",
+            kind="source",
+            title="Unregistered source",
+            content="Model-reported source excerpt.",
+            content_sha256=sha256_text("Model-reported source excerpt."),
+            provenance=provenance("thread-literature"),
+            source_uri="https://example.test/source",
+            source_trust=EvidenceTrust.RUNTIME_OBSERVED,
+            content_trust=EvidenceTrust.MODEL_REPORTED,
+            observation_ids=("observation-missing",),
+            source_uri_sha256=sha256_text("https://example.test/source"),
+        )
+        with pytest.raises(
+            ConflictError,
+            match="unknown web-search observation",
+        ):
+            store.add_evidence(
+                "run-observation",
+                unknown_observation,
+                execution=execution,
+            )
+        mismatched_uri = Evidence(
+            schema_version=2,
+            id="evidence-mismatched-observation",
+            kind="source",
+            title="Mismatched source",
+            content="Model-reported source excerpt.",
+            content_sha256=sha256_text("Model-reported source excerpt."),
+            provenance=provenance("thread-literature"),
+            source_uri="https://example.test/other",
+            source_trust=EvidenceTrust.RUNTIME_OBSERVED,
+            content_trust=EvidenceTrust.MODEL_REPORTED,
+            observation_ids=(observation.id,),
+            source_uri_sha256=sha256_text("https://example.test/other"),
+        )
+        with pytest.raises(
+            ConflictError,
+            match="does not match its web-search observation",
+        ):
+            store.add_evidence(
+                "run-observation",
+                mismatched_uri,
+                execution=execution,
+            )
+        assert store.add_evidence(
+            "run-observation",
+            evidence,
+            execution=execution,
+        ) == evidence
+        assert store.list_web_search_observations("run-observation") == (
+            observation,
+        )
+        assert store.snapshot("run-observation").web_search_observations == (
+            observation,
+        )
 
 
 def test_one_store_serializes_concurrent_writes(tmp_path) -> None:
@@ -1136,6 +1556,11 @@ def test_typed_artifacts_are_required_for_semantic_stage_progress_and_completion
                         status=CheckStatus.PASS,
                         summary="The proof passes this independent check.",
                         evidence_ids=(evidence.id,) if kind == "citation" else (),
+                        citation_support=(
+                            citation_support(proof, evidence)
+                            if kind == "citation"
+                            else ()
+                        ),
                     ),
                 ),
                 verifier_thread_id=local_id,
@@ -1320,6 +1745,7 @@ def prepare_adjudication_for_revision(
         role="prover",
         model="gpt-5.6-sol",
         provenance=provenance("prover-thread"),
+        external_thread_id="codex-prover-thread",
     )
     store.create_candidate(proof, thread_id="prover-thread")
     store.seal_candidate(proof.id)
@@ -1350,6 +1776,11 @@ def prepare_adjudication_for_revision(
                     status=CheckStatus.PASS,
                     summary="Independent report.",
                     evidence_ids=(evidence.id,) if kind == "citation" else (),
+                    citation_support=(
+                        citation_support(proof, evidence)
+                        if kind == "citation"
+                        else ()
+                    ),
                 ),
             ),
             verifier_thread_id=local_id,
@@ -1464,6 +1895,7 @@ def test_verification_requires_reports_for_a_candidate_from_the_latest_proving_c
             role="prover",
             model="gpt-5.6-sol",
             provenance=provenance("prover-thread-2"),
+            external_thread_id="codex-prover-thread-2",
         )
         revised_proof = "A proof from the revised proving cycle."
         current_candidate = prior_candidate.model_copy(
@@ -1478,6 +1910,7 @@ def test_verification_requires_reports_for_a_candidate_from_the_latest_proving_c
         store.create_candidate(current_candidate, thread_id="prover-thread-2")
         store.seal_candidate(current_candidate.id)
         store.transition_stage("run-1", RunStage.VERIFICATION)
+        evidence = store.list_evidence("run-1")[0]
 
         def add_reports(target: ProofCandidate, prefix: str) -> None:
             for index, kind in enumerate(
@@ -1510,6 +1943,11 @@ def test_verification_requires_reports_for_a_candidate_from_the_latest_proving_c
                                 evidence_ids=("evidence-1",)
                                 if kind == "citation"
                                 else (),
+                                citation_support=(
+                                    citation_support(target, evidence)
+                                    if kind == "citation"
+                                    else ()
+                                ),
                             ),
                         ),
                         verifier_thread_id=thread_id,

@@ -131,7 +131,7 @@ export interface ThreadRecord {
 }
 
 export interface Evidence {
-  schema_version: 1;
+  schema_version: 1 | 2;
   id: string;
   kind: "paper" | "theorem" | "computation" | "human_guidance" | "source" | "note";
   title: string;
@@ -140,6 +140,10 @@ export interface Evidence {
   provenance: Provenance;
   source_uri: string | null;
   citation: string | null;
+  source_trust: "legacy_untrusted" | "model_reported" | "runtime_observed" | "server_captured";
+  content_trust: "legacy_untrusted" | "model_reported" | "runtime_observed" | "server_captured";
+  observation_ids: string[];
+  source_uri_sha256: string | null;
 }
 
 export interface PlanStep {
@@ -202,6 +206,15 @@ export interface VerificationCheck {
   summary: string;
   proof_spans: string[];
   evidence_ids: string[];
+  rule_ids: string[];
+  citation_support: CitationSupport[];
+}
+
+export interface CitationSupport {
+  evidence_id: string;
+  proof_span: string;
+  evidence_excerpt: string;
+  source_locator: string;
 }
 
 export interface Finding {
@@ -215,7 +228,7 @@ export interface Finding {
 }
 
 export interface VerificationReport {
-  schema_version: 1;
+  schema_version: 1 | 2 | 3;
   id: string;
   candidate_id: string;
   candidate_sha256: string;
@@ -245,13 +258,22 @@ export interface VerificationRecord {
 }
 
 export interface CandidateDecision {
-  schema_version: 1;
+  schema_version: 1 | 2 | 3;
   candidate_id: string;
   candidate_sha256: string;
   passed: boolean;
   required_kinds: ("structural" | "detailed" | "citation")[];
+  required_rule_ids: string[];
+  rule_coverage: RuleCoverage[];
   report_ids: string[];
   reasons: string[];
+}
+
+export interface RuleCoverage {
+  rule_id: string;
+  report_id: string;
+  check_id: string;
+  status: CheckStatus;
 }
 
 export interface Adjudication {

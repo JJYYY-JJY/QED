@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -20,10 +21,13 @@ from qed.runtime import (
     TurnRef,
     TurnStarted,
 )
+from qed.schemas import Provenance
 from qed.service import (
     ApplicationService,
     RunAlreadyActiveError,
     StreamHeartbeat,
+    build_management_service,
+    build_mock_service,
     build_service,
 )
 from qed.service_settings import ServiceSettings
@@ -42,6 +46,53 @@ def _mock_runtime() -> MockRuntime:
             proactive_multi_agent=False,
         )
     )
+
+
+async def test_management_service_cannot_start_research_execution(
+    tmp_path: Path,
+) -> None:
+    service = build_management_service(ServiceSettings(data_root=tmp_path))
+    try:
+        assert service.store_info().journal_mode == "wal"
+        with pytest.raises(RuntimeError, match="management-only"):
+            service.create_run(
+                RunInput(problem="Prove P."),
+                QEDConfig(),
+                run_id="run-management",
+            )
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize("command", ["start", "resume", "cancel"])
+async def test_management_commands_fail_before_mutating_run_state(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    settings = ServiceSettings(data_root=tmp_path)
+    with RunStore(settings.database_path) as store:
+        created = store.create_run(
+            f"run-management-{command}",
+            config=QEDConfig(),
+            run_input=RunInput(problem="Prove P."),
+            provenance=Provenance(
+                source="application",
+                model="gpt-5.6-sol",
+                runtime_version="test-runtime",
+                captured_at=datetime(2026, 7, 17, tzinfo=UTC),
+            ),
+        )
+        event_count = len(store.list_events(created.id))
+
+    service = build_management_service(settings)
+    try:
+        method = getattr(service, f"{command}_run")
+        with pytest.raises(RuntimeError, match="management-only"):
+            await method(created.id, idempotency_key=f"{command}-key")
+        assert service.get_run(created.id).status is RunStatus.CREATED
+        assert len(service.snapshot(created.id).events) == event_count
+    finally:
+        await service.close()
 
 
 class BlockingRuntime:
@@ -357,6 +408,28 @@ async def test_service_uses_only_the_explicit_runtime_factory_and_closes_once(
     assert calls == 1
     assert codex_homes == [tmp_path / "codex-home"]
     assert runtime.close_count == 1
+
+
+def test_production_service_requires_an_explicit_runtime_factory(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="runtime_factory is required"):
+        build_service(ServiceSettings(data_root=tmp_path))
+
+
+async def test_mock_service_is_explicit_and_records_mock_runtime_provenance(
+    tmp_path: Path,
+) -> None:
+    service = build_mock_service(ServiceSettings(data_root=tmp_path))
+
+    created = service.create_run(
+        RunInput(problem="Prove P."),
+        QEDConfig(),
+        run_id="run-explicit-mock",
+    )
+
+    assert created.runtime_version == "mock-runtime/1"
+    assert created.provenance.runtime_version == "mock-runtime/1"
+
+    await service.close()
 
 
 async def test_service_close_drains_late_terminal_before_closing_store(

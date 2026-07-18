@@ -10,7 +10,9 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints
 from qed.schemas import (
     Adjudication,
     CheckStatus,
+    CitationSupport,
     Evidence,
+    EvidenceTrust,
     Finding,
     Plan,
     PlanStep,
@@ -18,6 +20,7 @@ from qed.schemas import (
     Provenance,
     VerificationCheck,
     VerificationReport,
+    WebSearchObservation,
     canonical_sha256,
     sha256_text,
 )
@@ -69,6 +72,13 @@ class ProofDraft(ModelDraft):
     deviations: tuple[NonEmptyStr, ...] = ()
 
 
+class CitationSupportDraft(ModelDraft):
+    evidence_id: NonEmptyStr
+    proof_span: NonEmptyStr
+    evidence_excerpt: NonEmptyStr
+    source_locator: NonEmptyStr
+
+
 class VerificationCheckDraft(ModelDraft):
     id: NonEmptyStr
     category: NonEmptyStr
@@ -76,6 +86,8 @@ class VerificationCheckDraft(ModelDraft):
     summary: NonEmptyStr
     proof_spans: tuple[NonEmptyStr, ...] = ()
     evidence_ids: tuple[NonEmptyStr, ...] = ()
+    rule_ids: tuple[NonEmptyStr, ...] = ()
+    citation_support: tuple[CitationSupportDraft, ...] = ()
 
 
 class FindingDraft(ModelDraft):
@@ -107,28 +119,58 @@ def _stable_id(prefix: str, value: BaseModel | JsonValue) -> str:
 def materialize_evidence(
     draft: EvidenceBatch,
     provenance: Provenance,
+    *,
+    observations: tuple[WebSearchObservation, ...] = (),
 ) -> tuple[Evidence, ...]:
     """Assign evidence IDs and content hashes outside the model boundary."""
 
-    return tuple(
-        Evidence(
-            id=_stable_id(
-                "evidence",
-                {
-                    "draft": item.model_dump(mode="json"),
-                    "provenance_source_id": provenance.source_id,
-                },
-            ),
-            kind=item.kind,
-            title=item.title,
-            content=item.content,
-            content_sha256=sha256_text(item.content),
-            provenance=provenance,
-            source_uri=item.source_uri,
-            citation=item.citation,
+    materialized: list[Evidence] = []
+    for item in draft.items:
+        matching_observations = tuple(
+            sorted(
+                (
+                    observation
+                    for observation in observations
+                    if observation.uri == item.source_uri
+                    and observation.local_thread_id == provenance.source_id
+                ),
+                key=lambda observation: observation.id,
+            )
         )
-        for item in draft.items
-    )
+        materialized.append(
+            Evidence(
+                schema_version=2,
+                id=_stable_id(
+                    "evidence",
+                    {
+                        "draft": item.model_dump(mode="json"),
+                        "provenance_source_id": provenance.source_id,
+                    },
+                ),
+                kind=item.kind,
+                title=item.title,
+                content=item.content,
+                content_sha256=sha256_text(item.content),
+                provenance=provenance,
+                source_uri=item.source_uri,
+                citation=item.citation,
+                source_trust=(
+                    EvidenceTrust.RUNTIME_OBSERVED
+                    if matching_observations
+                    else EvidenceTrust.MODEL_REPORTED
+                ),
+                content_trust=EvidenceTrust.MODEL_REPORTED,
+                observation_ids=tuple(
+                    observation.id for observation in matching_observations
+                ),
+                source_uri_sha256=(
+                    sha256_text(item.source_uri)
+                    if item.source_uri is not None
+                    else None
+                ),
+            )
+        )
+    return tuple(materialized)
 
 
 def materialize_plan(
@@ -229,6 +271,16 @@ def materialize_report(
                 summary=check.summary,
                 proof_spans=check.proof_spans,
                 evidence_ids=check.evidence_ids,
+                rule_ids=check.rule_ids,
+                citation_support=tuple(
+                    CitationSupport(
+                        evidence_id=support.evidence_id,
+                        proof_span=support.proof_span,
+                        evidence_excerpt=support.evidence_excerpt,
+                        source_locator=support.source_locator,
+                    )
+                    for support in check.citation_support
+                ),
             )
             for check in draft.checks
         ),

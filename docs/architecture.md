@@ -1,8 +1,8 @@
 # Architecture
 
-QED turns one frozen mathematical problem into a content-addressed research
-record. SQLite owns state. Codex threads perform bounded work, and application
-code decides whether a candidate passes verification.
+QED v2 alpha turns one frozen mathematical problem into a content-addressed
+research record. SQLite owns state. Codex threads perform bounded work, and
+application code decides whether a candidate earns a QED policy PASS.
 
 ## System map
 
@@ -70,6 +70,16 @@ execution segment and retains earlier attempts. Paused, cancelled, and failed
 runs may resume from their current durable stage when no unconfirmed runtime
 turn or live execution lease remains.
 
+Operators inspect exceptional runs with `qed doctor RUN_ID`. QED lists
+execution segments, external thread and turn identities, unresolved runtime
+events, consumed budgets, and each condition that blocks resume. The locked
+runtime abstraction cannot query one authoritative status by exact
+backend/thread/turn identity across SDK, App Server, and exec. `qed reconcile`
+reports that limit and creates no evidence. An operator can run `qed abandon
+RUN_ID --reason ...` after a lease expires. The store writes an immutable
+operator event and moves the run to non-resumable `failed`; it does not
+synthesize a runtime terminal or grant PASS.
+
 Each model call uses an immutable frozen turn input. QED records a turn-attempt
 event before invoking the runtime; resume counts those events, so a process
 restart cannot replenish the configured retry allowance. Local runtime
@@ -92,9 +102,13 @@ replacement execution even after lease expiry.
 | Concern | Owner | Contract |
 | --- | --- | --- |
 | Input and configuration | `qed.inputs`, `qed.config` | Strict frozen Pydantic models with canonical SHA-256 hashes |
+| Declared state machines | `qed.state_machine` | Run, stage, and thread transition graphs |
+| Schema migration | `qed.store_schema` | Supported database versions and fail-closed identity preflight |
 | State and transitions | `qed.store` | SQLite transactions, immutable records, ordered events, execution fencing |
+| Exceptional-run diagnosis | `qed.operations` | Read-only blocker and budget manifest; no runtime-state mutation |
 | Codex transport | `qed.runtime` | One typed interface over SDK, App Server, and the selected exec fallback |
-| Stage orchestration | `qed.workflow` | Bounded retries, concurrency, cancel, resume, and role policy |
+| Stage orchestration | `qed.workflow` | Bounded retries, cancel, resume, and role policy |
+| Runtime-event support | `qed.workflow_support` | Search-event classification, observed-source records, and strict sibling cancellation |
 | HTTP and SSE | `qed.api` | Versioned request and response models, replay from `Last-Event-ID` |
 | CLI and process supervision | `qed.service`, `qed.cli` | The same commands and durable records as the HTTP surface |
 | Export | `qed.export` | Deterministic `proof.md`, `report.md`, and `manifest.json` bundle |
@@ -118,9 +132,15 @@ empty Git working directory, including retries. Request construction and local
 preflight happen inside the attempt loop, and all runtime adapters disable
 local shell, file-editing, browser, code-mode, plugin, and hook capabilities.
 
-The store binds each verifier report to a fresh external Codex thread identity.
-It rejects writer reuse, verifier reuse within a required report set, candidate
-hash drift, and report mutation.
+The store binds each verifier report to a nonempty external Codex thread
+identity. It compares that identity with the candidate author's external
+identity and with the other required verifiers. A database uniqueness
+constraint rejects duplicate `(run_id, external_thread_id)` values. Migration
+stops and names existing duplicates instead of overwriting them.
+
+Fresh means that Codex created a new conversation state for the verifier. The
+prover and verifier can still use the same model weights and share systematic
+biases.
 
 Stage gates are scoped to the current revision cycle. A proving-cycle entry
 sets the lower event-sequence bound for eligible sealed candidates. Verification
@@ -128,13 +148,35 @@ and adjudication can use only reports and decisions linked to candidates after
 that bound. Earlier candidates and reports stay immutable and visible for audit,
 but they cannot satisfy a later cycle.
 
-## PASS and export
+## QED policy PASS and export
 
 The application requires structural and detailed reports for each candidate. A
-run with evidence also requires a citation report that references every stored
-evidence record and no unknown evidence ID. Accepted reports must contain
-consistent checks and findings. Application code recomputes the candidate
-decision from the frozen reports.
+run with evidence also requires a citation report with structured support for
+every stored evidence record and no unknown evidence ID. Each support record
+binds an exact span of the frozen proof to an exact excerpt of the frozen
+evidence and its registered URI or ledger locator. A bare evidence ID or
+free-text mention does not count. This proves that the citation check used the
+registered bytes; the LLM still judges whether those bytes semantically support
+the claim. Accepted reports must contain consistent checks and findings. QED
+assigns stable IDs to frozen user
+verification rules. Reports may cover a rule together, but at least one
+structured PASS check must name each required rule ID. Unknown IDs, missing
+coverage, FAIL, and UNCERTAIN all block PASS. Application code recomputes the
+candidate decision from the frozen reports.
+
+Export uses a durable `export_intent` boundary. The manifest records the run
+status and stage observed at that event-chain boundary, normally
+`running/export`, while separately recording the code verdict. Publishing the
+content-addressed files is followed by artifact registration and the
+`complete/completed` transition. A crash can leave an orphaned precommit bundle,
+but that bundle does not claim that the terminal transition was observed.
+`qed doctor` is the diagnostic manifest for non-success runs and includes every
+immutable operator decision; ordinary PASS exports also project any operator
+decision present in their selected event window.
+
+QED policy PASS means that a sealed candidate met the configured code gates and
+thread-isolated LLM checks. It does not certify peer review, formal or Lean
+verification, or mathematical truth.
 
 Completion requires a selected sealed candidate, its code decision, an
 adjudication, and three registered export artifacts. QED writes each bundle to:
@@ -149,14 +191,18 @@ adjudication, and three registered export artifacts. QED writes each bundle to:
 The manifest binds hashes for the input, configuration, evidence, plans,
 candidates, verifier reports, adjudications, code decisions, frozen turn
 inputs, thread provenance, proof-linked findings, and exported proof and report.
-It explicitly records terminal status `completed` and the code-derived verdict
-`PASS`, plus output-schema hashes, turn/backend lineage, prompt versions,
+It records the status and stage observed at the event-chain boundary and keeps
+the compatibility machine field `code_verdict: "PASS"`, whose reader-facing
+meaning is QED policy PASS. A production export-intent bundle records
+`running/export`; SQLite records the later terminal transition.
+The manifest also records rule-to-report/check coverage, output-schema hashes,
+turn/backend lineage, prompt versions,
 canonical runtime resolutions, execution segments, detailed usage and timing,
 and the first and last event sequences with a hash of the canonical event chain.
 Usage includes input, output, cached-input, and reasoning-output tokens, turns,
 search queries, and execution seconds. The bundle hash addresses the canonical
-manifest. Hashes detect modification; they do not provide a signature or author
-identity.
+manifest. SHA-256 provides integrity addressing. It does not provide an author
+signature, trusted timestamp, or source-authenticity proof.
 
 ## Runtime selection
 
@@ -171,6 +217,12 @@ The router uses the official Python SDK when it can represent every requested
 control. In `auto` mode, it sends unsupported controls through the
 version-matched App Server adapter. The `codex exec` backend runs only after a
 caller selects it. Every backend emits the same internal event models.
+
+The alpha configuration uses one global model name for all roles. A
+role-specific model change needs a versioned config and migration contract,
+per-turn actual-model recording, capability checks for each selected model, and
+cross-role test coverage. The alpha does not ship a partial role override. See
+[Role-specific model design](role-specific-models.md).
 
 ## Storage layout
 

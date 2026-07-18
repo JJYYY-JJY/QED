@@ -30,17 +30,22 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("keeps proof, reports, and evidence in one auditable workspace", async ({ page }, testInfo) => {
-  await expect(page.getByText("PASS", { exact: true })).toBeVisible();
-  await expect(page.getByText("3 independent reports", { exact: true })).toBeVisible();
+  await expect(page.getByText("QED policy PASS", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Passed configured thread-isolated LLM checks and code gates/)).toBeVisible();
+  await expect(page.getByText("3 required reports", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Fresh verifier threads isolate conversation state; they do not imply independent model weights/)).toBeVisible();
   await page.getByRole("button", { name: /Citation/ }).click();
   await expect(page.getByRole("heading", { name: "Citation report" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Verifier identity" })).toBeVisible();
   await expect(page.getByText("codex-thread-3", { exact: true })).toBeVisible();
+  await expect(page.getByText(/SHA-256 provides integrity addressing only; it is not an author signature or trusted timestamp/)).toBeVisible();
   if (testInfo.project.name.includes("mobile")) {
     await page.getByLabel("Research inspector").getByRole("button", { name: "Close inspector" }).click();
   }
 
   await page.getByRole("tab", { name: "Evidence" }).click();
   await expect(page.getByRole("heading", { name: "Evidence ledger" })).toBeVisible();
+  await expect(page.getByText(/A content hash records bytes; it does not establish source authenticity or citation support/)).toBeVisible();
   await expect(page.getByText("Classical group result", { exact: true })).toBeVisible();
 });
 

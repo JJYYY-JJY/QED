@@ -29,6 +29,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from qed.config import QEDConfig
 from qed.inputs import RunInput
 from qed.logging import get_logger
+from qed.runtime import create_codex_runtime
 from qed.schemas import Event, canonical_json
 from qed.service import (
     ApplicationService,
@@ -294,13 +295,20 @@ def create_app(
     service: ApplicationService | None = None,
     runtime_factory: RuntimeFactory | None = None,
 ) -> FastAPI:
-    """Build an app around one explicitly injected application service."""
+    """Build an app with an injected service or the production Codex runtime."""
 
     if service is not None and runtime_factory is not None:
         raise ValueError("service and runtime_factory are mutually exclusive")
-    selected_service = service or build_service(
-        settings,
-        runtime_factory=runtime_factory,
+    selected_runtime_factory = (
+        create_codex_runtime if runtime_factory is None else runtime_factory
+    )
+    selected_service = (
+        service
+        if service is not None
+        else build_service(
+            settings,
+            runtime_factory=selected_runtime_factory,
+        )
     )
 
     @asynccontextmanager

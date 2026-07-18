@@ -58,7 +58,7 @@ const EVENT_LABELS: Record<string, string> = {
   "proof.attempt_reserved": "Proof attempt reserved",
   "candidate.created": "Candidate created",
   "candidate.sealed": "Candidate sealed",
-  "verification.created": "Independent report recorded",
+  "verification.created": "Verifier report recorded",
   "adjudication.created": "Adjudication recorded",
   "candidate.decision_recorded": "Code decision recorded",
   "artifact.created": "Export artifact recorded",

@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/JJYYY-JJY/QED/benchmarks/reliability/case.schema.json",
+  "title": "QED reliability benchmark case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "case_id",
+    "title",
+    "category",
+    "statement",
+    "candidate_proof",
+    "verification_rules",
+    "expected",
+    "tags",
+    "citation",
+    "mutation"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]+$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "category": {
+      "enum": [
+        "known_true_correct_proof",
+        "false_statement",
+        "missing_assumption",
+        "quantifier_error",
+        "domain_error",
+        "correct_conclusion_invalid_proof",
+        "circular_reasoning",
+        "unproved_key_lemma",
+        "invalid_limit_exchange",
+        "inequality_direction",
+        "missing_boundary_case",
+        "semantic_mutation",
+        "citation_correct",
+        "citation_incorrect",
+        "citation_unsupported",
+        "citation_fabricated_metadata"
+      ]
+    },
+    "statement": {
+      "type": "string",
+      "minLength": 1
+    },
+    "candidate_proof": {
+      "type": "string",
+      "minLength": 1
+    },
+    "verification_rules": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_verdict",
+        "citation_support"
+      ],
+      "properties": {
+        "policy_verdict": {
+          "enum": [
+            "PASS",
+            "NON_PASS"
+          ]
+        },
+        "citation_support": {
+          "enum": [
+            "SUPPORTED",
+            "UNSUPPORTED",
+            "NOT_APPLICABLE"
+          ]
+        }
+      }
+    },
+    "tags": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "citation": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/citation"
+        }
+      ]
+    },
+    "mutation": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/mutation"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base_case_id",
+        "operator",
+        "description"
+      ],
+      "properties": {
+        "base_case_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operator": {
+          "enum": [
+            "key_step_deletion",
+            "quantifier_swap",
+            "symbol_change",
+            "assumption_replacement"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claim",
+        "cited_evidence_ids",
+        "evidence"
+      ],
+      "properties": {
+        "claim": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cited_evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_id",
+        "title",
+        "source_uri",
+        "final_uri",
+        "retrieved_at",
+        "excerpt",
+        "provenance",
+        "content_sha256"
+      ],
+      "properties": {
+        "evidence_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_uri": {
+          "type": "string",
+          "format": "uri"
+        },
+        "final_uri": {
+          "type": "string",
+          "format": "uri"
+        },
+        "retrieved_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "excerpt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provenance": {
+          "const": "benchmark_fixture"
+        },
+        "content_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

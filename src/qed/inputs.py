@@ -6,7 +6,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
-from qed.schemas import StrictModel, canonical_sha256
+from qed.schemas import NonEmptyStr, StrictModel, canonical_sha256
 
 ProblemText = Annotated[
     str,
@@ -20,6 +20,13 @@ VerificationRule = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=8_192),
 ]
+
+
+class FrozenVerificationRule(StrictModel):
+    """Application-assigned identity for one rule in a frozen run input."""
+
+    id: NonEmptyStr
+    text: VerificationRule
 
 
 class RunInput(StrictModel):
@@ -40,3 +47,16 @@ class RunInput(StrictModel):
     @property
     def sha256(self) -> str:
         return canonical_sha256(self)
+
+    @property
+    def frozen_verification_rules(self) -> tuple[FrozenVerificationRule, ...]:
+        return tuple(
+            FrozenVerificationRule(
+                id=(
+                    f"rule-{position:03d}-"
+                    f"{canonical_sha256({'position': position, 'text': text})[:16]}"
+                ),
+                text=text,
+            )
+            for position, text in enumerate(self.verification_rules, start=1)
+        )

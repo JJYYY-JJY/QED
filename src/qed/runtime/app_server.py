@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -135,6 +136,11 @@ class _ItemParams(_WireModel):
     thread_id: str = Field(alias="threadId", min_length=1)
     turn_id: str = Field(alias="turnId", min_length=1)
     item: dict[str, Any]
+    completed_at_ms: int | None = Field(
+        default=None,
+        alias="completedAtMs",
+        ge=0,
+    )
 
 
 class _TurnParams(_WireModel):
@@ -264,6 +270,14 @@ class AppServerRuntime:
                         item_id=item_id,
                         item_type=item_type,
                         payload=completed.item,
+                        completed_at=(
+                            datetime.fromtimestamp(
+                                completed.completed_at_ms / 1000,
+                                tz=UTC,
+                            )
+                            if completed.completed_at_ms is not None
+                            else None
+                        ),
                     )
                     continue
                 if method == "thread/tokenUsage/updated":

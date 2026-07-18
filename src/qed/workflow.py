@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -79,6 +79,13 @@ from qed.store import (
     ThreadRole,
     ThreadStatus,
 )
+from qed.workflow_support import (
+    counts_as_search_query,
+    gather_strict,
+    make_local_thread_id,
+    runtime_preference,
+    web_search_observation,
+)
 
 PROMPT_VERSIONS: dict[TurnRole, str] = {
     "literature": "qed-literature-v1",
@@ -124,6 +131,7 @@ class _TurnResult:
     thread_id: str
     external_thread_id: str
     provenance: Provenance
+    observation_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,49 +158,6 @@ class _TurnWorkspace:
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
-
-
-def _runtime_preference(value: str) -> RuntimePreference:
-    if value == "app-server":
-        return RuntimePreference.APP_SERVER
-    return RuntimePreference(value)
-
-
-def _local_thread_id(run_id: str, role: ThreadRole, external_id: str) -> str:
-    identity: dict[str, JsonValue] = {
-        "run_id": run_id,
-        "role": role.value,
-        "external_thread_id": external_id,
-    }
-    return f"thread-{canonical_sha256(identity)[:24]}"
-
-
-def _counts_as_search_query(event: ItemCompleted) -> bool:
-    if event.item_type not in {"webSearch", "web_search", "web_search_call"}:
-        return False
-    action = event.payload.get("action")
-    if not isinstance(action, dict):
-        return True
-    action_type = action.get("type")
-    if action_type in {"openPage", "open_page", "findInPage", "find_in_page"}:
-        return False
-    return action_type == "search" or action_type is None
-
-
-async def _gather_strict[GatherT](
-    coroutines: tuple[Coroutine[Any, Any, GatherT], ...],
-) -> tuple[GatherT, ...]:
-    """Cancel and drain every sibling when one concurrent operation fails."""
-
-    tasks = tuple(asyncio.create_task(coroutine) for coroutine in coroutines)
-    try:
-        return tuple(await asyncio.gather(*tasks))
-    except BaseException:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
 
 
 class ResearchWorkflow:
@@ -547,16 +512,50 @@ class ResearchWorkflow:
                 candidate_id: tuple(reports)
                 for candidate_id, reports in grouped.items()
             }
-            required_evidence_ids = tuple(
-                item.id for item in self._store.list_evidence(run_id)
+            evidence = self._store.list_evidence(run_id)
+            required_rule_ids = tuple(
+                rule.id for rule in run_input.frozen_verification_rules
             )
-            require_citation = bool(required_evidence_ids)
+            require_citation = bool(evidence)
+            candidate_records = {
+                record.id: record
+                for record in self._store.list_candidates(run_id)
+            }
+            threads = {
+                thread.id: thread
+                for thread in self._store.list_threads(run_id)
+            }
+
+            prover_external_ids: dict[str, str] = {}
+            for cycle_candidate in candidates:
+                candidate_id = cycle_candidate.id
+                candidate_record = candidate_records.get(candidate_id)
+                prover_thread = (
+                    threads.get(candidate_record.thread_id)
+                    if candidate_record is not None
+                    and candidate_record.thread_id is not None
+                    else None
+                )
+                if (
+                    prover_thread is None
+                    or prover_thread.role is not ThreadRole.PROVER
+                    or prover_thread.external_thread_id is None
+                ):
+                    raise WorkflowExecutionError(
+                        f"candidate {candidate_id} is missing prover external identity"
+                    )
+                prover_external_ids[candidate_id] = (
+                    prover_thread.external_thread_id
+                )
+
             advisory_decisions = {
                 candidate.id: decide_candidate(
                     candidate,
                     reports_by_candidate[candidate.id],
+                    prover_external_thread_id=prover_external_ids[candidate.id],
                     require_citation=require_citation,
-                    required_evidence_ids=required_evidence_ids,
+                    required_evidence=evidence,
+                    required_rule_ids=required_rule_ids,
                 )
                 for candidate in candidates
             }
@@ -843,7 +842,15 @@ class ResearchWorkflow:
             },
             capabilities=capabilities,
         )
-        evidence = materialize_evidence(cast(EvidenceBatch, result.output), result.provenance)
+        observations = tuple(
+            self._store.get_web_search_observation(observation_id)
+            for observation_id in result.observation_ids
+        )
+        evidence = materialize_evidence(
+            cast(EvidenceBatch, result.output),
+            result.provenance,
+            observations=observations,
+        )
         self._store.add_evidence_batch(
             run_id,
             evidence,
@@ -934,7 +941,7 @@ class ResearchWorkflow:
                 capabilities=capabilities,
             )
 
-        results = await _gather_strict(
+        results = await gather_strict(
             tuple(prove_one(attempt) for attempt in missing_attempts)
         )
         created: list[ProofCandidate] = list(existing)
@@ -1013,7 +1020,10 @@ class ResearchWorkflow:
                     schema=VerificationDraft,
                     payload={
                         "problem": run_input.problem,
-                        "verification_rules": list(run_input.verification_rules),
+                        "verification_rules": [
+                            rule.model_dump(mode="json")
+                            for rule in run_input.frozen_verification_rules
+                        ],
                         "candidate": candidate.model_dump(mode="json"),
                         "plan": plan.model_dump(mode="json"),
                         "evidence": [item.model_dump(mode="json") for item in evidence],
@@ -1042,7 +1052,7 @@ class ResearchWorkflow:
             requests.extend(
                 (candidate, kind, prompt_role) for kind, prompt_role in required
             )
-        reports = await _gather_strict(
+        reports = await gather_strict(
             tuple(
                 verify_one(candidate, kind, prompt_role)
                 for candidate, kind, prompt_role in requests
@@ -1337,7 +1347,7 @@ class ResearchWorkflow:
             thread=FreshThread(),
             role=work_role,
             web_search=WebSearchMode.LIVE if can_search else WebSearchMode.DISABLED,
-            runtime=_runtime_preference(run.config.backend),
+            runtime=runtime_preference(run.config.backend),
             cwd=cwd,
         )
 
@@ -1438,11 +1448,16 @@ class ResearchWorkflow:
         provenance: Provenance | None = None
         pending_runtime_error: WorkflowExecutionError | None = None
         usage_observed = False
+        observation_ids: list[str] = []
         events = self._runtime.stream(request)
         try:
             async for event in events:
                 if isinstance(event, ThreadStarted):
-                    local_thread_id = _local_thread_id(run_id, thread_role, event.thread_id)
+                    local_thread_id = make_local_thread_id(
+                        run_id,
+                        thread_role,
+                        event.thread_id,
+                    )
                     provenance = Provenance(
                         source="codex",
                         source_id=local_thread_id,
@@ -1516,7 +1531,18 @@ class ResearchWorkflow:
                             await self._interrupt_turn(turn)
                         continue
                 elif isinstance(event, ItemCompleted):
-                    counts_as_query = _counts_as_search_query(event)
+                    if local_thread_id is None or turn is None:
+                        raise WorkflowExecutionError(
+                            f"{schema.__name__} received an item before turn start"
+                        )
+                    if (
+                        event.thread_id != turn.thread_id
+                        or event.turn_id != turn.turn_id
+                    ):
+                        raise WorkflowExecutionError(
+                            f"{schema.__name__} received an item for another turn"
+                        )
+                    counts_as_query = counts_as_search_query(event)
                     stage = self._store.get_run(run_id).stage
                     self._store.append_event(
                         run_id,
@@ -1531,6 +1557,23 @@ class ResearchWorkflow:
                         },
                         execution=self._execution(run_id),
                     )
+                    observation = web_search_observation(
+                        event,
+                        run_id=run_id,
+                        local_thread_id=local_thread_id,
+                        turn=turn,
+                        captured_at=event.completed_at or self._clock(),
+                    )
+                    if observation is not None:
+                        if request.web_search is WebSearchMode.DISABLED:
+                            raise WorkflowExecutionError(
+                                "runtime emitted a web action for an offline turn"
+                            )
+                        persisted = self._store.add_web_search_observation(
+                            observation,
+                            execution=self._execution(run_id),
+                        )
+                        observation_ids.append(persisted.id)
                     if counts_as_query:
                         key = (run_id, stage)
                         self._queries_by_stage[key] = self._queries_by_stage.get(key, 0) + 1
@@ -1704,6 +1747,7 @@ class ResearchWorkflow:
                         thread_id=local_thread_id,
                         external_thread_id=event.turn.thread_id,
                         provenance=provenance,
+                        observation_ids=tuple(observation_ids),
                     )
         except asyncio.CancelledError:
             if turn is not None:

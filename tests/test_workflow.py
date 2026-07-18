@@ -30,14 +30,16 @@ from qed.runtime import (
     TurnRef,
     TurnStarted,
 )
-from qed.schemas import canonical_sha256
+from qed.schemas import EvidenceTrust, VerificationReport, canonical_sha256
 from qed.store import (
     ConflictError,
+    ExecutionToken,
     RunStage,
     RunStatus,
     RunStore,
     ThreadRole,
     ThreadStatus,
+    VerificationRecord,
 )
 from qed.workflow import ResearchWorkflow, WorkflowExecutionError
 
@@ -54,6 +56,7 @@ class ScriptedRuntime:
         literature_queries: int = 0,
         block_title: str | None = None,
         constant_turn_id: bool = False,
+        literature_observed_uri: str | None = None,
     ) -> None:
         self.responses = {title: deque(values) for title, values in responses.items()}
         self.counts: defaultdict[str, int] = defaultdict(int)
@@ -73,6 +76,7 @@ class ScriptedRuntime:
         self.literature_queries = literature_queries
         self.block_title = block_title
         self.constant_turn_id = constant_turn_id
+        self.literature_observed_uri = literature_observed_uri
         self.turn_reached = asyncio.Event()
         self._blocked_turn: TurnRef | None = None
         self._release_blocked_turn = asyncio.Event()
@@ -118,6 +122,22 @@ class ScriptedRuntime:
             ),
         )
         if title == "EvidenceBatch":
+            if self.literature_observed_uri is not None:
+                yield ItemCompleted(
+                    thread_id=thread_id,
+                    turn_id=turn.turn_id,
+                    item_id="open-source",
+                    item_type="webSearch",
+                    payload={
+                        "id": "open-source",
+                        "type": "webSearch",
+                        "query": "primary source",
+                        "action": {
+                            "type": "openPage",
+                            "url": self.literature_observed_uri,
+                        },
+                    },
+                )
             for query_number in range(self.literature_queries):
                 yield ItemCompleted(
                     thread_id=thread_id,
@@ -191,6 +211,16 @@ class ScriptedRuntime:
                 response = json.loads(json.dumps(response))
                 response["checks"][0]["evidence_ids"] = [
                     item["id"] for item in payload["evidence"]
+                ]
+                response["checks"][0]["citation_support"] = [
+                    {
+                        "evidence_id": item["id"],
+                        "proof_span": payload["candidate"]["proof"],
+                        "evidence_excerpt": item["content"],
+                        "source_locator": item.get("source_uri")
+                        or f"evidence:{item['id']}",
+                    }
+                    for item in payload["evidence"]
                 ]
             yield TurnCompleted(
                 turn=turn,
@@ -442,6 +472,57 @@ async def test_workflow_completes_with_sealed_independently_verified_candidate(
         "proof",
         "report",
     }
+
+
+async def test_workflow_binds_evidence_to_observed_web_action(
+    tmp_path: Path,
+) -> None:
+    source_uri = "https://example.test/euclid"
+    responses = passing_responses()
+    responses["EvidenceBatch"][0]["items"][0]["source_uri"] = source_uri
+    runtime = ScriptedRuntime(
+        responses,
+        literature_observed_uri=source_uri,
+    )
+
+    with RunStore(tmp_path / "qed.sqlite3") as store:
+        workflow = ResearchWorkflow(store, runtime, runtime_version="test-runtime")
+        created = workflow.create_run(
+            RunInput(problem="Prove that there are infinitely many primes."),
+            config(),
+            run_id="run-observed-evidence",
+        )
+
+        await workflow.execute(created.id)
+
+        (observation,) = store.list_web_search_observations(created.id)
+        (evidence,) = store.list_evidence(created.id)
+        assert observation.uri == source_uri
+        assert evidence.source_trust is EvidenceTrust.RUNTIME_OBSERVED
+        assert evidence.content_trust is EvidenceTrust.MODEL_REPORTED
+        assert evidence.observation_ids == (observation.id,)
+        manifest_artifact = next(
+            item for item in store.snapshot(created.id).artifacts
+            if item.kind == "manifest"
+        )
+        assert manifest_artifact.relative_path is not None
+        manifest = json.loads(
+            (tmp_path / "exports" / manifest_artifact.relative_path).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert manifest["evidence_provenance"] == [
+            {
+                "content_trust": "model_reported",
+                "evidence_id": evidence.id,
+                "observation_ids": [observation.id],
+                "schema_version": 2,
+                "source_trust": "runtime_observed",
+                "source_uri_sha256": evidence.source_uri_sha256,
+            }
+        ]
+        assert manifest["web_search_observations"][0]["id"] == observation.id
+        assert manifest["web_search_observations"][0]["uri"] == source_uri
 
 
 async def test_usage_identity_includes_thread_when_turn_ids_repeat(tmp_path: Path) -> None:
@@ -1106,6 +1187,69 @@ async def test_cancellation_drains_final_usage_before_interrupted_terminal(
     )
 
 
+async def test_cancel_waits_for_delayed_terminal_before_ending_event_chain(
+    tmp_path: Path,
+) -> None:
+    class DelayedTerminalRuntime(ScriptedRuntime):
+        def __init__(self) -> None:
+            super().__init__(passing_responses())
+            self.terminal_emitted = asyncio.Event()
+
+        async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
+            self.requests.append(request)
+            turn = TurnRef(
+                thread_id="delayed-terminal-thread",
+                turn_id="delayed-terminal-turn",
+                backend=RuntimeBackend.MOCK,
+            )
+            yield ThreadStarted(thread_id=turn.thread_id, backend=turn.backend)
+            yield TurnStarted(turn=turn)
+            self._blocked_turn = turn
+            self.turn_reached.set()
+            await self._release_blocked_turn.wait()
+            await asyncio.sleep(0.05)
+            self.terminal_emitted.set()
+            yield TurnCompleted(turn=turn, status="interrupted")
+
+    runtime = DelayedTerminalRuntime()
+    with RunStore(tmp_path / "qed.sqlite3") as store:
+        workflow = ResearchWorkflow(store, runtime, runtime_version="test-runtime")
+        workflow.create_run(
+            RunInput(problem="Prove that there are infinitely many primes."),
+            config(),
+            run_id="run-1",
+        )
+        running = asyncio.create_task(workflow.execute("run-1"))
+        await asyncio.wait_for(runtime.turn_reached.wait(), timeout=1)
+
+        cancelling = asyncio.create_task(workflow.cancel("run-1"))
+        await asyncio.sleep(0.01)
+        assert not runtime.terminal_emitted.is_set()
+        assert not cancelling.done()
+
+        await asyncio.wait_for(runtime.terminal_emitted.wait(), timeout=1)
+        cancelled = await asyncio.wait_for(cancelling, timeout=1)
+        assert await asyncio.wait_for(running, timeout=1) == cancelled
+        snapshot = store.snapshot("run-1")
+
+    assert cancelled.status is RunStatus.CANCELLED
+    terminal = next(
+        event for event in snapshot.events if event.event_type == "runtime.turn_completed"
+    )
+    cancelled_event = next(
+        event for event in snapshot.events if event.event_type == "run.cancelled"
+    )
+    assert terminal.seq < cancelled_event.seq
+    assert [event.seq for event in snapshot.events] == list(
+        range(1, len(snapshot.events) + 1)
+    )
+    assert snapshot.execution_segments[-1].released_at is not None
+    assert not any(
+        event.event_type == "runtime.turn_terminal_unconfirmed"
+        for event in snapshot.events
+    )
+
+
 async def test_worker_task_cancellation_pauses_run_and_interrupts_active_turn(
     tmp_path: Path,
 ) -> None:
@@ -1130,6 +1274,86 @@ async def test_worker_task_cancellation_pauses_run_and_interrupts_active_turn(
     assert paused.resumable is True
     assert runtime.interruptions
     assert all(thread.status is not ThreadStatus.ACTIVE for thread in snapshot.threads)
+
+
+async def test_verification_persistence_interruption_resumes_without_rewriting_report(
+    tmp_path: Path,
+) -> None:
+    class InterruptAfterFirstVerificationStore(RunStore):
+        interrupted = False
+
+        def add_verification(
+            self,
+            run_id: str,
+            report: VerificationReport,
+            *,
+            execution: ExecutionToken | None = None,
+        ) -> VerificationRecord:
+            record = super().add_verification(
+                run_id,
+                report,
+                execution=execution,
+            )
+            if not self.interrupted:
+                self.interrupted = True
+                raise asyncio.CancelledError
+            return record
+
+    database = tmp_path / "qed.sqlite3"
+    first_runtime = ScriptedRuntime(passing_responses())
+    recovery_config = config().model_copy(
+        update={"budgets": config().budgets.model_copy(update={"turn_retries": 1})}
+    )
+    with InterruptAfterFirstVerificationStore(database) as store:
+        first = ResearchWorkflow(store, first_runtime, runtime_version="test-runtime")
+        first.create_run(
+            RunInput(problem="Prove that there are infinitely many primes."),
+            recovery_config,
+            run_id="run-1",
+        )
+
+        running = asyncio.create_task(first.execute("run-1"))
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        paused = store.snapshot("run-1")
+
+    assert paused.run.status is RunStatus.PAUSED
+    assert paused.run.stage is RunStage.VERIFICATION
+    assert len(paused.verifications) == 1
+    frozen_report = paused.verifications[0]
+
+    second_runtime = ScriptedRuntime(passing_responses())
+    second_runtime.counts["VerificationDraft"] = 3
+    with RunStore(database) as reopened:
+        second = ResearchWorkflow(
+            reopened,
+            second_runtime,
+            runtime_version="test-runtime",
+        )
+        completed = await second.resume(
+            "run-1",
+            idempotency_key="resume-verification-persistence",
+        )
+        resumed = reopened.snapshot("run-1")
+
+    assert completed.status is RunStatus.COMPLETED
+    assert resumed.verifications[0] == frozen_report
+    assert len(resumed.verifications) == 3
+    assert len(
+        [
+            event
+            for event in resumed.events
+            if event.event_type == "verification.created"
+            and event.payload["verification_id"] == frozen_report.id
+        ]
+    ) == 1
+    assert len(
+        [
+            request
+            for request in second_runtime.requests
+            if request.output_schema["title"] == "VerificationDraft"
+        ]
+    ) == 2
 
 
 async def test_heartbeat_failure_fails_run_and_always_releases_worker_state(
@@ -1575,6 +1799,73 @@ async def test_token_budget_survives_process_restart_and_fails_before_candidate(
         assert second_runtime.counts["VerificationDraft"] == 0
 
 
+async def test_turn_retry_budget_survives_worker_restart(tmp_path: Path) -> None:
+    class FailThenBlockRetryRuntime(ScriptedRuntime):
+        async def stream(self, request: RunRequest) -> AsyncIterator[RuntimeEvent]:
+            async for event in super().stream(request):
+                if (
+                    isinstance(event, TurnCompleted)
+                    and request.output_schema["title"] == "EvidenceBatch"
+                    and self.counts["EvidenceBatch"] == 1
+                ):
+                    self.block_title = "EvidenceBatch"
+                yield event
+
+    database = tmp_path / "qed.sqlite3"
+    responses = passing_responses()
+    responses["EvidenceBatch"].insert(
+        0,
+        {"__runtime_error__": "temporary App Server overload"},
+    )
+    first_runtime = FailThenBlockRetryRuntime(responses)
+    retry_config = config().model_copy(
+        update={"budgets": config().budgets.model_copy(update={"turn_retries": 1})}
+    )
+    with RunStore(database) as store:
+        first = ResearchWorkflow(store, first_runtime, runtime_version="test-runtime")
+        first.create_run(
+            RunInput(problem="Prove that there are infinitely many primes."),
+            retry_config,
+            run_id="run-1",
+        )
+        running = asyncio.create_task(first.execute("run-1"))
+        await asyncio.wait_for(first_runtime.turn_reached.wait(), timeout=1)
+
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        paused = store.snapshot("run-1")
+
+    assert paused.run.status is RunStatus.PAUSED
+    assert len(
+        [
+            event
+            for event in paused.events
+            if event.event_type == "runtime.turn_attempt_started"
+            and event.payload["output_schema"] == "EvidenceBatch"
+        ]
+    ) == 2
+    assert len(
+        [event for event in paused.events if event.event_type == "runtime.turn_retry"]
+    ) == 1
+
+    second_runtime = ScriptedRuntime(passing_responses())
+    with RunStore(database) as reopened:
+        second = ResearchWorkflow(
+            reopened,
+            second_runtime,
+            runtime_version="test-runtime",
+        )
+        with pytest.raises(WorkflowExecutionError, match="exhausted 1 turn retries"):
+            await second.resume(
+                "run-1",
+                idempotency_key="resume-after-retry-budget",
+            )
+
+        assert reopened.get_run("run-1").status is RunStatus.FAILED
+        assert second_runtime.requests == []
+
+
 async def test_run_time_budget_survives_process_restart(tmp_path: Path) -> None:
     now = [datetime(2026, 7, 16, 12, 0, tzinfo=UTC)]
     database = tmp_path / "qed.sqlite3"
@@ -1649,6 +1940,63 @@ async def test_search_query_budget_is_durable_and_interrupts_excess_turn(
 
     assert len(query_events) == 2
     assert runtime.interruptions
+
+
+async def test_search_query_budget_survives_process_restart(tmp_path: Path) -> None:
+    database = tmp_path / "qed.sqlite3"
+    limited = config().model_copy(
+        update={
+            "search": config().search.model_copy(update={"max_queries_per_stage": 1}),
+            "budgets": config().budgets.model_copy(update={"turn_retries": 1}),
+        }
+    )
+    first_runtime = ScriptedRuntime(
+        passing_responses(),
+        literature_queries=1,
+        block_title="EvidenceBatch",
+    )
+    with RunStore(database) as store:
+        first = ResearchWorkflow(store, first_runtime, runtime_version="test-runtime")
+        first.create_run(
+            RunInput(problem="Prove that there are infinitely many primes."),
+            limited,
+            run_id="run-1",
+        )
+        running = asyncio.create_task(first.execute("run-1"))
+        await asyncio.wait_for(first_runtime.turn_reached.wait(), timeout=1)
+
+        cancelled = await first.cancel("run-1")
+        assert await asyncio.wait_for(running, timeout=1) == cancelled
+        assert cancelled.status is RunStatus.CANCELLED
+
+    second_runtime = ScriptedRuntime(
+        passing_responses(),
+        literature_queries=1,
+    )
+    second_runtime.counts["EvidenceBatch"] = 1
+    with RunStore(database) as reopened:
+        second = ResearchWorkflow(
+            reopened,
+            second_runtime,
+            runtime_version="test-runtime",
+        )
+        with pytest.raises(WorkflowExecutionError, match="search query budget"):
+            await second.resume(
+                "run-1",
+                idempotency_key="resume-after-query-budget",
+            )
+        failed = reopened.snapshot("run-1")
+
+    assert failed.run.status is RunStatus.FAILED
+    assert len(
+        [
+            event
+            for event in failed.events
+            if event.event_type == "runtime.item_completed"
+            and event.payload.get("counts_as_search_query") is True
+        ]
+    ) == 2
+    assert len(second_runtime.requests) == 1
 
 
 async def test_resume_from_export_does_not_repeat_model_work(
