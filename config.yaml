@@ -18,19 +18,18 @@ claude:
   provider: "api_key"
 
   # --- Option 1: Claude subscription (Pro/Max) ---
-  # No API key needed. Model is a shorthand: "opus", "sonnet", "haiku"
-  # Claude Max required for "opus". Claude Pro supports "sonnet".
+  # No API key needed. Use "claude-opus-5" for Opus 5.
   subscription:
-    model: "opus"
+    model: "claude-fable-5"
 
   # --- Option 2: AWS Bedrock ---
   bedrock:
-    model: "us.anthropic.claude-opus-4-6-v1[1m]"
+    model: "us.anthropic.claude-fable-5[1m]"  # or "us.anthropic.claude-opus-5[1m]"
     aws_profile: "default"
 
   # --- Option 3: Anthropic API key ---
   api_key:
-    model: "claude-opus-4-6"
+    model: "claude-fable-5"  # or "claude-opus-5"
     key: ""  # paste your Anthropic API key here
 
 # --- Codex (OpenAI) ---
