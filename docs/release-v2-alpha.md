@@ -1,5 +1,9 @@
 # QED v2 alpha release boundary
 
+> Historical / non-runtime record. This alpha checklist is retained for
+> provenance; the current release boundary is `docs/release-v2-stable.md` and
+> the machine-checked stable evidence contract.
+
 The `codex-native-rewrite` branch is a QED v2 alpha candidate. It can enter
 formal pull-request review after the checklist below has evidence. It does not
 replace `main` as a stable release by declaration.

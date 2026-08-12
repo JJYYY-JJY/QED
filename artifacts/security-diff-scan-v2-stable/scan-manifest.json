@@ -1,0 +1,104 @@
+{
+  "documentType": "codex-security.scan-manifest",
+  "scan": {
+    "artifacts": [
+      {
+        "mediaType": "application/json",
+        "path": "findings.json",
+        "sha256": "ed039c3d7348d05912badf9278705ccc511459d0ed12666690a64722d1695791"
+      },
+      {
+        "mediaType": "application/json",
+        "path": "coverage.json",
+        "sha256": "6daf6c15f4bb8a42aeca3c99e3ab0d77c9e61b7aa1e393d7aeaae4212bec19e5"
+      },
+      {
+        "mediaType": "application/octet-stream",
+        "path": "artifacts/01_context/threat_model.md",
+        "sha256": "bc11b7468e63e6e6a7962b2b94272ab7d01285f72336fff6eba9a9603441929d"
+      },
+      {
+        "mediaType": "application/octet-stream",
+        "path": "artifacts/02_discovery/work_ledger.jsonl",
+        "sha256": "173f63f8f0bf37047b77d316bf82db8cb40b32afa912dac5bc0e3a3176e498f0"
+      }
+    ],
+    "completedAt": "2026-08-12T01:21:18.617201Z",
+    "coverageRef": "coverage.json",
+    "findingsRef": "findings.json",
+    "id": "cc2e7d79-c9f2-42e7-84ae-58c22896d567",
+    "producer": {
+      "name": "codex-security-plugin",
+      "version": "0.1.18"
+    },
+    "scope": {
+      "artifactsReviewed": [
+        "artifacts/01_context/security_guidance.md",
+        "artifacts/01_context/threat_model.md",
+        "artifacts/02_discovery/deep_review_input.jsonl",
+        "artifacts/02_discovery/work_ledger.jsonl",
+        "artifacts/02_discovery/finding_discovery_report.md"
+      ],
+      "context": "Codex-only QED runtime; fail closed on provider, credential, filesystem, network, protocol, and bundle-integrity boundaries.",
+      "excludePaths": [],
+      "includePaths": [
+        "."
+      ],
+      "limitations": [
+        "Delegated workers were unavailable; this scan does not claim independent worker/model diversity.",
+        "The current parent review found no additional distinct candidate, but the prior partial baseline scan remains a separate release evidence blocker until closeout is accepted."
+      ],
+      "runtimeStatus": "Parent-agent fallback; official Codex Security scan has no delegated worker capability in this session.",
+      "summary": "Working-tree diff against the alpha candidate HEAD, with changed-file security review and directly supporting runtime/security paths.",
+      "validationMode": "diff-scoped source review with regression-test and secret/export scan cross-checks"
+    },
+    "sealedAt": "2026-08-12T01:21:18.617201Z",
+    "startedAt": "2026-08-12T01:16:33.097025Z",
+    "status": "completed",
+    "target": {
+      "baseRevision": "df40a9683004ab58fb38497d1aecfc8f1fffa288",
+      "displayName": "QED",
+      "headRevision": "df40a9683004ab58fb38497d1aecfc8f1fffa288",
+      "kind": "git_diff",
+      "snapshotDigest": "codex-security-snapshot/v1:sha256:bcece120c01f5cf5740d08cf93f1f8fb9acd9521933288a51794205f86610bf5",
+      "targetId": "target_sha256_192a804361b55a71e1da32163a5310fcf01116f9c4b58827fb9f273253013066"
+    },
+    "threatModel": {
+      "assets": [
+        "frozen problem and proof records",
+        "Codex credentials and dedicated CODEX_HOME",
+        "SQLite state, leases, fencing, and audit events",
+        "server-owned workspaces and export bundles",
+        "model/provider/runtime provenance"
+      ],
+      "assumptions": [
+        "remote deployment is unsupported and non-loopback bind is rejected",
+        "official Codex credentials are supplied only through a dedicated operator-controlled home",
+        "offline verification must work without runtime or network access"
+      ],
+      "attackerCapabilities": [
+        "submit malformed API or protocol data",
+        "control untrusted citation URLs/content",
+        "attempt path/link/hard-link traversal",
+        "replay stale workers or idempotency keys",
+        "supply prompt-injection text in evidence or candidate content"
+      ],
+      "securityObjectives": [
+        "fail closed on unknown identity, terminal, schema, provider, or policy state",
+        "prevent credential and workspace boundary escape",
+        "preserve immutable audit lineage and event ordering",
+        "keep model-reported data below server-captured authority"
+      ],
+      "summary": "QED protects frozen mathematical inputs, immutable research records, Codex credentials and thread lineage, SQLite state transitions, managed workspaces, citation network boundaries, and content-addressed export integrity.",
+      "trustBoundaries": [
+        "operator/API to application service",
+        "application service to SQLite",
+        "application runtime to official Codex adapter",
+        "citation fetcher to untrusted literature bytes",
+        "export producer to offline bundle verifier",
+        "frontend to loopback HTTP/SSE API"
+      ]
+    }
+  },
+  "schemaVersion": "1.0"
+}

@@ -1,4 +1,4 @@
-import { formatDate } from "../format";
+import { formatDate, runStatusLabel } from "../format";
 import type { RunRecord } from "../types";
 import { useModalDrawer } from "../useModalDrawer";
 import { StatusBadge } from "./StatusBadge";
@@ -78,7 +78,7 @@ export function RunNavigation({
               >
                 <span className="run-list-title">{run.id}</span>
                 <span className="run-list-meta">
-                  <StatusBadge value={run.status} />
+                  <StatusBadge value={run.status} label={runStatusLabel(run.status)} />
                   <time dateTime={run.updated_at}>{formatDate(run.updated_at)}</time>
                 </span>
               </button>

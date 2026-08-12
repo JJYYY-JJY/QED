@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "command": "uv run --frozen mutmut run --max-children 2",
+  "commit_sha": "df40a9683004ab58fb38497d1aecfc8f1fffa288",
+  "scope": "src/qed/domain/state.py, src/qed/decision.py, src/qed/stable_contracts.py, src/qed/export.py, src/qed/persistence/migrations.py",
+  "environment": "macOS Darwin; Python 3.14.6; mutmut 3.7.0; current working tree",
+  "mutants": {
+    "killed": 1232,
+    "survived": 906,
+    "no_tests": 28,
+    "skipped": 0,
+    "suspicious": 0,
+    "timeout": 0,
+    "segfault": 0,
+    "total": 2166
+  },
+  "score": 0.5762394761468662,
+  "required_score": 0.9,
+  "result": "1232 of 2138 executable mutants killed; the core mutation gate failed closed.",
+  "limitation": "906 surviving mutations remain a code blocker; no threshold or test assertion was weakened."
+}

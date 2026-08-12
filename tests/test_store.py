@@ -1,5 +1,6 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -21,6 +22,13 @@ from qed.schemas import (
     WebSearchObservation,
     canonical_sha256,
     sha256_text,
+)
+from qed.stable_contracts import (
+    ClaimCoverage,
+    ClaimType,
+    ProofObligation,
+    ProofObligationGraph,
+    VerifierRole,
 )
 from qed.store import (
     ConflictError,
@@ -49,6 +57,7 @@ REQUIRED_TABLES = {
     "plans",
     "resume_commands",
     "runtime_resolutions",
+    "runtime_provenance",
     "runs",
     "run_inputs",
     "schema_metadata",
@@ -187,7 +196,7 @@ def test_store_persists_schema_lifecycle_and_monotonic_events(tmp_path) -> None:
 
     with RunStore(database) as store:
         info = store.info()
-        assert info.schema_version == 4
+        assert info.schema_version == 5
         assert info.journal_mode == "wal"
         assert info.foreign_keys is True
         assert set(info.tables) == REQUIRED_TABLES
@@ -239,7 +248,7 @@ def test_store_migrates_additive_database_schema_v1_to_v4(tmp_path) -> None:
     with RunStore(database):
         pass
 
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.execute("DROP TABLE turn_inputs")
         connection.execute("DROP TABLE runtime_resolutions")
         connection.execute("DROP TABLE resume_commands")
@@ -248,9 +257,10 @@ def test_store_migrates_additive_database_schema_v1_to_v4(tmp_path) -> None:
         connection.execute(
             "UPDATE schema_metadata SET value = '1' WHERE key = 'schema_version'"
         )
+        connection.commit()
 
     with RunStore(database) as migrated:
-        assert migrated.info().schema_version == 4
+        assert migrated.info().schema_version == 5
         assert set(migrated.info().tables) == REQUIRED_TABLES
 
 
@@ -274,7 +284,7 @@ def test_store_migration_rejects_duplicate_external_thread_identities(
             external_thread_id="codex-shared-thread",
         )
 
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.execute("DROP INDEX threads_external_unique_idx")
         connection.execute(
             """
@@ -293,6 +303,7 @@ def test_store_migration_rejects_duplicate_external_thread_identities(
         connection.execute(
             "UPDATE schema_metadata SET value = '2' WHERE key = 'schema_version'"
         )
+        connection.commit()
 
     with pytest.raises(
         StoreIntegrityError,
@@ -1204,9 +1215,24 @@ def test_cancel_and_resume_commands_are_idempotent_and_rotate_execution_version(
 
 def test_execution_runtime_resolution_is_full_hashed_and_immutable(tmp_path) -> None:
     resolution = {
+        "schema_version": 1,
+        "model_provider": "OpenAI",
         "model": "gpt-5.6-sol",
+        "model_version": "fixture-model-version",
+        "backend": "fixture",
+        "codex_runtime_version": "0.144.5",
+        "codex_cli_version": "fixture-cli/1",
+        "sdk_version": "fixture-sdk/1",
+        "app_server_version": "fixture-app-server/1",
+        "requested_effort": "auto",
         "selected_effort": "ultra",
-        "proactive_multi_agent": True,
+        "model_catalog_sha256": "0" * 64,
+        "config_sha256": "1" * 64,
+        "prompt_sha256": "2" * 64,
+        "schema_sha256": "3" * 64,
+        "executable_sha256": "4" * 64,
+        "capability_response_sha256": "5" * 64,
+        "protocol_version": "qed-fixture-protocol-v1",
     }
     with RunStore(tmp_path / "qed.sqlite3") as store:
         store.create_run(
@@ -1344,17 +1370,18 @@ def test_persisted_turn_start_blocks_crash_recovery_until_terminal(tmp_path) -> 
         with pytest.raises(ConflictError, match="confirmed terminal"):
             reopened.acknowledge_cancel("run-started")
 
-        reopened.record_turn_completed(
-            "run-started",
-            payload={
-                "thread_id": "remote-thread",
-                "turn_id": "remote-turn",
-                "backend": "app_server",
-                "status": "interrupted",
-            },
-            execution=token,
-        )
-        assert reopened.acknowledge_cancel("run-started").status is RunStatus.CANCELLED
+        with pytest.raises(ConflictError, match="stale execution token"):
+            reopened.record_turn_completed(
+                "run-started",
+                payload={
+                    "thread_id": "remote-thread",
+                    "turn_id": "remote-turn",
+                    "backend": "app_server",
+                    "status": "interrupted",
+                },
+                execution=token,
+            )
+        assert reopened.has_unconfirmed_runtime_turns("run-started")
 
 
 @pytest.mark.parametrize("terminal_status", ["completed", "failed", "interrupted"])
@@ -1407,19 +1434,18 @@ def test_expired_lease_cannot_override_unconfirmed_runtime_turn(
                 lease_token="replacement-secret",
             )
 
-        store.record_turn_completed(
-            "run-unconfirmed",
-            payload={
-                "thread_id": "remote-thread",
-                "turn_id": "remote-turn",
-                "backend": "app_server",
-                "status": terminal_status,
-            },
-            execution=token,
-        )
-        assert store.release_execution(token).released_at == now[0]
-        store.request_cancel("run-unconfirmed")
-        assert store.acknowledge_cancel("run-unconfirmed").status is RunStatus.CANCELLED
+        with pytest.raises(ConflictError, match="stale execution token"):
+            store.record_turn_completed(
+                "run-unconfirmed",
+                payload={
+                    "thread_id": "remote-thread",
+                    "turn_id": "remote-turn",
+                    "backend": "app_server",
+                    "status": terminal_status,
+                },
+                execution=token,
+            )
+        assert store.has_unconfirmed_runtime_turns("run-unconfirmed")
 
 
 def test_resume_idempotency_receipt_survives_failure_and_reopen(tmp_path) -> None:
@@ -1534,7 +1560,18 @@ def test_typed_artifacts_are_required_for_semantic_stage_progress_and_completion
         for kind, local_id, external_id in (
             ("structural", "structural-thread", "codex-verifier-1"),
             ("detailed", "detailed-thread", "codex-verifier-2"),
-            ("citation", "citation-thread", "codex-verifier-3"),
+            (
+                "assumptions_quantifiers",
+                "assumptions-quantifiers-thread",
+                "codex-verifier-3",
+            ),
+            (
+                "counterexample_edge_case",
+                "counterexample-edge-case-thread",
+                "codex-verifier-4",
+            ),
+            ("reconstruction", "reconstruction-thread", "codex-verifier-5"),
+            ("citation", "citation-thread", "codex-verifier-6"),
         ):
             store.add_thread(
                 local_id,
@@ -1569,6 +1606,47 @@ def test_typed_artifacts_are_required_for_semantic_stage_progress_and_completion
                 created_at=NOW,
             )
             reports.append(store.add_verification("run-1", report).report)
+        role_by_kind = {
+            "structural": VerifierRole.STRUCTURAL,
+            "detailed": VerifierRole.DETAILED_STEP,
+            "assumptions_quantifiers": VerifierRole.ASSUMPTIONS_QUANTIFIERS,
+            "counterexample_edge_case": VerifierRole.COUNTEREXAMPLE_EDGE_CASE,
+            "reconstruction": VerifierRole.RECONSTRUCTION,
+            "citation": VerifierRole.CITATION,
+        }
+        graph = ProofObligationGraph.from_proof(
+            candidate_sha256=canonical_sha256(proof),
+            proof=proof.proof,
+            nodes=(
+                ProofObligation(
+                    claim_id="claim-candidate-1",
+                    byte_start=0,
+                    byte_end=len(proof.proof.encode("utf-8")),
+                    span_sha256=sha256_text(proof.proof),
+                    claim_text=proof.proof,
+                    claim_type=ClaimType.CONCLUSION,
+                    evidence_ids=proof.evidence_ids,
+                    rule_ids=tuple(rule.id for rule in run_input.frozen_verification_rules),
+                    coverage=tuple(
+                        ClaimCoverage(
+                            role=role_by_kind[report.kind],
+                            status=report.verdict.value,
+                            report_id=report.id,
+                            check_id=report.checks[0].id,
+                        )
+                        for report in reports
+                    ),
+                ),
+            ),
+        )
+        store.add_stage_output(
+            "claim-graph-output",
+            run_id="run-1",
+            stage=RunStage.VERIFICATION,
+            kind="claim_graph:candidate-1",
+            content=graph.model_dump(mode="json"),
+            provenance=provenance("claim-graph"),
+        )
         store.transition_stage("run-1", RunStage.ADJUDICATION)
         with pytest.raises(InvalidTransitionError, match="typed adjudication"):
             store.transition_stage("run-1", RunStage.EXPORT)
@@ -1754,7 +1832,18 @@ def prepare_adjudication_for_revision(
     for kind, local_id, external_id in (
         ("structural", "structural-thread", "codex-verifier-1"),
         ("detailed", "detailed-thread", "codex-verifier-2"),
-        ("citation", "citation-thread", "codex-verifier-3"),
+        (
+            "assumptions_quantifiers",
+            "assumptions-quantifiers-thread",
+            "codex-verifier-3",
+        ),
+        (
+            "counterexample_edge_case",
+            "counterexample-edge-case-thread",
+            "codex-verifier-4",
+        ),
+        ("reconstruction", "reconstruction-thread", "codex-verifier-5"),
+        ("citation", "citation-thread", "codex-verifier-6"),
     ):
         store.add_thread(
             local_id,
@@ -1914,7 +2003,14 @@ def test_verification_requires_reports_for_a_candidate_from_the_latest_proving_c
 
         def add_reports(target: ProofCandidate, prefix: str) -> None:
             for index, kind in enumerate(
-                ("structural", "detailed", "citation"),
+                (
+                    "structural",
+                    "detailed",
+                    "assumptions_quantifiers",
+                    "counterexample_edge_case",
+                    "reconstruction",
+                    "citation",
+                ),
                 start=1,
             ):
                 thread_id = f"{prefix}-{kind}-thread"

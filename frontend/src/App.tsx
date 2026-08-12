@@ -10,7 +10,7 @@ import { NewRunForm } from "./components/NewRunForm";
 import { RunNavigation } from "./components/RunNavigation";
 import { StageRail } from "./components/StageRail";
 import { StatusBadge } from "./components/StatusBadge";
-import { formatDate, formatDuration, formatNumber, shortHash, titleCase, totalTokens } from "./format";
+import { formatDate, formatDuration, formatNumber, runStatusLabel, shortHash, titleCase, totalTokens } from "./format";
 import type { Capabilities, CreateRunPayload, RunRecord, RunSnapshot } from "./types";
 import { useMediaQuery } from "./useModalDrawer";
 import "./styles.css";
@@ -376,7 +376,10 @@ function RunWorkspace(props: RunWorkspaceProps) {
           <span className="run-breadcrumb">QED / Runs / <span className="mono">{shortHash(run.id, 24)}</span></span>
           <div>
             <h1>{run.id}</h1>
-            <StatusBadge value={run.status} />
+            <StatusBadge value={run.status} label={runStatusLabel(run.status)} />
+            {run.stage === "export" && run.status !== "completed" && (
+              <StatusBadge value="running" label="Export intent" tone="progress" />
+            )}
             {streamState !== "offline" && (
               <span className={`stream-state stream-${streamState}`}>
                 <span aria-hidden="true" /> {streamState === "live" ? "Live events" : "Reconnecting"}

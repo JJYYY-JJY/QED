@@ -35,13 +35,27 @@ from qed.schemas import (
     evidence_sha256,
     sha256_text,
 )
+from qed.stable_contracts import (
+    ClaimCoverage,
+    ClaimType,
+    ProofObligation,
+    ProofObligationGraph,
+    VerifierRole,
+)
 from qed.store import RunSnapshot, RunStage, RunStatus, RunStore, ThreadStatus
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 GENERATED_AT = datetime(2026, 7, 16, 13, 0, tzinfo=UTC)
 PROOF = "For every integer $n > 1$, a prime divisor of $n! + 1$ exceeds $n$."
 EVIDENCE_CONTENT = "Euclid's construction produces a prime outside any finite list."
-VerificationKind = Literal["structural", "detailed", "citation"]
+VerificationKind = Literal[
+    "structural",
+    "detailed",
+    "assumptions_quantifiers",
+    "counterexample_edge_case",
+    "reconstruction",
+    "citation",
+]
 RUN_INPUT = RunInput(
     problem="Prove that there are infinitely many primes.",
     verification_rules=("Every divisibility inference must be justified.",),
@@ -174,8 +188,7 @@ def _snapshot(
             external_thread_id="codex-prover",
         )
         store.transition_thread("thread-prover", ThreadStatus.COMPLETED)
-        store.create_candidate(
-            ProofCandidate(
+        candidate = ProofCandidate(
                 id="candidate-1",
                 run_id="run-1",
                 plan_id="plan-1",
@@ -185,7 +198,9 @@ def _snapshot(
                 evidence_ids=evidence_ids,
                 provenance=_provenance("thread-prover", "proof-v2"),
                 created_at=NOW,
-            ),
+            )
+        store.create_candidate(
+            candidate,
             thread_id="thread-prover",
         )
         store.seal_candidate("candidate-1")
@@ -195,6 +210,9 @@ def _snapshot(
         report_kinds: tuple[VerificationKind, ...] = (
             "structural",
             "detailed",
+            "assumptions_quantifiers",
+            "counterexample_edge_case",
+            "reconstruction",
             "citation",
         )
         for kind in report_kinds:
@@ -209,6 +227,48 @@ def _snapshot(
             )
             store.transition_thread(thread_id, ThreadStatus.COMPLETED)
             reports.append(store.add_verification("run-1", _report(kind, thread_id)).report)
+
+        role_by_kind = {
+            "structural": VerifierRole.STRUCTURAL,
+            "detailed": VerifierRole.DETAILED_STEP,
+            "assumptions_quantifiers": VerifierRole.ASSUMPTIONS_QUANTIFIERS,
+            "counterexample_edge_case": VerifierRole.COUNTEREXAMPLE_EDGE_CASE,
+            "reconstruction": VerifierRole.RECONSTRUCTION,
+            "citation": VerifierRole.CITATION,
+        }
+        graph = ProofObligationGraph.from_proof(
+            candidate_sha256=canonical_sha256(candidate),
+            proof=PROOF,
+            nodes=(
+                ProofObligation(
+                    claim_id="claim-candidate-1",
+                    byte_start=0,
+                    byte_end=len(PROOF.encode("utf-8")),
+                    span_sha256=sha256_text(PROOF),
+                    claim_text=PROOF,
+                    claim_type=ClaimType.CONCLUSION,
+                    evidence_ids=evidence_ids,
+                    rule_ids=(RUN_INPUT.frozen_verification_rules[0].id,),
+                    coverage=tuple(
+                        ClaimCoverage(
+                            role=role_by_kind[report.kind],
+                            status=report.verdict.value,
+                            report_id=report.id,
+                            check_id=report.checks[0].id,
+                        )
+                        for report in reports
+                    ),
+                ),
+            ),
+        )
+        store.add_stage_output(
+            "output-claim-graph",
+            run_id="run-1",
+            stage=RunStage.VERIFICATION,
+            kind="claim_graph:candidate-1",
+            content=graph.model_dump(mode="json"),
+            provenance=_provenance("candidate-1", "qed-claim-graph-v1"),
+        )
 
         store.transition_stage("run-1", RunStage.ADJUDICATION)
         store.add_thread(
@@ -294,11 +354,14 @@ def test_builds_a_deterministic_verified_bundle(tmp_path) -> None:
         {
             "id": RUN_INPUT.frozen_verification_rules[0].id,
             "text": "Every divisibility inference must be justified.",
-            "responsible_report_kinds": [
-                "structural",
-                "detailed",
-                "citation",
-            ],
+                "responsible_report_kinds": [
+                    "structural",
+                    "detailed",
+                    "assumptions_quantifiers",
+                    "counterexample_edge_case",
+                    "reconstruction",
+                    "citation",
+                ],
             "coverage": [
                 {
                     "report_id": "report-detailed",
@@ -313,17 +376,22 @@ def test_builds_a_deterministic_verified_bundle(tmp_path) -> None:
     assert manifest["runtime_version"] == "0.144.5"
     assert manifest["generated_at"] == "2026-07-16T13:00:00Z"
     assert manifest["first_event_seq"] == 1
-    assert manifest["last_event_seq"] == 29
+    assert manifest["last_event_seq"] == 39
     assert manifest["prompt_versions"] == {
         "adjudication:adjudication-1": "adjudication-v1",
         "candidate:candidate-1": "proof-v2",
         "evidence:evidence-1": "literature-v1",
         "plan:plan-1": "planning-v1",
         "run:run-1": "intake-v1",
-        "verification:report-citation": "verify-citation-v1",
-        "verification:report-detailed": "verify-detailed-v1",
-        "verification:report-structural": "verify-structural-v1",
-    }
+            "verification:report-citation": "verify-citation-v1",
+            "verification:report-detailed": "verify-detailed-v1",
+            "verification:report-structural": "verify-structural-v1",
+            "verification:report-assumptions_quantifiers":
+            "verify-assumptions_quantifiers-v1",
+            "verification:report-counterexample_edge_case":
+            "verify-counterexample_edge_case-v1",
+            "verification:report-reconstruction": "verify-reconstruction-v1",
+        }
     assert manifest["candidate_hashes"] == [snapshot.candidates[0].candidate_sha256]
     assert manifest["verification_hashes"] == [
         record.report_sha256
@@ -373,8 +441,11 @@ def test_builds_a_deterministic_verified_bundle(tmp_path) -> None:
         }
     ]
     assert [item["id"] for item in manifest["verification_records"]] == [
+        "report-assumptions_quantifiers",
         "report-citation",
+        "report-counterexample_edge_case",
         "report-detailed",
+        "report-reconstruction",
         "report-structural",
     ]
     assert manifest["adjudication_records"] == [
@@ -404,11 +475,19 @@ def test_builds_a_deterministic_verified_bundle(tmp_path) -> None:
     assert [artifact["relative_path"] for artifact in manifest["artifacts"]] == [
         "proof.md",
         "report.md",
+        "event-chain.json",
+        "audit.json",
     ]
     assert manifest["artifacts"][0]["sha256"] == sha256_text(first.proof_md)
     assert manifest["artifacts"][1]["sha256"] == sha256_text(first.report_md)
     assert first.bundle_sha256 == sha256_text(first.manifest_json)
-    assert set(first.files) == {"manifest.json", "proof.md", "report.md"}
+    assert set(first.files) == {
+        "manifest.json",
+        "proof.md",
+        "report.md",
+        "event-chain.json",
+        "audit.json",
+    }
 
 
 def test_refuses_missing_or_failed_required_reports(tmp_path) -> None:
@@ -479,7 +558,10 @@ def test_requires_citation_from_frozen_ledger_when_candidate_omits_evidence_ids(
         generated_at=GENERATED_AT,
     )
 
-    assert "Required reports: `structural`, `detailed`, `citation`" in bundle.report_md
+    assert (
+        "Required reports: `structural`, `detailed`, `assumptions_quantifiers`, "
+        "`counterexample_edge_case`, `reconstruction`, `citation`"
+    ) in bundle.report_md
     assert "## Citation" in bundle.report_md
 
 
@@ -603,7 +685,7 @@ def test_completed_run_can_rebuild_its_terminal_manifest(tmp_path) -> None:
     assert snapshot.run.status is RunStatus.COMPLETED
     assert bundle.manifest.run_status == "completed"
     assert bundle.manifest.code_verdict == "PASS"
-    assert bundle.manifest.last_event_seq == 34
+    assert bundle.manifest.last_event_seq == 44
 
 
 def test_refuses_missing_reused_or_writer_external_verifier_identities(tmp_path) -> None:

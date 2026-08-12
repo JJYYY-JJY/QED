@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from qed.security.paths import ensure_private_directory, reject_symlink_components
+
 from .models import WebSearchMode
 
 INHERITED_CODEX_AUTH_ENV_VARS = (
@@ -75,14 +77,13 @@ def prepare_codex_home(codex_home: Path) -> Path:
     """Create and lock down one persistent server-owned Codex state root."""
 
     expanded = codex_home.expanduser()
-    if expanded.is_symlink():
-        raise ValueError("server-owned Codex home cannot be a symbolic link")
+    if not expanded.is_absolute():
+        raise ValueError("server-owned Codex home must be absolute")
+    reject_symlink_components(expanded)
     expanded.mkdir(mode=0o700, parents=True, exist_ok=True)
-    resolved = expanded.resolve(strict=True)
-    if not resolved.is_dir():
-        raise NotADirectoryError(f"server-owned Codex home is not a directory: {resolved}")
-    resolved.chmod(0o700)
-    return resolved
+    reject_symlink_components(expanded)
+    expanded.chmod(0o700)
+    return ensure_private_directory(expanded)
 
 
 def server_config(web_search: WebSearchMode) -> dict[str, Any]:

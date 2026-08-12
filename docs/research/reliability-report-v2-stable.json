@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "report_version": "v2-stable-reliability-1",
+  "status": "blocked",
+  "fixture_results_excluded": true,
+  "commit_sha": "df40a9683004ab58fb38497d1aecfc8f1fffa288",
+  "run_window_utc": {
+    "started_at": "2026-08-12T00:10:05Z",
+    "finished_at": "2026-08-12T00:10:05Z"
+  },
+  "development_pack": {
+    "version": "v2-stable-development-1",
+    "case_count": 27,
+    "cases_file_sha256": "52e175d7ca13be4a212afe4c73b64e087c387462daab12ebac9007a597eb3abc",
+    "lock_file_sha256": "99e62ecced5f66c2dd68993e2035e36830eeb23f5dd36371b438bdfd198944c8",
+    "manifest_sha256": "67037a47a8925f234eb10aae617a1821b0331fc43b4ea53401003f563e555346",
+    "validation_command": "uv run --frozen python benchmarks/reliability/run.py validate --cases benchmarks/reliability/v2-stable-cases.jsonl --lock benchmarks/reliability/v2-stable-cases.lock.json",
+    "validation_result": "27 cases validated"
+  },
+  "runtime": {
+    "model_provider": "OpenAI",
+    "exact_model": null,
+    "model_version": null,
+    "codex_runtime_version": null,
+    "backend": null,
+    "prompt_schema_hashes": null,
+    "status": "unrun",
+    "reason": "Dedicated credentials, quota, and a server-owned CODEX_HOME were not available."
+  },
+  "sealed_holdout": {
+    "status": "blocked",
+    "pack_hash": null,
+    "reason": "Operator-supplied sealed holdout pack was not provided. Expected labels were not exposed to any model context."
+  },
+  "raw_results": {
+    "path": "docs/research/reliability-v2-stable-raw.jsonl",
+    "sha256": "7e4c4c88d691d30e19707c2fa6e727ecd667d553b260c4f3dd87e95f2dfcfc29",
+    "result_rows": 0,
+    "blocked_metadata_rows": 1
+  },
+  "metrics": {
+    "false_pass": {
+      "status": "unrun",
+      "numerator": 0,
+      "denominator": 0,
+      "observed_rate": null,
+      "one_sided_95_upper": null,
+      "required_runs": 300,
+      "required_false_passes": 0
+    },
+    "known_true_acceptance": {
+      "status": "unrun",
+      "numerator": 0,
+      "denominator": 0,
+      "observed_rate": null,
+      "one_sided_95_lower": null,
+      "required_runs": 100,
+      "required_observed_rate": 0.95,
+      "required_lower_bound": 0.9
+    },
+    "semantic_mutation_detection": {
+      "status": "unrun",
+      "numerator": 0,
+      "denominator": 0,
+      "observed_rate": null,
+      "required_rate": 1.0
+    },
+    "citation_support_precision": {
+      "status": "unrun",
+      "numerator": 0,
+      "denominator": 0,
+      "observed_rate": null,
+      "required_judgments": 100,
+      "required_rate": 1.0
+    },
+    "infrastructure_healthy_uncertain_rate": {
+      "status": "unrun",
+      "numerator": 0,
+      "denominator": 0,
+      "observed_rate": null,
+      "required_upper_rate": 0.05
+    }
+  },
+  "alpha_fixture_baseline_excluded": {
+    "false_pass": "2/17",
+    "semantic_mutation_detection": "3/4",
+    "citation_support_precision": "1/2",
+    "reason": "The checked-in fixture adapter is not real Codex evidence and is excluded from stable release denominators."
+  },
+  "blockers": [
+    "real Codex lifecycle and reliability window are unrun",
+    "sealed holdout pack hash and execution are unrun",
+    "300 expected-NON_PASS, 100 known-true, and 100 citation real executions are unavailable"
+  ]
+}

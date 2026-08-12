@@ -1,116 +1,75 @@
-# Legacy run migration
+# SQLite migration and recovery
 
-QED imports a legacy run directory as an untrusted, content-addressed archive.
-The importer preserves bytes for audit and leaves the source directory intact.
-It does not convert legacy Markdown verdicts into trusted QED decisions.
+QED schema version 5 is the current stable-candidate schema. SQLite remains the
+single durable authority; migrations never edit frozen research records in
+place without a preflight and a verified staged copy.
 
-## Import a directory
+## Supported versions
 
-Choose a managed data root outside the legacy source:
+Schema versions 1 through 5 are accepted by the preflight. The checked-in
+fixture matrix under `tests/fixtures/migrations/` exercises every supported
+version, v1/v2 historical layouts, the v4-compatible v3/v4 layout, the v5
+schema, malformed input, unsupported versions, backup, restore, and staged
+upgrade. The v3 fixture is explicitly a compatibility fixture because the
+repository history contains no separate v3 DDL snapshot; it is not presented
+as historical schema evidence. Unsupported downgrades are rejected. A stable
+rollback is a restore from a verified backup, not a guessed reverse migration.
+
+Preflight checks integrity, readable schema version, duplicate `(run_id, seq)`
+events, conflicting external thread identities, stale unreleased leases,
+invalid immutable candidate hashes, and credential-shaped database paths. A
+preflight warning about a stale lease is not permission to delete or release
+it; reconcile the owner or record an explicit operator abandonment.
+
+## Safe commands
+
+Stop QED before changing a production data root. Use a dedicated backup path
+outside the data root and protect it as sensitive:
 
 ```bash
-uv run qed migrate /absolute/path/to/legacy-run --data-root .qed
+uv run --frozen qed backup /srv/qed/qed.sqlite3 \
+  --output /srv/backups/qed-2026-08-11.sqlite3
+uv run --frozen qed upgrade /srv/qed/qed.sqlite3
+uv run --frozen qed restore /srv/backups/qed-2026-08-11.sqlite3 \
+  --database /srv/qed/qed.sqlite3
 ```
 
-The command prints JSON with the import directory and manifest. QED writes the
-archive under:
+`backup` uses SQLite backup APIs, validates the copy, fsyncs it, and publishes
+it atomically. `upgrade` runs preflight, copies to a private staging file,
+opens the staged copy through `RunStore`, and replaces the original only after
+the current schema and integrity checks pass. A failed upgrade deletes only its
+staging file and leaves the original database byte-for-byte available for
+restore. `restore` follows the same staged replacement path and rejects source
+and destination aliasing, symlinked components, and credential-shaped paths.
 
-```text
-<data-root>/legacy-imports/legacy-<content-prefix>/
-├── artifacts/       # byte copies with source-relative paths
-└── manifest.json
-```
+Do not run two QED versions against one database. Preserve SQLite `-wal` and
+`-shm` files when making a filesystem-level data-root backup, or stop the
+service and use `qed backup` for a single-file backup. The dedicated Codex home
+may contain authentication state; it must never be included in an export or
+committed to Git. Rotate credentials if a backup leaves the operator boundary.
 
-The manifest records:
+## Failed-upgrade recovery
 
-- the `legacy_untrusted` trust label;
-- the resolved source root and aggregate content SHA-256;
-- each regular file's relative path, byte size, and SHA-256.
+1. Stop the service and retain the original database plus its WAL files.
+2. Capture `qed doctor --json` and the migration preflight result without
+   editing SQLite.
+3. Run `qed restore <verified-backup> --database <staging-database>` and check
+   `PRAGMA integrity_check`, schema version, event-chain continuity, lease
+   ownership, and one read-only run snapshot.
+4. Start QED against the restored staging data root on loopback only.
+5. Resume only runs whose durable state has no unconfirmed runtime terminal and
+   no active lease owned by another execution. Abandon an unrecoverable run
+   through the command so the operator rationale is recorded.
 
-The aggregate hash determines the import ID. Importing the same unchanged tree
-returns the same address and validates the existing copy. QED rejects an
-existing address when its manifest or artifact bytes differ.
+Migration never restores credentials from model output, never imports a
+personal `~/.codex`, and never treats legacy Markdown, old provider metadata,
+or a fixture result as current PASS authority.
 
-## Safety rules
+## Retention and compatibility
 
-The importer:
-
-- opens regular files without following symbolic links;
-- rejects a symbolic link at any point in the source tree;
-- rejects a managed root inside the source tree;
-- inventories the source before copying and checks each file again during copy;
-- writes through a staging directory and renames the complete archive into
-  place;
-- leaves the source tree unchanged.
-
-Use a source snapshot when another process may still write the legacy run. A
-mid-import change causes the command to fail, and QED removes its staging
-directory.
-
-## Trust and re-verification
-
-Legacy providers, model names, prompt text, reports, logs, and verdict strings
-remain historical evidence inside the archive. They have no authority in the
-current state machine. The importer does not create a runnable current run,
-select a candidate, or mark a proof as passed.
-
-To research a legacy problem under the current policy, create a new run with
-the exact problem, guidance, and verification rules. Keep the legacy import ID
-in your external research notes. QED will generate new evidence, candidates,
-fresh verifier reports, and a new content-addressed export.
-
-## Limits
-
-Legacy import manifest schema version 1 preserves the legacy tree as files. It
-does not parse either historical directory dialect into typed evidence, plans,
-candidates, token usage, or event records. Do not delete the source archive
-after import unless your retention policy treats the managed copy and its
-backup as sufficient.
-
-## v2 alpha authority boundary
-
-Import and database migration preserve data; they do not upgrade trust. A
-file-based run from v1, an upstream archive, or another provider remains
-`legacy_untrusted` after import. QED does not synthesize a current candidate,
-verifier identity, verification-rule coverage, adjudication, or code decision
-from legacy Markdown.
-
-A current QED policy PASS requires a new v2 run under the frozen v2 input and
-policy. That run must create sealed candidates and fresh structured verifier
-reports in SQLite. Copying a legacy proof into research guidance or citing its
-import ID does not change this requirement.
-
-SQLite schema upgrades also grant no new decision authority. An upgrade may add
-tables, columns, indexes, or guards. It must not manufacture a missing external
-thread identity, rule-coverage check, terminal event, lease, or content hash.
-Startup stops on incompatible or duplicate data when a new uniqueness invariant
-cannot be established. Operators should diagnose and retain the original
-database rather than deleting or overwriting conflicting rows.
-
-The v2 alpha release and old-version retention steps are listed in
-[QED v2 alpha release boundary](release-v2-alpha.md).
-
-## SQLite schema upgrades
-
-The current SQLite database schema is version 4. QED opens database versions 1,
-2, 3, and 4. It creates the missing version 4 structures and guards for a
-supported older database, then updates the database metadata to version 4. The
-operation is idempotent, so reopening after an interrupted startup repeats the
-same checks. QED rejects every other database schema version.
-
-Before applying the migration, QED searches each run for duplicate non-null
-external thread IDs. A duplicate blocks startup with the run ID, external ID,
-and conflicting local thread IDs. The migration never chooses one row or
-overwrites the conflict.
-
-Typed run, API, event, and legacy import records use schema versions separate
-from the database layout. Evidence v1 remains hash-verifiable and readable but
-lacks the current trust fields. Verification-report v1/v2 and code-decision
-v1/v2 also remain readable with their original hashes; they predate the current
-structured citation-support authority. Current reports and decisions use record
-schema v3. Older record schemas cannot grant current QED policy PASS authority,
-and resume adds new immutable attempts rather than rewriting them.
-
-Back up the complete data root before starting a newer QED release against it.
-There is no downgrade command. Test startup and resume against a copy before
-allowing the new release to upgrade the production database.
+Frozen inputs, candidates, verifier reports, events, execution segments, and
+export intent records are append-only audit history. Resume adds attempts and
+segments; it does not replenish budgets or rewrite earlier records. Current
+readers may display legacy records, but only schema-current structured reports
+with valid Codex provenance and stable rule/claim coverage can participate in a
+QED policy PASS.

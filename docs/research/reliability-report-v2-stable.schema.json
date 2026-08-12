@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/JJYYY-JJY/QED/docs/research/reliability-report-v2-stable.schema.json",
+  "title": "QED v2 stable reliability report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "report_version", "status", "fixture_results_excluded", "commit_sha", "run_window_utc", "development_pack", "runtime", "sealed_holdout", "raw_results", "metrics", "alpha_fixture_baseline_excluded", "blockers"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "report_version": {"type": "string", "minLength": 1},
+    "status": {"enum": ["passed", "blocked", "failed", "unrun"]},
+    "fixture_results_excluded": {"const": true},
+    "commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "run_window_utc": {"type": "object", "additionalProperties": false, "required": ["started_at", "finished_at"], "properties": {"started_at": {"type": "string"}, "finished_at": {"type": "string"}}},
+    "development_pack": {"type": "object", "additionalProperties": false, "required": ["version", "case_count", "cases_file_sha256", "lock_file_sha256", "manifest_sha256", "validation_command", "validation_result"], "properties": {"version": {"type": "string"}, "case_count": {"type": "integer", "minimum": 1}, "cases_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "lock_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "validation_command": {"type": "string"}, "validation_result": {"type": "string"}}},
+    "runtime": {"type": "object", "additionalProperties": false, "required": ["model_provider", "exact_model", "model_version", "codex_runtime_version", "backend", "prompt_schema_hashes", "status", "reason"], "properties": {"model_provider": {"const": "OpenAI"}, "exact_model": {"type": ["string", "null"]}, "model_version": {"type": ["string", "null"]}, "codex_runtime_version": {"type": ["string", "null"]}, "backend": {"type": ["string", "null"]}, "prompt_schema_hashes": {"type": ["object", "null"]}, "status": {"enum": ["passed", "blocked", "failed", "unrun"]}, "reason": {"type": "string"}}},
+    "sealed_holdout": {"type": "object", "additionalProperties": false, "required": ["status", "pack_hash", "reason"], "properties": {"status": {"enum": ["passed", "blocked", "failed", "unrun"]}, "pack_hash": {"type": ["string", "null"]}, "reason": {"type": "string"}}},
+    "raw_results": {"type": "object", "additionalProperties": false, "required": ["path", "sha256", "result_rows", "blocked_metadata_rows"], "properties": {"path": {"type": "string"}, "sha256": {"type": "string"}, "result_rows": {"type": "integer", "minimum": 0}, "blocked_metadata_rows": {"type": "integer", "minimum": 0}}},
+    "metrics": {"type": "object", "additionalProperties": false, "required": ["false_pass", "known_true_acceptance", "semantic_mutation_detection", "citation_support_precision", "infrastructure_healthy_uncertain_rate"], "properties": {"false_pass": {"$ref": "#/$defs/metric"}, "known_true_acceptance": {"$ref": "#/$defs/metric"}, "semantic_mutation_detection": {"$ref": "#/$defs/metric"}, "citation_support_precision": {"$ref": "#/$defs/metric"}, "infrastructure_healthy_uncertain_rate": {"$ref": "#/$defs/metric"}}},
+    "alpha_fixture_baseline_excluded": {"type": "object", "additionalProperties": false, "required": ["false_pass", "semantic_mutation_detection", "citation_support_precision", "reason"], "properties": {"false_pass": {"type": "string"}, "semantic_mutation_detection": {"type": "string"}, "citation_support_precision": {"type": "string"}, "reason": {"type": "string"}}},
+    "blockers": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+  },
+  "$defs": {
+    "metric": {"type": "object", "additionalProperties": false, "required": ["status", "numerator", "denominator", "observed_rate"], "properties": {"status": {"enum": ["passed", "blocked", "failed", "unrun"]}, "numerator": {"type": "integer", "minimum": 0}, "denominator": {"type": "integer", "minimum": 0}, "observed_rate": {"type": ["number", "null"]}, "one_sided_95_upper": {"type": ["number", "null"]}, "one_sided_95_lower": {"type": ["number", "null"]}, "required_runs": {"type": "integer", "minimum": 0}, "required_false_passes": {"type": "integer", "minimum": 0}, "required_observed_rate": {"type": "number"}, "required_lower_bound": {"type": "number"}, "required_judgments": {"type": "integer", "minimum": 0}, "required_rate": {"type": "number"}, "required_upper_rate": {"type": "number"}}}
+  }
+}

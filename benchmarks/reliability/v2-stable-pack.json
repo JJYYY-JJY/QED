@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "pack_version": "v2-stable-development-1",
+  "cases_path": "benchmarks/reliability/v2-stable-cases.jsonl",
+  "lock_path": "benchmarks/reliability/v2-stable-cases.lock.json",
+  "case_schema_sha256": "68fe1b9e7fb1ddfb3d924d77d35d44cd19bfd24b2a643574377136495f6efcd4",
+  "cases_file_sha256": "52e175d7ca13be4a212afe4c73b64e087c387462daab12ebac9007a597eb3abc",
+  "case_count": 27,
+  "domains": [
+    "algebra",
+    "number_theory",
+    "analysis",
+    "probability",
+    "combinatorics",
+    "geometry",
+    "topology",
+    "differential_equations",
+    "citation_support"
+  ],
+  "error_types": [
+    "false_statement",
+    "missing_assumption",
+    "swapped_quantifiers",
+    "domain_error",
+    "circular_proof",
+    "unproved_lemma",
+    "invalid_limit_or_interchange",
+    "reversed_inequality",
+    "missing_boundary_case",
+    "degenerate_case",
+    "invalid_induction_base_or_step",
+    "compactness_or_completeness_misuse",
+    "pointwise_uniform_confusion",
+    "almost_sure_everywhere_confusion",
+    "necessary_sufficient_reversal",
+    "symbol_mutation",
+    "deleted_key_step",
+    "fabricated_metadata",
+    "contradicted_citation",
+    "unrelated_citation",
+    "nearby_but_different_citation_claim"
+  ],
+  "real_execution_requirements": {
+    "expected_non_pass": 300,
+    "known_true": 100,
+    "citation_judgments": 100
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "current_database_schema_version": 5,
+  "fixtures": [
+    {
+      "version": 1,
+      "path": "v1.sqlite3",
+      "size_bytes": 102400,
+      "sha256": "5e542bf5104bfb14e46712b8be232daf303b2c5af2c9ef6e793f1698a7820f62",
+      "source": "9045191f2a44b05869d10d2038ab54fabe61b75c"
+    },
+    {
+      "version": 2,
+      "path": "v2.sqlite3",
+      "size_bytes": 270336,
+      "sha256": "fe0a49899c6ed2c63c391fa2e20a968801d519314877de54b39938e5f58b968e",
+      "source": "2f05f50a9bf2c52abfc26e4c29b7e64ed8d7121b"
+    },
+    {
+      "version": 3,
+      "path": "v3.sqlite3",
+      "size_bytes": 286720,
+      "sha256": "7d690d1e548a7da0058339eb84691efdeb7f9992af394242abae9f7a28673e89",
+      "source": "df40a9683004ab58fb38497d1aecfc8f1fffa288:v4-compatible-layout"
+    },
+    {
+      "version": 4,
+      "path": "v4.sqlite3",
+      "size_bytes": 286720,
+      "sha256": "543223e2236f76e12bb99399f5d118781edf1b9cfa38c2ebe5ec151656422e98",
+      "source": "df40a9683004ab58fb38497d1aecfc8f1fffa288"
+    },
+    {
+      "version": 5,
+      "path": "v5.sqlite3",
+      "size_bytes": 294912,
+      "sha256": "33ad9c2dc51994a7321c948e9cd303b4ebb8fcef14760865b46ba8cc15af810f",
+      "source": "working-tree schema"
+    }
+  ]
+}

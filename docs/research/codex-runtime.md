@@ -22,7 +22,7 @@ This note uses three evidence labels:
 7. Pass a JSON Schema on every control-producing turn and validate the final assistant message with the matching Pydantic model. Application code, not rendered text, computes transitions and final PASS.
 8. Keep `codex exec` as a tested fallback. The fallback must emit JSONL, use the same output schema and explicit safety settings, and map into the same internal event types. No code path may use sandbox, approval, or hook-trust bypass flags.
 9. Require an application-created absolute `cwd` on every turn. Build a distinct empty Git working directory for each attempt, including retries, and perform request construction and local preflight inside the attempt loop.
-10. Keep command network out of the public turn contract. Apply one server-owned configuration through SDK, App Server, and exec that disables local shell, file-editing, browser, code-mode, plugin, and hook capabilities. Native web search remains available only to literature and citation roles.
+10. Keep command network out of the public turn contract. Apply one server-owned configuration through SDK, App Server, and exec that disables local shell, file-editing, browser, code-mode, plugin, and hook capabilities. Literature uses native search only when its captured observation contract is available; citation turns remain offline unless the restricted fetcher is explicitly attested.
 11. Preserve Codex-native multi-agent capability when advertised. Subagents inherit the turn's empty Git working directory, read-only sandbox, and server-owned local-tool restrictions; QED does not force-enable an experimental multi-agent version.
 
 ## Official Python SDK
@@ -162,9 +162,11 @@ action, URL, capture time, and application-computed URL/payload hashes. It label
 a model evidence URI `runtime_observed` only when that exact URL appeared in an
 open/find action from the same literature turn. Titles, citation strings, and
 evidence content remain `model_reported`. QED does not use
-`server_captured` under this interface. A future upgrade may use that label only
-after an official event supplies fetched bytes or a service-authenticated
-excerpt and the application hashes those bytes.
+`server_captured` under this interface. Citation verification is offline in the
+current candidate because these adapter events do not provide byte-checked
+fetches; a future upgrade may enable citation fetching only after the restricted
+fetcher is attested and an official event supplies fetched bytes or a
+service-authenticated excerpt.
 
 Citation verification therefore uses a narrower code-enforced contract. A
 citation check must name a registered evidence ID and include an exact proof
@@ -297,7 +299,9 @@ Use skills for reusable mathematical procedures such as literature evidence coll
 
 Useful stable events include `SessionStart`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PreCompact`, `PostCompact`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop`, and `Stop`.
 
-Use hooks for developer-time policy checks such as the approved Impeccable detector. Do not use hooks for candidate sealing, transition commits, retry accounting, or final verdicts. QED must not pass `--dangerously-bypass-hook-trust`; a setup command should tell the user to inspect and approve the checked-in hook.
+QED has no production hook dependency. Do not use hooks for candidate sealing,
+transition commits, retry accounting, or final verdicts. QED must not pass
+`--dangerously-bypass-hook-trust` or any equivalent approval bypass.
 
 ## Sandbox, network, and approvals
 

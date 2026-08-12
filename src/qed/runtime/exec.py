@@ -34,6 +34,7 @@ from .models import (
     TurnStarted,
     UnknownNotification,
 )
+from .protocol import MAX_JSONL_FRAME_BYTES
 
 
 class _Reader(Protocol):
@@ -71,6 +72,7 @@ async def _spawn(
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=MAX_JSONL_FRAME_BYTES + 1,
         env=codex_subprocess_environment(codex_home),
     )
     if process.stdout is None or process.stderr is None:
@@ -203,6 +205,10 @@ class ExecRuntime:
             stderr_task = asyncio.create_task(self._drain_stderr(process.stderr))
             try:
                 while line := await process.stdout.readline():
+                    if len(line) > MAX_JSONL_FRAME_BYTES:
+                        raise RuntimeProtocolError(
+                            "codex exec JSONL frame exceeds the configured byte limit"
+                        )
                     event = self._decode_event(line)
                     event_type = event.get("type")
                     if event_type == "thread.started":
@@ -314,6 +320,8 @@ class ExecRuntime:
 
     @staticmethod
     def _decode_event(line: bytes) -> dict[str, Any]:
+        if len(line) > MAX_JSONL_FRAME_BYTES:
+            raise RuntimeProtocolError("codex exec JSONL frame exceeds the configured byte limit")
         try:
             value = json.loads(line)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:

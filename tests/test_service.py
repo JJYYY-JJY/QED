@@ -27,12 +27,12 @@ from qed.service import (
     RunAlreadyActiveError,
     StreamHeartbeat,
     build_management_service,
-    build_mock_service,
     build_service,
 )
 from qed.service_settings import ServiceSettings
 from qed.store import ExecutionToken, RunRecord, RunStatus, RunStore
 from qed.workflow import ResearchWorkflow
+from tests.mock_service import build_mock_service
 
 
 def _mock_runtime() -> MockRuntime:
@@ -97,6 +97,7 @@ async def test_management_commands_fail_before_mutating_run_state(
 
 class BlockingRuntime:
     def __init__(self) -> None:
+        self.runtime_version = "fixture-runtime/1"
         self.requests: list[RunRequest] = []
         self.turn_started = asyncio.Event()
         self.release = asyncio.Event()
@@ -141,6 +142,38 @@ class ClosingRuntime(BlockingRuntime):
     def __init__(self) -> None:
         super().__init__()
         self.close_count = 0
+
+    def runtime_resolution(
+        self,
+        capabilities: RuntimeCapabilities,
+        *,
+        requested_effort: str,
+        config_sha256: str,
+        prompt_sha256: str,
+        schema_sha256: str,
+        requested_backend: object | None = None,
+    ) -> dict[str, object]:
+        del requested_backend
+        return {
+            "schema_version": 1,
+            "model_provider": "OpenAI",
+            "model": capabilities.model,
+            "model_version": "fixture-model-version",
+            "backend": "fixture",
+            "codex_runtime_version": self.runtime_version,
+            "codex_cli_version": "fixture-cli/1",
+            "sdk_version": "fixture-sdk/1",
+            "app_server_version": "fixture-app-server/1",
+            "requested_effort": requested_effort,
+            "selected_effort": capabilities.selected_effort,
+            "model_catalog_sha256": "0" * 64,
+            "config_sha256": config_sha256,
+            "prompt_sha256": prompt_sha256,
+            "schema_sha256": schema_sha256,
+            "executable_sha256": "1" * 64,
+            "capability_response_sha256": "2" * 64,
+            "protocol_version": "qed-fixture-protocol-v1",
+        }
 
     async def close(self) -> None:
         self.close_count += 1
@@ -393,12 +426,12 @@ async def test_service_uses_only_the_explicit_runtime_factory_and_closes_once(
         nonlocal calls
         calls += 1
         codex_homes.append(codex_home)
+        runtime.runtime_version = "observed-test-runtime"
         return runtime
 
     service = build_service(
         ServiceSettings(data_root=tmp_path),
         runtime_factory=factory,
-        runtime_version="explicit-test-runtime",
     )
     service.create_run(RunInput(problem="Prove P."), QEDConfig(), run_id="run-factory")
 
@@ -415,7 +448,7 @@ def test_production_service_requires_an_explicit_runtime_factory(tmp_path: Path)
         build_service(ServiceSettings(data_root=tmp_path))
 
 
-async def test_mock_service_is_explicit_and_records_mock_runtime_provenance(
+async def test_fixture_service_is_test_only_and_records_fixture_provenance(
     tmp_path: Path,
 ) -> None:
     service = build_mock_service(ServiceSettings(data_root=tmp_path))
@@ -426,8 +459,8 @@ async def test_mock_service_is_explicit_and_records_mock_runtime_provenance(
         run_id="run-explicit-mock",
     )
 
-    assert created.runtime_version == "mock-runtime/1"
-    assert created.provenance.runtime_version == "mock-runtime/1"
+    assert created.runtime_version == "fixture-runtime/1"
+    assert created.provenance.runtime_version == "fixture-runtime/1"
 
     await service.close()
 

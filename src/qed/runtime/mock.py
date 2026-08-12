@@ -5,6 +5,8 @@ from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 
 from pydantic import JsonValue
 
+from qed.schemas import sha256_text
+
 from .models import (
     CapabilityRequest,
     RunRequest,
@@ -45,6 +47,40 @@ class MockRuntime:
         if self._capabilities is None:
             raise RuntimeError("MockRuntime has no configured capabilities")
         return self._capabilities
+
+    def runtime_resolution(
+        self,
+        capabilities: RuntimeCapabilities,
+        *,
+        requested_effort: str,
+        config_sha256: str,
+        prompt_sha256: str,
+        schema_sha256: str,
+        requested_backend: object | None = None,
+    ) -> dict[str, object]:
+        """Expose an explicit fixture provenance shape; never used by production construction."""
+
+        del config_sha256, prompt_sha256, schema_sha256, requested_backend
+        return {
+            "schema_version": 1,
+            "model_provider": "OpenAI",
+            "model": capabilities.model,
+            "model_version": "fixture-model-version",
+            "backend": "fixture",
+            "codex_runtime_version": "fixture-runtime/1",
+            "codex_cli_version": "fixture-cli/1",
+            "sdk_version": "fixture-sdk/1",
+            "app_server_version": "fixture-app-server/1",
+            "requested_effort": requested_effort,
+            "selected_effort": capabilities.selected_effort,
+            "model_catalog_sha256": sha256_text("fixture-model-catalog"),
+            "config_sha256": sha256_text("fixture-config"),
+            "prompt_sha256": sha256_text("fixture-prompts"),
+            "schema_sha256": sha256_text("fixture-schemas"),
+            "executable_sha256": sha256_text("fixture-executable"),
+            "capability_response_sha256": sha256_text("fixture-capability-response"),
+            "protocol_version": "qed-fixture-protocol-v1",
+        }
 
     def preflight(self, request: RunRequest) -> None:
         del request

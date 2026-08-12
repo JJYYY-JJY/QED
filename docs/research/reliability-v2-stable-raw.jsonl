@@ -1,0 +1,1 @@
+{"schema_version":1,"status":"blocked","fixture":false,"sample_count":0,"expected_non_pass_runs":0,"known_true_runs":0,"citation_judgments":0,"reason":"No dedicated real Codex credentials, quota, operator CODEX_HOME, or sealed holdout pack were supplied; no model execution was attempted."}

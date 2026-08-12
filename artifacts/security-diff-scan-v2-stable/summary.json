@@ -1,0 +1,52 @@
+{
+  "artifact_sha256": {
+    "artifacts/01_context/security_guidance.md": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "artifacts/01_context/threat_model.md": "bc11b7468e63e6e6a7962b2b94272ab7d01285f72336fff6eba9a9603441929d",
+    "artifacts/02_discovery/deep_review_input.jsonl": "c88499130ff4bbb3b8440e1e0f7cc39d7b649a3e8a1f720e606af3b77a53837c",
+    "artifacts/02_discovery/finding_discovery_report.md": "36beacae4f6c7dc6bad9f2d7e6301fc11bc7e89fb27daefad9718090758ebd72",
+    "artifacts/02_discovery/rank_input.jsonl": "9e8dbc111e3b8ede4c233864a1861959071f7fffb356b1aa8ae2b328ec467b0a",
+    "artifacts/02_discovery/raw_candidates.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "artifacts/02_discovery/work_ledger.jsonl": "173f63f8f0bf37047b77d316bf82db8cb40b32afa912dac5bc0e3a3176e498f0",
+    "artifacts/03_coverage/reviewed_surfaces.md": "a13dacf811cdfdde029582f136f704cc949bfd39542403e761544116e6e0ceb2",
+    "coverage.json": "6daf6c15f4bb8a42aeca3c99e3ab0d77c9e61b7aa1e393d7aeaae4212bec19e5",
+    "exports/results.sarif": "564cc86018edf899b131a4a8833a8b5b82a068e633f65cb8bd6770f088d8ccd8",
+    "findings.json": "ed039c3d7348d05912badf9278705ccc511459d0ed12666690a64722d1695791",
+    "report.md": "33bd2e65d85bfd03d18720929384c3b12ad28d620909fb7d295d188fcb96fb25",
+    "scan-manifest.json": "f8e53cfce875d196c35b34097f24dfdccf587504394b2b4098b110382913e09a"
+  },
+  "completed_at": "2026-08-12T01:21:18.617201Z",
+  "coverage_completeness": "partial",
+  "generated_at": "2026-08-12T01:21:56.666137Z",
+  "mode": "diff",
+  "preflight_warning": "delegated_workers unavailable; parent-agent fallback",
+  "producer": {
+    "name": "codex-security-plugin",
+    "version": "0.1.18"
+  },
+  "production_config_rows_reviewed": 26,
+  "reportable_findings": 0,
+  "scan_id": "cc2e7d79-c9f2-42e7-84ae-58c22896d567",
+  "schema_version": 1,
+  "sealed_at": "2026-08-12T01:21:18.617201Z",
+  "started_at": "2026-08-12T01:16:33.097025Z",
+  "status": "completed",
+  "target": {
+    "baseRevision": "df40a9683004ab58fb38497d1aecfc8f1fffa288",
+    "displayName": "QED",
+    "headRevision": "df40a9683004ab58fb38497d1aecfc8f1fffa288",
+    "kind": "git_diff",
+    "snapshotDigest": "codex-security-snapshot/v1:sha256:bcece120c01f5cf5740d08cf93f1f8fb9acd9521933288a51794205f86610bf5",
+    "targetId": "target_sha256_192a804361b55a71e1da32163a5310fcf01116f9c4b58827fb9f273253013066"
+  },
+  "usage": {
+    "cached_input_tokens": 5318400,
+    "coverage": "complete",
+    "input_tokens": 5419523,
+    "output_tokens": 13379,
+    "reasoning_output_tokens": 4491,
+    "thread_count": 1,
+    "total_tokens": 114502
+  },
+  "worklist_receipts": 104,
+  "worklist_rows": 104
+}

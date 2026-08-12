@@ -18,7 +18,22 @@ from qed.schemas import (
     sha256_text,
 )
 
-RequiredReportKind = Literal["structural", "detailed", "citation"]
+RequiredReportKind = Literal[
+    "structural",
+    "detailed",
+    "assumptions_quantifiers",
+    "counterexample_edge_case",
+    "reconstruction",
+    "citation",
+]
+
+STABLE_REQUIRED_REPORT_KINDS: tuple[RequiredReportKind, ...] = (
+    "structural",
+    "detailed",
+    "assumptions_quantifiers",
+    "counterexample_edge_case",
+    "reconstruction",
+)
 
 
 class CandidateIntegrityError(ValueError):
@@ -86,6 +101,7 @@ def decide_candidate(
     required_evidence: tuple[Evidence, ...] = (),
     required_evidence_ids: tuple[str, ...] = (),
     required_rule_ids: tuple[str, ...] = (),
+    required_report_kinds: tuple[RequiredReportKind, ...] | None = None,
 ) -> CandidateDecision:
     """Compute PASS from frozen input and independent structured reports."""
 
@@ -105,11 +121,15 @@ def decide_candidate(
         raise ValueError("required evidence records and ids disagree")
     effective_evidence_ids = evidence_ids or required_evidence_ids
     require_citation = require_citation or bool(effective_evidence_ids)
-    required: tuple[RequiredReportKind, ...] = (
+    required: tuple[RequiredReportKind, ...] = required_report_kinds or (
         ("structural", "detailed", "citation")
         if require_citation
         else ("structural", "detailed")
     )
+    if len(set(required)) != len(required):
+        raise ValueError("required report kinds must be unique")
+    if require_citation and "citation" not in required:
+        raise ValueError("citation is required when evidence is frozen")
     relevant = tuple(report for report in reports if report.kind in required)
     reasons: list[str] = []
 
@@ -252,4 +272,26 @@ def decide_candidate(
         rule_coverage=rule_coverage,
         report_ids=tuple(sorted(report.id for report in relevant)),
         reasons=tuple(reasons),
+    )
+
+
+def decide_stable_candidate(
+    candidate: ProofCandidate,
+    reports: tuple[VerificationReport, ...],
+    *,
+    prover_external_thread_id: str,
+    required_evidence: tuple[Evidence, ...] = (),
+    required_rule_ids: tuple[str, ...] = (),
+) -> CandidateDecision:
+    """Compute the release policy with the frozen N-of-N verifier roles."""
+
+    required = STABLE_REQUIRED_REPORT_KINDS + (("citation",) if required_evidence else ())
+    return decide_candidate(
+        candidate,
+        reports,
+        prover_external_thread_id=prover_external_thread_id,
+        require_citation=bool(required_evidence),
+        required_evidence=required_evidence,
+        required_rule_ids=required_rule_ids,
+        required_report_kinds=required,
     )

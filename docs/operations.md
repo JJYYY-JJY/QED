@@ -111,25 +111,12 @@ command reads personal `~/.codex`.
 
 ## Remote bind
 
-A non-loopback bind requires a bearer token of at least 32 characters. Put the
-service behind a TLS reverse proxy, set an exact CORS allowlist, and keep the
-App Server process on local stdio.
-
-```bash
-export QED_AUTH_TOKEN="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export QED_ALLOWED_ORIGINS='["https://qed.example.org"]'
-
-uv run qed --log-level info --log-format json serve \
-  --data-root /srv/qed \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --runtime codex
-```
-
-Do not expose Codex App Server, the SQLite files, or the export directory
-through the reverse proxy. The API uses bearer authentication rather than a
-multi-user identity or authorization model. Use one trusted research group per
-deployment or add an external access-control layer.
+Non-loopback binds are rejected in this release, even when a bearer token is
+provided. The remote BFF, HttpOnly/Secure/SameSite session, CSRF protection,
+Origin validation, exact CORS allowlist, and TLS deployment contract are not yet
+implemented as one QED-controlled boundary. Do not work around this check by
+passing a raw server override or exposing the App Server, SQLite files, or
+export directory.
 
 The browser console never receives the QED bearer token. For remote browser
 access, use a same-origin backend-for-frontend (BFF) that authenticates users
@@ -282,10 +269,14 @@ or policy problem before retrying a failed run.
 
 Stop the service before a filesystem backup. Copy the complete data root so the
 backup contains the SQLite database, WAL files, exports, legacy imports, and the
-dedicated Codex state needed to resume recorded threads:
+dedicated Codex state needed to resume recorded threads. For a verified
+database-only backup and restore use:
 
 ```bash
-cp -a /srv/qed /srv/backups/qed-2026-07-16
+uv run --frozen qed backup /srv/qed/qed.sqlite3 \
+  --output /srv/backups/qed-2026-08-11.sqlite3
+uv run --frozen qed restore /srv/backups/qed-2026-08-11.sqlite3 \
+  --database /srv/qed/qed.sqlite3
 ```
 
 `codex-home` can contain authentication credentials and local session state.
@@ -296,13 +287,16 @@ it when a backup may have been exposed.
 
 Restore into a new empty path, start QED against that path, and inspect runs with
 `qed status` or the API before opening it to users. The current release opens
-SQLite schema versions 1 through 4 and upgrades supported older versions to 4.
+SQLite schema versions 1 through 5 and upgrades supported older versions to 5.
 The migration rejects duplicate external thread identities and reports the
 conflicting run, external ID, and local thread IDs. Typed research records use
 their own schema versions; legacy v1 reports and decisions remain readable but
 cannot grant current QED policy PASS authority.
-The project has no retention task, remote backup task, or manual schema
-migration command, so the operator owns backup rotation and upgrade sequencing.
+Run `uv run --frozen qed upgrade /srv/qed/qed.sqlite3` only after a verified
+backup. Upgrade occurs on a staged copy and atomically replaces the database
+only after integrity and schema checks pass; failed upgrades preserve the
+original. The operator owns backup rotation, retention, credential rotation,
+and restore drills.
 
 ## Upgrade procedure
 

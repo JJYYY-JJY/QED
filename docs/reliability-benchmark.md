@@ -1,5 +1,9 @@
 # Reliability benchmark
 
+> The alpha pack and fixture examples below are preserved as historical,
+> non-release evidence. The current stable-candidate contract is described in
+> the v2 section at the end of this document.
+
 QED v2 alpha includes a frozen false-PASS benchmark under
 [`benchmarks/reliability/`](../benchmarks/reliability/). The benchmark measures
 one configured QED runtime against known cases. It does not certify the runtime,
@@ -171,6 +175,34 @@ must retain the raw and summary files and state:
 - repetition count and run window;
 - raw token, query, elapsed-time, and cost fields;
 - failed or excluded runs and the reason for each exclusion.
+
+## v2 stable-candidate harness
+
+`benchmarks/reliability/v2-stable-pack.json` records the versioned development
+pack, domain/error coverage, case-file hash, lock hash, and required real-run
+sample sizes. `build_v2_stable_pack.py` derives it from the unchanged 19-case
+alpha pack plus explicitly versioned development cases; it never rewrites the
+alpha expected labels. Validate it with:
+
+```bash
+uv run --frozen python benchmarks/reliability/run.py validate \
+  --cases benchmarks/reliability/v2-stable-cases.jsonl \
+  --lock benchmarks/reliability/v2-stable-cases.lock.json
+```
+
+`benchmarks/reliability/statistics.py` computes reproducible one-sided 95%
+Wilson confidence bounds. Its tests cover the release examples `0/300` and
+`95/100`; those examples are statistical checks, not observed Codex runs.
+
+The stable result file is
+[`docs/research/reliability-report-v2-stable.json`](research/reliability-report-v2-stable.json)
+with normalized raw rows in
+[`reliability-v2-stable-raw.jsonl`](research/reliability-v2-stable-raw.jsonl).
+The checked-in report is currently `blocked` with zero real result rows. It
+records the exact missing credential/quota/CODEX_HOME/holdout conditions and
+explicitly excludes the alpha fixture rates. A real run must preserve the
+operator-supplied holdout hash before execution and must not expose expected
+labels to any verifier context.
 
 ## Limits
 

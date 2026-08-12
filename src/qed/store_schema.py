@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import sqlite3
 
-DATABASE_SCHEMA_VERSION = 4
-SUPPORTED_DATABASE_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
+DATABASE_SCHEMA_VERSION = 5
+SUPPORTED_DATABASE_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
 
 
 class SchemaVersionError(ValueError):

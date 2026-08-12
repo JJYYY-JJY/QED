@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "baseline_scan_id": "61393cb5-6ff6-4961-b53f-91e24926455a",
+  "candidate_scan_id": "cc2e7d79-c9f2-42e7-84ae-58c22896d567",
+  "owner": "QED maintainers",
+  "closed_at_utc": "2026-08-12",
+  "release_disposition": "candidate-remediations-mapped; final delegated security closeout remains required",
+  "findings": [
+    {
+      "finding_id": "baseline-001",
+      "severity": "medium",
+      "summary": "Mock runtime could reach a production construction path",
+      "status": "remediated_in_candidate",
+      "evidence": ["src/qed/cli.py", "src/qed/service.py", "tests/test_cli.py", "tests/test_no_legacy_runtime.py"]
+    },
+    {
+      "finding_id": "baseline-002",
+      "severity": "medium",
+      "summary": "Caller-controlled executable override was not sufficiently constrained",
+      "status": "remediated_in_candidate",
+      "evidence": ["src/qed/runtime/stdio.py", "src/qed/runtime/router.py", "tests/test_runtime_stdio.py", "tests/test_runtime_router.py"]
+    },
+    {
+      "finding_id": "baseline-003",
+      "severity": "medium",
+      "summary": "Expired lease could authorize lifecycle mutation",
+      "status": "remediated_in_candidate",
+      "evidence": ["src/qed/store.py", "tests/test_store.py"]
+    },
+    {
+      "finding_id": "baseline-004",
+      "severity": "medium",
+      "summary": "Managed CODEX_HOME path checks needed link and check-use protection",
+      "status": "remediated_in_candidate",
+      "evidence": ["src/qed/security/paths.py", "src/qed/runtime/isolation.py", "tests/test_security_boundaries.py", "tests/test_migration.py"]
+    },
+    {
+      "finding_id": "baseline-005",
+      "severity": "medium",
+      "summary": "Caller-supplied runtime version could override observed provenance",
+      "status": "remediated_in_candidate",
+      "evidence": ["src/qed/runtime/stdio.py", "src/qed/runtime/router.py", "tests/test_runtime_stdio.py", "tests/test_store.py"]
+    },
+    {
+      "finding_id": "baseline-006",
+      "severity": "low",
+      "summary": "SSE stream resource and replay limits needed explicit bounds",
+      "status": "remediated_in_candidate",
+      "evidence": ["src/qed/api.py", "src/qed/service.py", "tests/test_api.py", "tests/test_service.py"]
+    },
+    {
+      "finding_id": "baseline-007",
+      "severity": "low",
+      "summary": "Runtime JSONL stdout frames needed a hard byte limit",
+      "status": "remediated_in_candidate",
+      "evidence": ["src/qed/runtime/protocol.py", "src/qed/runtime/stdio.py", "src/qed/runtime/exec.py", "tests/test_runtime_stdio.py", "tests/test_runtime_exec.py"]
+    },
+    {
+      "finding_id": "baseline-008",
+      "severity": "low",
+      "summary": "Export publication needed pinned directory identity and safe staging",
+      "status": "remediated_in_candidate",
+      "evidence": ["src/qed/export.py", "tests/test_export.py"]
+    }
+  ]
+}

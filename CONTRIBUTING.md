@@ -18,9 +18,9 @@ commands. Change `pyproject.toml`, refresh `uv.lock` with uv, and include both
 files when dependency metadata changes. Change `package.json`, refresh
 `package-lock.json` with npm, and include both files for client dependencies.
 
-The repo-local Impeccable filesystem boundary requires Linux `/proc/self/fd`
-and fails closed on other platforms. QED's service and console runtime do not
-depend on that developer-tool boundary.
+The removed alpha-only visual tooling is not a current development or release
+dependency. QED's service and console runtime use the repository's ordinary
+typed tests and accessibility checks.
 
 ## Change process
 
@@ -42,7 +42,7 @@ expert commentary, and historical artifacts.
 - Let `qed.store` own transactions, transitions, event sequence numbers,
   immutable records, and execution fencing.
 - Keep sealed candidates and verifier reports unchanged across resume.
-- Start structural, detailed, and citation verifiers on fresh read-only threads.
+- Start every required verifier role on a fresh read-only thread.
 - Keep structural and detailed verification offline. Restrict search and network
   to literature and citation work.
 - Compute PASS in application code from stored reports.
@@ -79,9 +79,7 @@ Frontend changes also run:
 npm run lint
 npm run typecheck
 npm test
-npm run test:impeccable
 npm run build
-npm run impeccable
 npx playwright install chromium
 npm run test:e2e
 ```
@@ -110,7 +108,7 @@ changes before merge.
 - [ ] No credential, unsafe flag, raw override, or provider dispatch entered
       the diff.
 - [ ] Backend lint, typecheck, tests, and package build pass.
-- [ ] Frontend lint, typecheck, tests, build, Impeccable, and Playwright pass
+- [ ] Frontend lint, typecheck, tests, build, accessibility, and Playwright pass
       when client code changed.
 - [ ] Contract changes include matching docs and threat-model updates.
 - [ ] Historical assets and upstream attribution remain present.

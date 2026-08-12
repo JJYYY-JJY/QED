@@ -248,6 +248,8 @@ __pycache__/
 .ruff_cache/
 .coverage
 .coverage.*
+coverage.json
+mutants/
 htmlcov/
 
 ## QED runtime state
@@ -255,6 +257,7 @@ htmlcov/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+!tests/fixtures/migrations/*.sqlite3
 
 ## Frontend build and test output
 node_modules/
@@ -263,12 +266,6 @@ frontend/test-results/
 frontend/playwright-report/
 test-results/
 playwright-report/
-
-## Local Impeccable consent and runtime state
-.impeccable/config.local.json
-.impeccable/hook.cache.json
-.impeccable/live/selection.json
-.impeccable/critique/
 
 # xmpincl
 *.xmpi
@@ -342,8 +339,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
-.impeccable/config.local.json
-
 # Streamlit UI runtime data
 ui/proof_runs/
 .config_smoke_tmp.yaml

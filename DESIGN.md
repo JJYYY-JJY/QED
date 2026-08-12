@@ -102,6 +102,8 @@ preferences collapse animation and transition duration.
 
 - **Do** keep evidence, source identity, and content hash near each cited claim.
 - **Do** show stage, thread, and verification state with text as well as color.
+- **Do** label Running, Paused, Failed, Uncertain, Export intent, Complete, and
+  QED policy PASS separately.
 - **Do** borrow Linear's state clarity, GitHub review's linked findings, and
   Zotero's evidence organization.
 - **Do** keep motion within 150–250ms and provide a reduced-motion path.
@@ -113,3 +115,5 @@ preferences collapse animation and transition duration.
 - **Don't** tint the white ground toward cream, clay, or parchment to echo the
   warm primary color.
 - **Don't** use crimson for inactive controls or decoration.
+- **Don't** describe QED policy PASS as mathematical truth, formal verification,
+  or a certificate.

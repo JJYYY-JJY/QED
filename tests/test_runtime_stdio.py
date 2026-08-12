@@ -164,9 +164,8 @@ def test_runtime_version_comes_from_the_resolved_executable(
 
 def test_default_executable_is_the_uv_bundled_codex() -> None:
     assert resolve_codex_executable() == bundled_codex_path().resolve(strict=True)
-    assert resolve_codex_executable(sys.executable) == Path(sys.executable).resolve(
-        strict=True
-    )
+    with pytest.raises(PermissionError, match="package-managed official executable"):
+        resolve_codex_executable(sys.executable)
 
 
 async def test_stdio_transport_initializes_once_and_broadcasts_notifications() -> None:

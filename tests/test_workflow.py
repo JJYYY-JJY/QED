@@ -352,6 +352,39 @@ def passing_responses() -> dict[str, list[dict[str, Any]]]:
                     }
                 ],
             },
+            {
+                "schema_version": 1,
+                "checks": [
+                    {
+                        "id": "assumptions",
+                        "category": "assumptions-quantifiers",
+                        "status": "pass",
+                        "summary": "The assumptions and quantifier order are explicit.",
+                    }
+                ],
+            },
+            {
+                "schema_version": 1,
+                "checks": [
+                    {
+                        "id": "counterexample",
+                        "category": "counterexample-edge-case",
+                        "status": "pass",
+                        "summary": "No counterexample or omitted boundary case was found.",
+                    }
+                ],
+            },
+            {
+                "schema_version": 1,
+                "checks": [
+                    {
+                        "id": "reconstruction",
+                        "category": "reconstruction",
+                        "status": "pass",
+                        "summary": "The proof can be reconstructed from the frozen claims.",
+                    }
+                ],
+            },
         ],
         "AdjudicationDraft": [
             {
@@ -403,15 +436,15 @@ async def test_workflow_completes_with_sealed_independently_verified_candidate(
         snapshot.execution_segments[0].runtime_resolution_sha256
     )
     assert exported_manifest["usage"] == {
-        "cached_input_tokens": 14,
+        "cached_input_tokens": 20,
         "execution_seconds": exported_manifest["usage"]["execution_seconds"],
-        "input_tokens": 70,
-        "output_tokens": 35,
-        "reasoning_output_tokens": 21,
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "reasoning_output_tokens": 30,
         "search_queries": 0,
-        "turns": 7,
+        "turns": 10,
     }
-    assert len(snapshot.turn_inputs) == 7
+    assert len(snapshot.turn_inputs) == 10
     assert all(
         turn_input.payload_sha256 == canonical_sha256(turn_input.payload)
         for turn_input in snapshot.turn_inputs
@@ -438,10 +471,13 @@ async def test_workflow_completes_with_sealed_independently_verified_candidate(
     assert {record.kind for record in snapshot.verifications} == {
         "structural",
         "detailed",
+        "assumptions_quantifiers",
+        "counterexample_edge_case",
+        "reconstruction",
         "citation",
     }
     verifier_threads = {record.thread_id for record in snapshot.verifications}
-    assert len(verifier_threads) == 3
+    assert len(verifier_threads) == 6
     assert all(
         thread.role is ThreadRole.VERIFIER
         and thread.status is ThreadStatus.COMPLETED
@@ -458,7 +494,7 @@ async def test_workflow_completes_with_sealed_independently_verified_candidate(
         for request in runtime.requests
         if request.output_schema["title"] == "VerificationDraft"
     )
-    assert len(verification_requests) == 3
+    assert len(verification_requests) == 6
     assert all('"plan":{' in request.prompt for request in verification_requests)
     assert all('"evidence":[{' in request.prompt for request in verification_requests)
     assert sum(request.role.value == "citation" for request in verification_requests) == 1
@@ -542,9 +578,9 @@ async def test_usage_identity_includes_thread_when_turn_ids_repeat(tmp_path: Pat
             (tmp_path / "exports" / artifact.relative_path).read_text(encoding="utf-8")
         )
 
-    assert manifest["usage"]["turns"] == 7
-    assert manifest["usage"]["input_tokens"] == 70
-    assert manifest["usage"]["output_tokens"] == 35
+    assert manifest["usage"]["turns"] == 10
+    assert manifest["usage"]["input_tokens"] == 100
+    assert manifest["usage"]["output_tokens"] == 50
 
 
 async def test_schema_failure_marks_run_failed_without_creating_candidate(
@@ -774,14 +810,12 @@ async def test_resume_records_observed_capability_drift_without_changing_control
     second_resolution = resolution_by_segment[second_segment.id]
     assert isinstance(first_resolution, dict)
     assert isinstance(second_resolution, dict)
-    assert first_resolution["advertised_efforts"] == [
-        "low",
-        "high",
-        "ultra",
-    ]
-    assert second_resolution["advertised_efforts"] == [
-        "high",
-        "ultra",
+    assert first_resolution["backend"] == "fixture"
+    assert second_resolution["backend"] == "fixture"
+    assert first_resolution["codex_runtime_version"] == "runtime-v1"
+    assert second_resolution["codex_runtime_version"] == "runtime-v2"
+    assert first_resolution["capability_response_sha256"] != second_resolution[
+        "capability_response_sha256"
     ]
     assert all(request.effort == "ultra" for request in second_runtime.requests)
     assert all(request.proactive is True for request in second_runtime.requests)
@@ -861,7 +895,7 @@ async def test_generates_configured_proof_candidates_concurrently(tmp_path: Path
     assert completed.status is RunStatus.COMPLETED
     assert runtime.max_provers_in_flight == 3
     assert [record.attempt for record in snapshot.candidates] == [1, 2, 3]
-    assert len(snapshot.verifications) == 9
+    assert len(snapshot.verifications) == 18
     accepted = next(
         output for output in snapshot.stage_outputs if output.kind == "accepted_candidate"
     )
@@ -1323,7 +1357,7 @@ async def test_verification_persistence_interruption_resumes_without_rewriting_r
     frozen_report = paused.verifications[0]
 
     second_runtime = ScriptedRuntime(passing_responses())
-    second_runtime.counts["VerificationDraft"] = 3
+    second_runtime.counts["VerificationDraft"] = 6
     with RunStore(database) as reopened:
         second = ResearchWorkflow(
             reopened,
@@ -1338,7 +1372,7 @@ async def test_verification_persistence_interruption_resumes_without_rewriting_r
 
     assert completed.status is RunStatus.COMPLETED
     assert resumed.verifications[0] == frozen_report
-    assert len(resumed.verifications) == 3
+    assert len(resumed.verifications) == 6
     assert len(
         [
             event
@@ -1353,7 +1387,7 @@ async def test_verification_persistence_interruption_resumes_without_rewriting_r
             for request in second_runtime.requests
             if request.output_schema["title"] == "VerificationDraft"
         ]
-    ) == 2
+    ) == 5
 
 
 async def test_heartbeat_failure_fails_run_and_always_releases_worker_state(
@@ -2032,3 +2066,10 @@ async def test_resume_from_export_does_not_repeat_model_work(
 
     assert completed.status is RunStatus.COMPLETED
     assert dict(runtime.counts) == counts_before_resume
+
+
+def test_claim_graph_line_spans_are_utf8_byte_addressed() -> None:
+    assert ResearchWorkflow._proof_lines_with_offsets("前言\n第二步\n") == (
+        (0, "前言"),
+        (7, "第二步"),
+    )

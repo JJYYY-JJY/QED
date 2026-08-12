@@ -366,7 +366,15 @@ class VerificationReport(StrictModel):
     id: NonEmptyStr
     candidate_id: NonEmptyStr
     candidate_sha256: Sha256
-    kind: Literal["structural", "detailed", "citation", "mutation"]
+    kind: Literal[
+        "structural",
+        "detailed",
+        "assumptions_quantifiers",
+        "counterexample_edge_case",
+        "reconstruction",
+        "citation",
+        "mutation",
+    ]
     checks: tuple[VerificationCheck, ...] = Field(min_length=1)
     findings: tuple[Finding, ...] = ()
     verifier_thread_id: NonEmptyStr
@@ -633,7 +641,15 @@ class ManifestVerificationRule(StrictModel):
     id: NonEmptyStr
     text: NonEmptyStr
     responsible_report_kinds: tuple[
-        Literal["structural", "detailed", "citation"], ...
+        Literal[
+            "structural",
+            "detailed",
+            "assumptions_quantifiers",
+            "counterexample_edge_case",
+            "reconstruction",
+            "citation",
+            "mutation",
+        ], ...
     ] = Field(min_length=2)
     coverage: tuple[ManifestRuleCoverage, ...] = ()
 

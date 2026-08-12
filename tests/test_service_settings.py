@@ -19,21 +19,17 @@ def test_service_defaults_to_local_only_managed_state(tmp_path: Path) -> None:
     assert settings.allowed_origins == ("http://127.0.0.1:5173", "http://localhost:5173")
 
 
-def test_non_loopback_bind_requires_a_strong_bearer_token(tmp_path: Path) -> None:
+def test_non_loopback_bind_is_fail_closed_even_with_a_bearer_token(tmp_path: Path) -> None:
     all_interfaces = str(ip_address(0))
-    with pytest.raises(ValidationError, match="bearer token"):
+    with pytest.raises(ValidationError, match="non-loopback"):
         ServiceSettings(data_root=tmp_path, host=all_interfaces)
 
-    settings = ServiceSettings(
-        data_root=tmp_path,
-        host=all_interfaces,
-        auth_token="a" * 32,
-    )
-
-    assert settings.auth_required is True
-    assert settings.auth_token is not None
-    assert settings.auth_token.get_secret_value() == "a" * 32
-    assert "a" * 32 not in str(settings)
+    with pytest.raises(ValidationError, match="non-loopback"):
+        ServiceSettings(
+            data_root=tmp_path,
+            host=all_interfaces,
+            auth_token="a" * 32,
+        )
 
 
 @pytest.mark.parametrize("database_name", ("../qed.sqlite3", "state/qed.sqlite3"))

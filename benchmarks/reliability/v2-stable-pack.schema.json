@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/JJYYY-JJY/QED/benchmarks/reliability/v2-stable-pack.schema.json",
+  "title": "QED v2 stable benchmark pack manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pack_version",
+    "cases_path",
+    "lock_path",
+    "case_schema_sha256",
+    "cases_file_sha256",
+    "case_count",
+    "domains",
+    "error_types",
+    "real_execution_requirements"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "pack_version": {"const": "v2-stable-development-1"},
+    "cases_path": {"type": "string", "minLength": 1},
+    "lock_path": {"type": "string", "minLength": 1},
+    "case_schema_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "cases_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "case_count": {"type": "integer", "minimum": 1},
+    "domains": {"type": "array", "uniqueItems": true, "minItems": 8, "items": {"type": "string"}},
+    "error_types": {"type": "array", "uniqueItems": true, "minItems": 20, "items": {"type": "string"}},
+    "real_execution_requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected_non_pass", "known_true", "citation_judgments"],
+      "properties": {
+        "expected_non_pass": {"const": 300},
+        "known_true": {"const": 100},
+        "citation_judgments": {"const": 100}
+      }
+    }
+  }
+}

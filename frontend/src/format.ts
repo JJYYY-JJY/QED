@@ -15,6 +15,20 @@ export function titleCase(value: string): string {
   return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+export function runStatusLabel(status: string): string {
+  return {
+    running: "Running",
+    paused: "Paused",
+    failed: "Failed",
+    uncertain: "Uncertain",
+    completed: "Complete",
+    complete: "Complete",
+    cancelling: "Cancelling",
+    cancelled: "Cancelled",
+    created: "Created",
+  }[status] ?? titleCase(status);
+}
+
 export function shortHash(value: string, length = 10): string {
   return value.length <= length ? value : `${value.slice(0, length)}…`;
 }

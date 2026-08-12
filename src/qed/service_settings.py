@@ -67,10 +67,13 @@ class ServiceSettings(BaseSettings):
         return values
 
     @model_validator(mode="after")
-    def require_auth_for_remote_bind(self) -> Self:
+    def require_loopback_bind(self) -> Self:
         loopback = self.host == "localhost" or ip_address(self.host).is_loopback
-        if not loopback and self.auth_token is None:
-            raise ValueError("a bearer token is required for a non-loopback bind")
+        if not loopback:
+            raise ValueError(
+                "non-loopback binds are disabled until the remote BFF, CSRF, Origin, "
+                "CORS, and TLS boundary is implemented"
+            )
         return self
 
     @property

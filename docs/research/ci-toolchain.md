@@ -61,17 +61,15 @@ runs:
 npm run lint
 npm run typecheck
 npm test
-npm run test:impeccable
 npm run build
-npm run impeccable
 npx playwright install --with-deps chromium
 npm run test:e2e
 ```
 
-The Impeccable regression command exercises the checked-in local-tool security
-boundary. The detector command runs without `npx` or network access. Playwright
-installs Chromium because both configured projects use that browser engine at
-desktop and narrow viewport sizes.
+The removed alpha-only visual-tool regression is not a current gate. Frontend
+release checks use the typed unit, accessibility, contract, build, and
+Playwright suites. Playwright installs Chromium because both configured projects
+use that browser engine at desktop and narrow viewport sizes.
 
 The job also rejects `Authorization`, `Bearer`, token-storage keys, and Vite
 secret variables in production browser source. Regression tests may name those

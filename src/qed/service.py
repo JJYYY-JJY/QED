@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,7 +17,7 @@ from qed.inputs import RunInput
 from qed.logging import get_logger
 from qed.migration import ImportedLegacyRun, import_legacy_run
 from qed.operations import RunDiagnosis, diagnose_run
-from qed.runtime import CodexRuntime, MockRuntime, RuntimeCapabilities
+from qed.runtime import CodexRuntime
 from qed.schemas import Event
 from qed.service_settings import ServiceSettings
 from qed.store import (
@@ -55,95 +54,10 @@ class WorkflowService(Protocol):
     async def resume(self, run_id: str, *, idempotency_key: str) -> RunRecord: ...
 
 
-def _default_mock_runtime() -> MockRuntime:
-    def verification_response(request: Any) -> dict[str, Any]:
-        start = request.prompt.index('<frozen-input encoding="canonical-json">')
-        start = request.prompt.index("\n", start) + 1
-        end = request.prompt.index("\n</frozen-input>", start)
-        payload = json.loads(request.prompt[start:end])
-        rule_ids = [item["id"] for item in payload["verification_rules"]]
-        evidence_ids: list[str] = []
-        citation_support: list[dict[str, str]] = []
-        if request.role.value == "citation":
-            evidence_ids = [item["id"] for item in payload["evidence"]]
-            proof_span = payload["candidate"]["proof"]
-            citation_support = [
-                {
-                    "evidence_id": item["id"],
-                    "proof_span": proof_span,
-                    "evidence_excerpt": item["content"],
-                    "source_locator": item.get("source_uri") or f"evidence:{item['id']}",
-                }
-                for item in payload["evidence"]
-            ]
-        return {
-            "schema_version": 1,
-            "checks": [
-                {
-                    "id": "mock-check",
-                    "category": "fixture-integrity",
-                    "status": "pass",
-                    "summary": (
-                        "The deterministic mock fixture is internally consistent."
-                    ),
-                    "evidence_ids": evidence_ids,
-                    "rule_ids": rule_ids,
-                    "citation_support": citation_support,
-                }
-            ],
-        }
-
-    return MockRuntime(
-        capabilities=RuntimeCapabilities(
-            model="gpt-5.6-sol",
-            advertised_efforts=("high",),
-            default_effort="high",
-            selected_effort="high",
-            multi_agent=False,
-            proactive_multi_agent=False,
-        ),
-        responses={
-            "EvidenceBatch": {
-                "schema_version": 1,
-                "items": [
-                    {
-                        "kind": "note",
-                        "title": "Mock evidence",
-                        "content": "A deterministic fixture for local workflow validation.",
-                    }
-                ],
-            },
-            "PlanDraft": {
-                "schema_version": 1,
-                "strategy": "Apply the deterministic mock argument.",
-                "steps": [
-                    {
-                        "id": "mock-step",
-                        "statement": "Establish the requested conclusion.",
-                        "rationale": "This fixture exercises orchestration, not mathematics.",
-                        "success_criteria": ["The conclusion is stated."],
-                    }
-                ],
-            },
-            "ProofDraft": {
-                "schema_version": 1,
-                "proof": "Deterministic mock proof for end-to-end system validation.",
-            },
-            "VerificationDraft": verification_response,
-            "AdjudicationDraft": {
-                "schema_version": 1,
-                "outcome": "accept",
-                "rationale": "Every required mock verification report passed.",
-            },
-        },
-    )
-
-
 def build_service(
     settings: ServiceSettings,
     *,
     runtime_factory: RuntimeFactory | None = None,
-    runtime_version: str | None = None,
 ) -> ApplicationService:
     """Construct managed state around an explicitly selected production runtime."""
 
@@ -151,11 +65,11 @@ def build_service(
         raise ValueError("runtime_factory is required for production service construction")
     runtime = runtime_factory(settings.codex_home)
     observed_version = getattr(runtime, "runtime_version", None)
-    if runtime_version is None and (
-        not isinstance(observed_version, str) or not observed_version.strip()
-    ):
+    if not isinstance(observed_version, str) or not observed_version.strip():
         raise ValueError("a production runtime must report its observed runtime_version")
-    selected_version = cast(str, runtime_version or observed_version)
+    if not callable(getattr(runtime, "runtime_resolution", None)):
+        raise ValueError("a production runtime must expose immutable runtime provenance")
+    selected_version = observed_version
     store = RunStore(settings.database_path)
     workflow = ResearchWorkflow(
         store,
@@ -168,18 +82,6 @@ def build_service(
         workflow=workflow,
         runtime=runtime,
         managed_root=settings.data_root,
-    )
-
-
-def build_mock_service(
-    settings: ServiceSettings,
-) -> ApplicationService:
-    """Construct the deterministic test/development service explicitly."""
-
-    return build_service(
-        settings,
-        runtime_factory=lambda _codex_home: _default_mock_runtime(),
-        runtime_version="mock-runtime/1",
     )
 
 

@@ -18,6 +18,7 @@ from .isolation import (
     server_config_overrides,
 )
 from .models import WebSearchMode
+from .protocol import MAX_JSONL_FRAME_BYTES
 
 
 class RuntimeRequestTimeout(RuntimeProtocolError):
@@ -25,13 +26,18 @@ class RuntimeRequestTimeout(RuntimeProtocolError):
 
 
 def resolve_codex_executable(executable: str | Path | None = None) -> Path:
-    value = bundled_codex_path() if executable is None else Path(executable)
+    bundled = Path(bundled_codex_path()).resolve(strict=True)
+    value = bundled if executable is None else Path(executable)
     candidate = value if value.is_absolute() else shutil.which(str(value))
     if candidate is None:
         raise FileNotFoundError(f"could not resolve Codex executable {str(value)!r}")
     resolved = Path(candidate).resolve(strict=True)
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise PermissionError(f"Codex executable is not executable: {resolved}")
+    if resolved != bundled:
+        raise PermissionError(
+            "production Codex runtime must use the package-managed official executable"
+        )
     return resolved
 
 
@@ -109,6 +115,7 @@ async def _spawn(argv: tuple[str, ...], codex_home: Path) -> _Process:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
+        limit=MAX_JSONL_FRAME_BYTES + 1,
         env=codex_subprocess_environment(codex_home),
     )
     if process.stdin is None or process.stdout is None:
@@ -280,6 +287,10 @@ class StdioAppServerTransport:
         assert process is not None
         try:
             while line := await process.stdout.readline():
+                if len(line) > MAX_JSONL_FRAME_BYTES:
+                    raise RuntimeProtocolError(
+                        "App Server JSONL frame exceeds the configured byte limit"
+                    )
                 message = self._decode_message(line)
                 request_id = message.get("id")
                 method = message.get("method")
@@ -307,6 +318,8 @@ class StdioAppServerTransport:
 
     @staticmethod
     def _decode_message(line: bytes) -> dict[str, Any]:
+        if len(line) > MAX_JSONL_FRAME_BYTES:
+            raise RuntimeProtocolError("App Server JSONL frame exceeds the configured byte limit")
         try:
             value = json.loads(line)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:

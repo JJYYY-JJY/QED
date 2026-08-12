@@ -14,16 +14,24 @@ import uvicorn
 from pydantic import BaseModel, ValidationError
 
 from qed.api import create_app
+from qed.bundle_verifier import verify_bundle
 from qed.config import QEDConfig
+from qed.doctor import build_doctor_report
+from qed.evidence import (
+    dimension_eligibility,
+    evidence_digest,
+    load_stable_evidence,
+    verify_evidence_artifacts,
+)
 from qed.inputs import RunInput
 from qed.logging import configure_logging
+from qed.persistence.migrations import backup_database, restore_database, upgrade_database
 from qed.runtime import create_codex_runtime
 from qed.schemas import canonical_json
 from qed.service import (
     ApplicationService,
     RunAlreadyActiveError,
     build_management_service,
-    build_mock_service,
     build_service,
 )
 from qed.service_settings import ServiceSettings
@@ -66,7 +74,6 @@ class LogLevel(StrEnum):
 
 
 class RuntimeMode(StrEnum):
-    MOCK = "mock"
     CODEX = "codex"
 
 
@@ -98,8 +105,8 @@ def _build_runtime_service(
     settings: ServiceSettings,
     mode: RuntimeMode,
 ) -> ApplicationService:
-    if mode is RuntimeMode.MOCK:
-        return build_mock_service(settings)
+    if mode is not RuntimeMode.CODEX:
+        raise ValueError("production CLI only supports the official Codex runtime")
     return build_service(settings, runtime_factory=create_codex_runtime)
 
 
@@ -223,12 +230,23 @@ def run(
     runtime: Annotated[RuntimeMode, typer.Option(help="Runtime implementation.")] = (
         RuntimeMode.CODEX
     ),
+    acknowledge_exec_risk: Annotated[
+        bool,
+        typer.Option(
+            "--acknowledge-exec-risk",
+            help="Required explicit acknowledgement before using codex exec.",
+        ),
+    ] = False,
     data_root: Annotated[Path, typer.Option(help="Managed QED data directory.")] = Path(".qed"),
 ) -> None:
     """Create and synchronously execute one research run."""
 
     selected_run_id = run_id or f"run-{uuid4().hex}"
     try:
+        if backend is BackendMode.EXEC and not acknowledge_exec_risk:
+            raise ValueError(
+                "codex exec is an explicit-risk backend; pass --acknowledge-exec-risk"
+            )
         result = asyncio.run(
             _run_research(
                 data_root=data_root,
@@ -371,21 +389,140 @@ def migrate(
 
 
 @app.command()
+def backup(
+    database: Annotated[Path, typer.Argument(help="SQLite database to back up.")],
+    output: Annotated[Path, typer.Option(help="New backup file path.")],
+) -> None:
+    """Create a verified atomic SQLite backup."""
+
+    try:
+        _write({"schema_version": 1, "backup": str(backup_database(database, output))})
+    except Exception as error:
+        _abort(error)
+
+
+@app.command()
+def restore(
+    source: Annotated[Path, typer.Argument(help="Verified SQLite backup file.")],
+    database: Annotated[Path, typer.Option(help="Database path to replace atomically.")],
+) -> None:
+    """Restore a SQLite backup through a staged atomic replacement."""
+
+    try:
+        _write({"schema_version": 1, "database": str(restore_database(source, database))})
+    except Exception as error:
+        _abort(error)
+
+
+@app.command()
+def upgrade(
+    database: Annotated[Path, typer.Argument(help="SQLite database to upgrade.")],
+) -> None:
+    """Upgrade a copy of the SQLite database and replace it only after validation."""
+
+    try:
+        _write({"schema_version": 1, "database": str(upgrade_database(database))})
+    except Exception as error:
+        _abort(error)
+
+
+@app.command()
 def doctor(
-    run_id: Annotated[str, typer.Argument(help="Durable run identifier.")],
+    run_id_argument: Annotated[
+        str | None,
+        typer.Argument(help="Optional durable run identifier."),
+    ] = None,
+    run_id_option: Annotated[
+        str | None,
+        typer.Option("--run-id", help="Optional durable run identifier."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the machine-readable environment report."),
+    ] = False,
+    live: Annotated[
+        bool,
+        typer.Option("--live", help="Request the operator-controlled live capability check."),
+    ] = False,
     data_root: Annotated[Path, typer.Option(help="Managed QED data directory.")] = Path(".qed"),
 ) -> None:
-    """Read one run's execution, runtime identity, budget, and resume blockers."""
+    """Check the managed environment, or inspect one run when a run ID is supplied."""
 
+    run_id = run_id_option or run_id_argument
     service: ApplicationService | None = None
+    doctor_ok = True
     try:
-        service = build_management_service(_settings(data_root))
-        _write(service.diagnose_run(run_id))
+        if run_id is not None and not json_output and not live:
+            service = build_management_service(_settings(data_root))
+            _write(service.diagnose_run(run_id))
+        else:
+            report = build_doctor_report(_settings(data_root), live=live)
+            _write(report)
+            doctor_ok = report.ok
     except Exception as error:
         _abort(error)
     finally:
         if service is not None:
             asyncio.run(_close(service))
+    if not doctor_ok:
+        raise typer.Exit(code=ExitCode.ERROR)
+
+
+@app.command("verify-bundle")
+def verify_bundle_command(
+    bundle: Annotated[Path, typer.Argument(help="Offline export bundle directory.")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the machine-readable verification result."),
+    ] = False,
+) -> None:
+    """Verify an export bundle without Codex, credentials, or network access."""
+
+    del json_output  # The result is always JSON so it is safe for automation.
+    try:
+        result = verify_bundle(bundle)
+    except (OSError, ValueError) as error:
+        _write(
+            {
+                "schema_version": 1,
+                "error": {"code": "bundle_verifier_environment", "message": str(error)},
+            },
+            error=True,
+        )
+        raise typer.Exit(code=3) from error
+    _write(result)
+    if not result.valid:
+        raise typer.Exit(code=2)
+
+
+@app.command("validate-evidence")
+def validate_evidence_command(
+    evidence: Annotated[
+        Path,
+        typer.Argument(help="Canonical v2-stable-evidence.json file."),
+    ],
+) -> None:
+    """Validate stable evidence and recompute dimension eligibility."""
+
+    try:
+        loaded = load_stable_evidence(evidence)
+        verify_evidence_artifacts(loaded, evidence.parents[2])
+        _write(
+            {
+                "schema_version": 1,
+                "evidence_sha256": evidence_digest(loaded),
+                "eligible_for_10": dimension_eligibility(loaded),
+            }
+        )
+    except (OSError, ValueError) as error:
+        _write(
+            {
+                "schema_version": 1,
+                "error": {"code": "invalid_stable_evidence", "message": str(error)},
+            },
+            error=True,
+        )
+        raise typer.Exit(code=2) from error
 
 
 @app.command()
@@ -449,7 +586,13 @@ def serve(
     port: Annotated[int, typer.Option(min=1, max=65535, help="Listen port.")] = 8000,
     auth_token: Annotated[
         str | None,
-        typer.Option(help="Bearer token; required for non-loopback binds.", hide_input=True),
+        typer.Option(
+            help=(
+                "Reserved for a future remote boundary; non-loopback binds are "
+                "currently rejected."
+            ),
+            hide_input=True,
+        ),
     ] = None,
     runtime: Annotated[RuntimeMode, typer.Option(help="Runtime implementation.")] = (
         RuntimeMode.CODEX

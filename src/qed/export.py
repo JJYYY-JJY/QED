@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import re
 import stat
@@ -18,7 +19,7 @@ from qed.decision import (
     CandidateDecision,
     CandidateIntegrityError,
     candidate_decision_sha256,
-    decide_candidate,
+    decide_stable_candidate,
 )
 from qed.schemas import (
     Event,
@@ -45,6 +46,8 @@ from qed.schemas import (
     sha256_text,
     verification_report_sha256,
 )
+from qed.security.paths import PathSecurityError, require_descendant
+from qed.stable_contracts import ProofObligationGraph
 from qed.store import (
     CandidateRecord,
     ExecutionLease,
@@ -81,6 +84,8 @@ class ExportBundle:
     run_id: str
     proof_md: str
     report_md: str
+    event_chain_json: str
+    audit_json: str
     manifest: Manifest
     manifest_json: str
     bundle_sha256: str
@@ -91,13 +96,17 @@ class ExportBundle:
             {
                 "proof.md": self.proof_md.encode(),
                 "report.md": self.report_md.encode(),
+                "event-chain.json": self.event_chain_json.encode(),
+                "audit.json": self.audit_json.encode(),
                 "manifest.json": self.manifest_json.encode(),
             }
         )
 
 
 _SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_EXPORTED_PATHS = frozenset({"proof.md", "report.md", "manifest.json"})
+_EXPORTED_PATHS = frozenset(
+    {"proof.md", "report.md", "event-chain.json", "audit.json", "manifest.json"}
+)
 
 
 def _validated_files(bundle: ExportBundle) -> Mapping[str, bytes]:
@@ -114,12 +123,27 @@ def _validated_files(bundle: ExportBundle) -> Mapping[str, bytes]:
         for artifact in bundle.manifest.artifacts
         if artifact.relative_path is not None
     }
-    if set(artifacts) != {"proof.md", "report.md"}:
-        raise ExportIntegrityError("manifest must contain proof and report artifacts")
+    if set(artifacts) != {"proof.md", "report.md", "event-chain.json", "audit.json"}:
+        raise ExportIntegrityError(
+            "manifest must contain proof, report, and event-chain artifacts"
+        )
     if artifacts["proof.md"] != sha256_text(bundle.proof_md):
         raise ExportIntegrityError("proof artifact hash does not match bundle")
     if artifacts["report.md"] != sha256_text(bundle.report_md):
         raise ExportIntegrityError("report artifact hash does not match bundle")
+    if artifacts["event-chain.json"] != sha256_text(bundle.event_chain_json):
+        raise ExportIntegrityError("event-chain artifact hash does not match bundle")
+    if artifacts["audit.json"] != sha256_text(bundle.audit_json):
+        raise ExportIntegrityError("audit artifact hash does not match bundle")
+    try:
+        events = tuple(
+            Event.model_validate_json(canonical_json(item))
+            for item in json.loads(bundle.event_chain_json)
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ExportIntegrityError("event-chain artifact is not a JSON event list") from error
+    if bundle.manifest.event_chain_sha256 != event_chain_sha256(events):
+        raise ExportIntegrityError("event-chain hash does not match manifest")
     return bundle.files
 
 
@@ -143,7 +167,11 @@ def _validate_existing(directory: Path, files: Mapping[str, bytes]) -> None:
             metadata = path.lstat()
         except FileNotFoundError as error:
             raise ExportCollisionError(f"export artifact is missing: {path}") from error
-        if not stat.S_ISREG(metadata.st_mode) or path.read_bytes() != expected:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or path.read_bytes() != expected
+        ):
             raise ExportCollisionError(f"export artifact does not match bundle: {path}")
 
 
@@ -177,12 +205,18 @@ def write_export_bundle(bundle: ExportBundle, managed_root: str | Path) -> Path:
     _reject_symlink_components(root)
     if not root.is_dir():
         raise ExportCollisionError(f"managed export root is not a directory: {root}")
+    root.chmod(0o700)
+    root_identity = root.stat()
 
     run_directory = root / bundle.run_id
     if run_directory.is_symlink():
         raise ExportCollisionError(f"export run directory is a symlink: {run_directory}")
     if run_directory.exists() and not run_directory.is_dir():
         raise ExportCollisionError(f"export run address is not a directory: {run_directory}")
+    try:
+        require_descendant(root, run_directory)
+    except PathSecurityError as error:
+        raise ExportCollisionError(str(error)) from error
     try:
         run_directory.mkdir(exist_ok=True)
     except FileExistsError as error:
@@ -191,6 +225,9 @@ def write_export_bundle(bundle: ExportBundle, managed_root: str | Path) -> Path:
         ) from error
     if not run_directory.is_dir():
         raise ExportCollisionError(f"export run address is not a directory: {run_directory}")
+    run_directory.chmod(0o700)
+    if root.stat().st_dev != root_identity.st_dev or root.stat().st_ino != root_identity.st_ino:
+        raise ExportCollisionError("managed export root changed during publication")
 
     destination = run_directory / bundle.bundle_sha256
     if destination.exists() or destination.is_symlink():
@@ -446,11 +483,21 @@ def _render_report(
 ) -> str:
     frozen = candidate.candidate
     required = (
-        ("structural", "detailed", "citation")
+        (
+            "structural",
+            "detailed",
+            "assumptions_quantifiers",
+            "counterexample_edge_case",
+            "reconstruction",
+            "citation",
+        )
         if snapshot.evidence
         else (
             "structural",
             "detailed",
+            "assumptions_quantifiers",
+            "counterexample_edge_case",
+            "reconstruction",
         )
     )
     lines = [
@@ -870,11 +917,10 @@ def build_export_bundle(
         rule.id for rule in snapshot.run_input.frozen_verification_rules
     )
     try:
-        decision = decide_candidate(
+        decision = decide_stable_candidate(
             candidate.candidate,
             tuple(record.report for record in reports),
             prover_external_thread_id=writer.external_thread_id,
-            require_citation=bool(snapshot.evidence),
             required_evidence=snapshot.evidence,
             required_rule_ids=required_rule_ids,
         )
@@ -896,6 +942,43 @@ def build_export_bundle(
         observed_stage,
         publication_phase,
     ) = _manifest_window(snapshot, generated_at)
+    event_chain_json = (
+        f"{canonical_json([event.model_dump(mode='json') for event in manifest_events])}\n"
+    )
+    graph_outputs = tuple(
+        output
+        for output in snapshot.stage_outputs
+        if output.kind == f"claim_graph:{candidate_id}"
+    )
+    if len(graph_outputs) != 1:
+        raise ExportIntegrityError("export requires exactly one immutable claim graph")
+    try:
+        graph = ProofObligationGraph.model_validate_json(
+            canonical_json(graph_outputs[0].content)
+        )
+        graph.validate_against_proof(
+            candidate.candidate.proof,
+            evidence_ids=frozenset(item.id for item in snapshot.evidence),
+            rule_ids=frozenset(required_rule_ids),
+        )
+    except ValueError as error:
+        raise ExportIntegrityError(f"claim graph is invalid: {error}") from error
+    audit_json = (
+        f"{canonical_json({
+            'candidate': candidate.candidate.model_dump(mode='json'),
+            'reports': [
+                record.report.model_dump(
+                    mode='json',
+                    exclude_computed_fields=True,
+                )
+                for record in reports
+            ],
+            'evidence': [item.model_dump(mode='json') for item in snapshot.evidence],
+            'decision': decision.model_dump(mode='json'),
+            'prover_external_thread_id': writer.external_thread_id,
+            'claim_graph': graph.model_dump(mode='json'),
+        })}\n"
+    )
     manifest_turns = _manifest_turns(manifest_events)
     selected_turn_inputs = {turn.turn_input_id for turn in manifest_turns}
     manifest = Manifest(
@@ -1098,6 +1181,20 @@ def build_export_bundle(
                 media_type="text/markdown",
                 relative_path="report.md",
             ),
+            ManifestArtifact(
+                id="event-chain",
+                kind="event_chain",
+                sha256=sha256_text(event_chain_json),
+                media_type="application/json",
+                relative_path="event-chain.json",
+            ),
+            ManifestArtifact(
+                id="audit",
+                kind="audit_records",
+                sha256=sha256_text(audit_json),
+                media_type="application/json",
+                relative_path="audit.json",
+            ),
         ),
         first_event_seq=manifest_events[0].seq,
         last_event_seq=manifest_events[-1].seq,
@@ -1109,6 +1206,8 @@ def build_export_bundle(
         run_id=snapshot.run.id,
         proof_md=proof_md,
         report_md=report_md,
+        event_chain_json=event_chain_json,
+        audit_json=audit_json,
         manifest=manifest,
         manifest_json=manifest_json,
         bundle_sha256=sha256_text(manifest_json),

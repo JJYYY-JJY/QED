@@ -1,244 +1,154 @@
-# Architecture
+# QED v2 architecture
 
-QED v2 alpha turns one frozen mathematical problem into a content-addressed
-research record. SQLite owns state. Codex threads perform bounded work, and
-application code decides whether a candidate earns a QED policy PASS.
+QED turns one frozen mathematical problem into a content-addressed research
+record. SQLite is the only durable authority. Official OpenAI Codex threads
+perform bounded work; application code computes QED policy decisions.
 
-## System map
+## Bounded contexts and dependency direction
 
-```mermaid
-flowchart LR
-    UI["React research console"]
-    CLI["qed CLI"]
-    API["FastAPI REST and SSE"]
-    SVC["ApplicationService"]
-    WF["ResearchWorkflow"]
-    STORE[("SQLite WAL store")]
-    RUNTIME["CodexRuntime"]
-    SDK["openai-codex SDK"]
-    APP["Codex App Server"]
-    EXEC["codex exec fallback"]
-    EXPORT["Content-addressed exports"]
-
-    UI --> API
-    CLI --> SVC
-    API --> SVC
-    SVC --> WF
-    SVC --> STORE
-    WF --> STORE
-    WF --> RUNTIME
-    RUNTIME --> SDK
-    RUNTIME --> APP
-    RUNTIME --> EXEC
-    WF --> EXPORT
-    EXPORT --> STORE
-    STORE -- "ordered event replay" --> API
-```
-
-The React client uses the versioned HTTP API and SSE stream. It never reads run
-files or starts a process. FastAPI and the CLI call the same application
-service. The workflow depends on the public store and runtime interfaces.
-Local browser use connects to a tokenless loopback API. A remote browser uses an
-external same-origin backend-for-frontend (BFF) with an HttpOnly session; the
-BFF keeps the QED bearer token on its server-side hop.
-
-## Run lifecycle
+The bounded-context names below are logical ownership boundaries. They are
+mapped to the shipped modules in this repository; the implementation does not
+create empty package facades merely to make the names look more granular.
 
 ```mermaid
-flowchart LR
-    I[intake] --> L[literature]
-    L --> P[planning]
-    P --> C[proving]
-    C --> V[verification]
-    V --> A[adjudication]
-    A -->|revise strategy| L
-    A -->|revise plan| P
-    A -->|new proof attempt| C
-    A -->|accepted candidate| E[export]
-    E --> D[complete]
+flowchart TB
+    API["qed.api"] --> APP["qed.service"]
+    APP --> SUP["qed.workflow + workflow_support"]
+    SUP --> DOMAIN["qed.domain.state + qed.decision"]
+    SUP --> RECORDS["qed.stable_contracts + qed.store"]
+    SUP --> ATTEMPTS["qed.runtime"]
+    DOMAIN --> PERSIST["qed.store + store_schema + persistence.migrations"]
+    RECORDS --> PERSIST
+    ATTEMPTS --> PERSIST
+    PERSIST --> SQLITE[("SQLite WAL")]
+    APP --> READ["qed.api read model"]
+    APP --> EXPORT["qed.export"]
+    EXPORT --> PERSIST
+    VERIFY["qed.bundle_verifier"] -. "hashes/schema only" .-> EXPORT
 ```
 
-Each run also has a lifecycle status: `created`, `running`, `paused`,
-`cancelling`, `cancelled`, `failed`, or `completed`. Stage changes and status
-changes require store transactions. Store-assigned sequence numbers make the
-event log replayable after a client disconnect.
+The public `RunStore`, `ResearchWorkflow`, and API shapes remain compatible
+with existing callers while their internal contracts have explicit owners:
 
-Start and resume commands acquire execution leases with fencing tokens. A stale
-worker cannot write after another execution claims the run. Cancel records the
-request before the workflow interrupts active Codex turns. Resume appends an
-execution segment and retains earlier attempts. Paused, cancelled, and failed
-runs may resume from their current durable stage when no unconfirmed runtime
-turn or live execution lease remains.
-
-Operators inspect exceptional runs with `qed doctor RUN_ID`. QED lists
-execution segments, external thread and turn identities, unresolved runtime
-events, consumed budgets, and each condition that blocks resume. The locked
-runtime abstraction cannot query one authoritative status by exact
-backend/thread/turn identity across SDK, App Server, and exec. `qed reconcile`
-reports that limit and creates no evidence. An operator can run `qed abandon
-RUN_ID --reason ...` after a lease expires. The store writes an immutable
-operator event and moves the run to non-resumable `failed`; it does not
-synthesize a runtime terminal or grant PASS.
-
-Each model call uses an immutable frozen turn input. QED records a turn-attempt
-event before invoking the runtime; resume counts those events, so a process
-restart cannot replenish the configured retry allowance. Local runtime
-preflight runs before that marker. A normal stream end before any thread starts
-records that the attempt did not start; any failure after remote acceptance may
-be possible remains unresolved until reconciled.
-
-A possibly accepted start retains execution ownership even before a turn ID is
-known. Once known, normal completion, interruption, and failure all satisfy the
-contract for that exact backend, thread, and turn. QED drains fenced lifecycle
-events while cancelling, retains a reconciliation task when a terminal is late,
-and drains those tasks before service shutdown closes the runtime or store. An
-ambiguous start creates `runtime.turn_start_unconfirmed`; a known turn whose
-stream ends early creates `runtime.turn_terminal_unconfirmed`. The store then
-rejects cancellation acknowledgement, execution release, resume, and a
-replacement execution even after lease expiry.
-
-## Authority boundaries
-
-| Concern | Owner | Contract |
+| Logical context (shipped owner) | Owns | Must not own |
 | --- | --- | --- |
-| Input and configuration | `qed.inputs`, `qed.config` | Strict frozen Pydantic models with canonical SHA-256 hashes |
-| Declared state machines | `qed.state_machine` | Run, stage, and thread transition graphs |
-| Schema migration | `qed.store_schema` | Supported database versions and fail-closed identity preflight |
-| State and transitions | `qed.store` | SQLite transactions, immutable records, ordered events, execution fencing |
-| Exceptional-run diagnosis | `qed.operations` | Read-only blocker and budget manifest; no runtime-state mutation |
-| Codex transport | `qed.runtime` | One typed interface over SDK, App Server, and the selected exec fallback |
-| Stage orchestration | `qed.workflow` | Bounded retries, cancel, resume, and role policy |
-| Runtime-event support | `qed.workflow_support` | Search-event classification, observed-source records, and strict sibling cancellation |
-| HTTP and SSE | `qed.api` | Versioned request and response models, replay from `Last-Event-ID` |
-| CLI and process supervision | `qed.service`, `qed.cli` | The same commands and durable records as the HTTP surface |
-| Export | `qed.export` | Deterministic `proof.md`, `report.md`, and `manifest.json` bundle |
+| Domain state (`qed.domain.state`; `qed.state_machine` is a compatibility facade) | one `CommandSpec` transition table and terminal rules | SQL, Codex calls |
+| Persistence (`qed.store`, `qed.store_schema`) | transactions, repositories, event sequence, receipts, snapshots, leases and fencing | model policy |
+| Migrations (`qed.persistence.migrations`, CLI wiring in `qed.migration`) | preflight, staged upgrade, backup/restore | runtime execution |
+| Research records (`qed.stable_contracts` plus store-owned immutable rows) | evidence, plans, candidates, proof spans, provenance and claim-graph records | network policy |
+| Runtime attempts (`qed.runtime`) | turn reservation contract, lifecycle, reconciliation, usage and Codex adapters | export verdict |
+| Verification policy (`qed.stable_contracts`, `qed.decision`) | required roles, rule/claim coverage and N-of-N inputs | free-text adjudication |
+| Mathematical decision (`qed.decision`) | pure code-derived candidate decision | model-generated PASS |
+| Export (`qed.export`, `qed.bundle_verifier`) | manifest, chain, hashes, signatures/status and offline verification | starting a runtime |
+| API commands/read model (`qed.api`, called through `qed.service`) | write contracts and read projections | direct SQL mutation in views |
+| Orchestration (`qed.workflow`, `qed.workflow_support`) | supervision, retry, cancel, resume and recovery | durable authority |
+| Observability (`qed.logging` and store-owned events) | structured events and deterministic redaction | credentials |
 
-Markdown has no control authority. Codex must return an output that matches the
-JSON Schema for the role. The workflow validates the terminal JSON with the
-matching Pydantic model before it writes a typed artifact or changes a stage.
+There is deliberately no generic provider, no second model interface, and no
+standalone `qed.*` module for every row in this table. The table is the
+reviewable dependency contract; the named shipped owner is the authority.
 
-## Thread and network policy
+## State and durable boundaries
 
-QED assigns separate Codex threads to literature, planning, proof generation,
-verification, and adjudication. A proof candidate records its author thread and
-plan. Sealing freezes its bytes and provenance.
+The `CommandSpec` table is the authoritative transition matrix. Each command
+declares source states, target state, transaction boundary, emitted event
+families, retry behavior, stale-owner behavior, and crash-recovery behavior.
+Store-assigned event sequences are contiguous and replayable. A write command
+requires an idempotency key; a repeated key returns its durable receipt without
+repeating the side effect.
 
-Structural and detailed verifiers start on fresh threads, receive frozen input,
-use a read-only sandbox, and run offline. Citation verification also starts on a
-fresh read-only thread; it may use live web search under the restricted role
-policy. Literature work may use the same search policy. The current workflow
-has no command-network control. Every attempt receives a distinct server-owned
-empty Git working directory, including retries. Request construction and local
-preflight happen inside the attempt loop, and all runtime adapters disable
-local shell, file-editing, browser, code-mode, plugin, and hook capabilities.
+Start/resume acquire a lease and fencing generation. Every lifecycle write,
+including terminal and release events, checks the current owner and expiry.
+Attempt reservations and budgets are durable before a runtime call, so process
+restart cannot replenish attempts or token allowances. A resumed run appends a
+new execution segment and never edits frozen input, candidates, or reports.
+Cancellation records the request before interruption and cannot become terminal
+until late runtime events are confirmed. An unconfirmed start or terminal keeps
+the run fail-closed even after lease expiry; `qed reconcile` diagnoses the
+limitation and `qed abandon` records an operator decision.
 
-The store binds each verifier report to a nonempty external Codex thread
-identity. It compares that identity with the candidate author's external
-identity and with the other required verifiers. A database uniqueness
-constraint rejects duplicate `(run_id, external_thread_id)` values. Migration
-stops and names existing duplicates instead of overwriting them.
+## Runtime contract
 
-Fresh means that Codex created a new conversation state for the verifier. The
-prover and verifier can still use the same model weights and share systematic
-biases.
+Production construction exposes only the official Codex SDK adapter, the
+version-matched Codex App Server adapter, and an explicitly acknowledged
+official `codex exec` adapter. A fixture runtime is test-only. No generic
+provider interface or model router is exposed to product callers.
 
-Stage gates are scoped to the current revision cycle. A proving-cycle entry
-sets the lower event-sequence bound for eligible sealed candidates. Verification
-and adjudication can use only reports and decisions linked to candidates after
-that bound. Earlier candidates and reports stay immutable and visible for audit,
-but they cannot satisfy a later cycle.
+Each execution segment persists an immutable `RuntimeProvenance` containing the
+exact OpenAI provider, model ID, model/runtime/CLI/SDK/App Server versions,
+backend, requested and selected reasoning effort, catalog/config/prompt/schema/
+executable/capability hashes, and protocol version. Missing identity,
+unsupported effort, silent substitution, version mismatch, unknown critical
+event, missing thread/turn identity, oversized frame, or late terminal is a
+NON_PASS condition.
 
-## QED policy PASS and export
+Roles differ only by prompt/schema, reasoning effort, fresh thread, and the
+minimum frozen input required for the task. A fresh verifier thread isolates
+conversation state; it does not produce independent model weights. Verifiers
+receive private read-only workspaces and no command network. Citation network
+access is disabled until the restricted fetcher is the only attested path.
 
-The application requires structural and detailed reports for each candidate. A
-run with evidence also requires a citation report with structured support for
-every stored evidence record and no unknown evidence ID. Each support record
-binds an exact span of the frozen proof to an exact excerpt of the frozen
-evidence and its registered URI or ledger locator. A bare evidence ID or
-free-text mention does not count. This proves that the citation check used the
-registered bytes; the LLM still judges whether those bytes semantically support
-the claim. Accepted reports must contain consistent checks and findings. QED
-assigns stable IDs to frozen user
-verification rules. Reports may cover a rule together, but at least one
-structured PASS check must name each required rule ID. Unknown IDs, missing
-coverage, FAIL, and UNCERTAIN all block PASS. Application code recomputes the
-candidate decision from the frozen reports.
+SDK, App Server, and exec adapters share typed versioned lifecycle events and
+the same conformance expectations for acceptance, cancellation, resume, usage,
+schema failure, unknown/late terminal, and identity binding. App Server events
+are routed by `(external_thread_id, turn_id)`, not broadcast.
 
-Export uses a durable `export_intent` boundary. The manifest records the run
-status and stage observed at that event-chain boundary, normally
-`running/export`, while separately recording the code verdict. Publishing the
-content-addressed files is followed by artifact registration and the
-`complete/completed` transition. A crash can leave an orphaned precommit bundle,
-but that bundle does not claim that the terminal transition was observed.
-`qed doctor` is the diagnostic manifest for non-success runs and includes every
-immutable operator decision; ordinary PASS exports also project any operator
-decision present in their selected event window.
+## Mathematical decision boundary
 
-QED policy PASS means that a sealed candidate met the configured code gates and
-thread-isolated LLM checks. It does not certify peer review, formal or Lean
-verification, or mathematical truth.
+Candidates are immutable and linked to a `ProofObligationGraph`. Application
+code verifies UTF-8 byte spans, span hashes, stable claim IDs, dependency
+existence and cycles, evidence/rule IDs, and verifier coverage. The current
+materializer creates deterministic non-empty proof-line obligations with
+linear dependencies and a final conclusion node; Codex does not choose stable
+IDs or byte ranges. Semantic decomposition quality still requires the blocked
+real Codex reconstruction/reliability window and is not claimed by the local
+fixture.
 
-Completion requires a selected sealed candidate, its code decision, an
-adjudication, and three registered export artifacts. QED writes each bundle to:
+Stable policy requires structural, detailed-step, assumptions/quantifiers,
+counterexample/edge-case, and reconstruction PASS reports, plus citation
+SUPPORT for every actual evidence record. It also requires all frozen rule and
+claim obligations to have coverage, distinct verifier external thread IDs,
+matching candidate/report/runtime hashes, no FAIL/UNCERTAIN/missing/unknown
+state, and confirmed terminal ownership. Adjudication can rank only candidates
+that already passed these gates; it cannot upgrade a failure.
 
-```text
-<data-root>/exports/<run-id>/<bundle-sha256>/
-├── proof.md
-├── report.md
-└── manifest.json
-```
+The user-facing term is always **QED policy PASS**. It never means formally
+verified, mathematically guaranteed, proven true, or certified theorem.
 
-The manifest binds hashes for the input, configuration, evidence, plans,
-candidates, verifier reports, adjudications, code decisions, frozen turn
-inputs, thread provenance, proof-linked findings, and exported proof and report.
-It records the status and stage observed at the event-chain boundary and keeps
-the compatibility machine field `code_verdict: "PASS"`, whose reader-facing
-meaning is QED policy PASS. A production export-intent bundle records
-`running/export`; SQLite records the later terminal transition.
-The manifest also records rule-to-report/check coverage, output-schema hashes,
-turn/backend lineage, prompt versions,
-canonical runtime resolutions, execution segments, detailed usage and timing,
-and the first and last event sequences with a hash of the canonical event chain.
-Usage includes input, output, cached-input, and reasoning-output tokens, turns,
-search queries, and execution seconds. The bundle hash addresses the canonical
-manifest. SHA-256 provides integrity addressing. It does not provide an author
-signature, trusted timestamp, or source-authenticity proof.
+## API, SSE, and deployment
 
-## Runtime selection
+FastAPI and CLI commands use the same application service. API write commands
+have idempotency contracts. SSE IDs are store event sequences and can replay
+from `Last-Event-ID`; payloads include schema version, replay is capped, client
+queues are bounded, stream lifetime and quotas are limited, and a slow client
+cannot block the state machine.
 
-`CodexRuntime` probes the exact model name and its advertised effort values. A
-missing model or effort stops the run. `auto` selects `ultra` only when the run
-requests proactive delegation, the runtime advertises multi-agent support, and
-the model advertises `ultra`; otherwise it uses the model default. An explicit
-effort must match the catalog and enables proactive delegation only when that
-effort is `ultra` and the same capability checks pass.
+The default deployment is loopback-only. Every non-loopback bind fails closed
+until the documented remote BFF, secure session cookie, CSRF/Origin/CORS, and
+TLS boundary exists. The React client has no bearer credential and uses explicit
+Running, Paused, Failed, Uncertain, Export intent, Complete, and QED policy PASS
+labels. Export intent is not the same as SQLite terminal completion.
 
-The router uses the official Python SDK when it can represent every requested
-control. In `auto` mode, it sends unsupported controls through the
-version-matched App Server adapter. The `codex exec` backend runs only after a
-caller selects it. Every backend emits the same internal event models.
+## Export and offline verification
 
-The alpha configuration uses one global model name for all roles. A
-role-specific model change needs a versioned config and migration contract,
-per-turn actual-model recording, capability checks for each selected model, and
-cross-role test coverage. The alpha does not ship a partial role override. See
-[Role-specific model design](role-specific-models.md).
+`qed verify-bundle <bundle> --json` reads exactly five regular files, rejects
+links, hard links, path escapes, extra/missing files and duplicate JSON keys,
+recanonicalizes JSON, checks all content hashes and event-chain roots, verifies
+candidate/report/thread lineage, claim/rule coverage, runtime bindings, export
+intent versus terminal state, and recomputes the candidate decision without
+Codex or network access. Exit codes are 0 valid, 2 invalid bundle, and 3
+usage/environment failure.
 
-## Storage layout
+Bundles are content-addressed by canonical manifest SHA-256. Unsigned bundles
+are explicitly reported as unsigned; SHA-256 is not an author signature or a
+trusted timestamp. Optional Ed25519 signing remains separate from hash
+verification and is not required for the offline integrity check.
 
-```text
-<data-root>/
-├── qed.sqlite3
-├── qed.sqlite3-shm             # present while SQLite uses shared memory
-├── qed.sqlite3-wal             # present while SQLite has WAL content
-├── exports/
-│   └── <run-id>/<bundle-sha256>/
-└── legacy-imports/
-    └── legacy-<content-prefix>/
-        ├── artifacts/
-        └── manifest.json
-```
+## Release evidence
 
-The SQLite database remains the state authority. Export and legacy files serve
-as immutable projections. See [Operations](operations.md) for backup and
-recovery guidance and [Migration](migration.md) for legacy import semantics.
+The stable evidence contract is `docs/research/v2-stable-evidence.json` and its
+strict schema. `qed validate-evidence` recomputes dimension eligibility from
+required gate statuses. Any false, missing, unknown, blocked, or unrun required
+gate makes the dimension ineligible for 10/10. A deterministic golden bundle
+is checked in under `artifacts/golden-bundle` and is explicitly excluded from
+real Codex reliability denominators.

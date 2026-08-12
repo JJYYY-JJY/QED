@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import importlib.metadata
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Protocol, cast
@@ -10,6 +12,7 @@ from .exec import ExecRuntime
 from .isolation import prepare_codex_home
 from .models import (
     CapabilityRequest,
+    FreshThread,
     RunRequest,
     RuntimeBackend,
     RuntimeCapabilities,
@@ -61,16 +64,85 @@ class RoutedCodexRuntime:
         app_server: _TurnRuntime,
         exec_runtime: _SelectableRuntime,
         *,
+        executable: Path,
         runtime_version: str,
     ) -> None:
         self._capability_runtime = capability_runtime
         self._sdk = sdk
         self._app_server = app_server
         self._exec = exec_runtime
+        self._executable = executable
         self.runtime_version = runtime_version
 
     async def probe(self, request: CapabilityRequest) -> RuntimeCapabilities:
         return await self._capability_runtime.probe(request)
+
+    def runtime_resolution(
+        self,
+        capabilities: RuntimeCapabilities,
+        *,
+        requested_effort: str,
+        config_sha256: str,
+        prompt_sha256: str,
+        schema_sha256: str,
+        requested_backend: RuntimePreference | None = None,
+    ) -> dict[str, object]:
+        """Return the immutable, observed identity bound before model work."""
+
+        if capabilities.model_version is None or capabilities.model_catalog_sha256 is None:
+            raise RuntimeError("Codex capability probe did not return exact model provenance")
+        if capabilities.capability_response_sha256 is None:
+            raise RuntimeError("Codex capability probe did not return a response hash")
+        try:
+            sdk_version = importlib.metadata.version("openai-codex")
+        except importlib.metadata.PackageNotFoundError as error:
+            raise RuntimeError("official openai-codex package version is unavailable") from error
+        selected_backend = capabilities.backend
+        if requested_backend is not None:
+            if requested_backend is RuntimePreference.SDK:
+                selected_backend = RuntimeBackend.SDK
+            elif requested_backend is RuntimePreference.APP_SERVER:
+                selected_backend = RuntimeBackend.APP_SERVER
+            elif requested_backend is RuntimePreference.EXEC:
+                selected_backend = RuntimeBackend.EXEC
+            else:
+                probe_request = RunRequest(
+                    model=capabilities.model,
+                    effort=capabilities.selected_effort,
+                    prompt="runtime backend capability probe",
+                    output_schema={"type": "object"},
+                    thread=FreshThread(),
+                    cwd=Path("/"),
+                )
+                try:
+                    sdk_available = self._sdk.supports(probe_request)
+                except Exception as error:
+                    raise RuntimeError("Codex SDK backend capability check failed") from error
+                selected_backend = (
+                    RuntimeBackend.SDK if sdk_available else RuntimeBackend.APP_SERVER
+                )
+        if selected_backend is None:
+            raise RuntimeError("Codex runtime did not resolve a selected backend")
+        return {
+            "schema_version": 1,
+            "model_provider": "OpenAI",
+            "model": capabilities.model,
+            "model_version": capabilities.model_version,
+            "backend": selected_backend.value,
+            "codex_runtime_version": self.runtime_version,
+            "codex_cli_version": self.runtime_version,
+            "sdk_version": sdk_version,
+            "app_server_version": self.runtime_version,
+            "requested_effort": requested_effort,
+            "selected_effort": capabilities.selected_effort,
+            "model_catalog_sha256": capabilities.model_catalog_sha256,
+            "config_sha256": config_sha256,
+            "prompt_sha256": prompt_sha256,
+            "schema_sha256": schema_sha256,
+            "executable_sha256": hashlib.sha256(self._executable.read_bytes()).hexdigest(),
+            "capability_response_sha256": capabilities.capability_response_sha256,
+            "protocol_version": "qed-codex-protocol-v1",
+        }
 
     def preflight(self, request: RunRequest) -> None:
         if request.effort == "auto":
@@ -156,5 +228,6 @@ def create_codex_runtime(
         sdk,
         app_server,
         exec_runtime,
+        executable=resolved,
         runtime_version=runtime_version,
     )

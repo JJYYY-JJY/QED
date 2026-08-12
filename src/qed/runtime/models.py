@@ -7,6 +7,8 @@ from typing import Annotated, Any, Literal, Self, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from qed.schemas import Sha256
+
 
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -45,6 +47,10 @@ class WorkRole(StrEnum):
     LITERATURE = "literature"
     CITATION = "citation"
     VERIFIER = "verifier"
+    ASSUMPTIONS_QUANTIFIERS = "assumptions_quantifiers"
+    COUNTEREXAMPLE_EDGE_CASE = "counterexample_edge_case"
+    RECONSTRUCTION = "reconstruction"
+    ADJUDICATOR = "adjudicator"
 
 
 class FreshThread(_FrozenModel):
@@ -65,6 +71,7 @@ ThreadTarget = Annotated[FreshThread | ResumeThread | ForkThread, Field(discrimi
 
 
 class RunRequest(_FrozenModel):
+    model_provider: Literal["OpenAI"] = "OpenAI"
     model: str = Field(min_length=1)
     effort: str = Field(default="auto", min_length=1)
     proactive: bool = False
@@ -86,16 +93,27 @@ class RunRequest(_FrozenModel):
 
     @model_validator(mode="after")
     def validate_network_controls(self) -> Self:
-        if self.role in {WorkRole.VERIFIER, WorkRole.CITATION} and (
+        if self.model_provider != "OpenAI":
+            raise ValueError("QED production runtime provider must be OpenAI")
+        if self.role in {
+            WorkRole.VERIFIER,
+            WorkRole.CITATION,
+            WorkRole.ASSUMPTIONS_QUANTIFIERS,
+            WorkRole.COUNTEREXAMPLE_EDGE_CASE,
+            WorkRole.RECONSTRUCTION,
+            WorkRole.ADJUDICATOR,
+        } and (
             not isinstance(self.thread, FreshThread)
             or self.sandbox is not SandboxMode.READ_ONLY
         ):
             raise ValueError("verification turns must be fresh and read-only")
-        if (
-            self.role is WorkRole.VERIFIER
-            and self.web_search is not WebSearchMode.DISABLED
-        ):
-            raise ValueError("structural and detailed verifiers must be offline")
+        if self.role in {
+            WorkRole.VERIFIER,
+            WorkRole.ASSUMPTIONS_QUANTIFIERS,
+            WorkRole.COUNTEREXAMPLE_EDGE_CASE,
+            WorkRole.RECONSTRUCTION,
+        } and self.web_search is not WebSearchMode.DISABLED:
+            raise ValueError("mathematical verifiers must be offline")
         network_roles = {WorkRole.LITERATURE, WorkRole.CITATION}
         if (
             self.web_search is not WebSearchMode.DISABLED
@@ -106,6 +124,7 @@ class RunRequest(_FrozenModel):
 
 
 class CapabilityRequest(_FrozenModel):
+    model_provider: Literal["OpenAI"] = "OpenAI"
     model: str = Field(min_length=1)
     effort: str = Field(default="auto", min_length=1)
     proactive: bool = False
@@ -126,12 +145,20 @@ class ModelCapability(_FrozenModel):
 
 
 class RuntimeCapabilities(_FrozenModel):
+    model_provider: Literal["OpenAI"] = "OpenAI"
     model: str
     advertised_efforts: tuple[str, ...]
     default_effort: str
     selected_effort: str
     multi_agent: bool
     proactive_multi_agent: bool
+    # These fields are populated by the official adapter's capability probe.  They
+    # stay optional here so deterministic test runtimes can be injected without
+    # pretending to have observed production provenance.
+    model_version: str | None = None
+    backend: RuntimeBackend | None = None
+    model_catalog_sha256: Sha256 | None = None
+    capability_response_sha256: Sha256 | None = None
 
 
 def resolve_capability(

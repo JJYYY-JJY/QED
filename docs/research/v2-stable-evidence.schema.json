@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qed.invalid/schemas/v2-stable-evidence.schema.json",
+  "title": "QED v2 stable evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["commit_sha", "generated_at", "gates"],
+  "properties": {
+    "schema_version": {"const": 1, "type": "integer"},
+    "commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "generated_at": {"type": "string", "minLength": 1},
+    "gates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/EvidenceGate"}
+    }
+  },
+  "$defs": {
+    "EvidenceGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gate_id",
+        "dimension",
+        "status",
+        "command",
+        "utc_date",
+        "commit_sha",
+        "environment",
+        "result",
+        "artifact_path"
+      ],
+      "properties": {
+        "gate_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]+$"},
+        "dimension": {"enum": ["architecture", "security", "mathematics", "maturity"]},
+        "required": {"type": "boolean", "default": true},
+        "status": {"enum": ["passed", "failed", "blocked", "unrun", "unknown"]},
+        "command": {"type": "string", "minLength": 1},
+        "utc_date": {"type": "string", "minLength": 1},
+        "commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "environment": {"type": "string", "minLength": 1},
+        "result": {"type": "string", "minLength": 1},
+        "artifact_path": {"type": "string", "minLength": 1},
+        "artifact_sha256": {
+          "anyOf": [
+            {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            {"type": "null"}
+          ],
+          "default": null
+        },
+        "limitation": {"type": ["string", "null"], "default": null},
+        "references": {"type": "array", "items": {"type": "string"}, "default": []}
+      }
+    }
+  }
+}

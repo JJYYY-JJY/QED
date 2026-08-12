@@ -35,6 +35,7 @@ qed = "qed.cli:app"
 dev = [
   "httpx>=0.28",
   "mypy>=1.17",
+  "mutmut>=3.3",
   "pytest>=8.4",
   "pytest-asyncio>=1.1",
   "pytest-cov>=6.2",
@@ -62,6 +63,41 @@ asyncio_mode = "auto"
 markers = [
   "real_codex: opt-in tests that invoke an authenticated Codex runtime",
 ]
+
+[tool.mutmut]
+source_paths = [
+  "src/qed/domain/state.py",
+  "src/qed/decision.py",
+  "src/qed/stable_contracts.py",
+  "src/qed/export.py",
+  "src/qed/persistence/migrations.py",
+]
+also_copy = [
+  "src/qed/__init__.py",
+  "src/qed/__main__.py",
+  "src/qed/api.py",
+  "src/qed/bundle_verifier.py",
+  "src/qed/config.py",
+  "src/qed/doctor.py",
+  "src/qed/evidence.py",
+  "src/qed/inputs.py",
+  "src/qed/logging.py",
+  "src/qed/migration.py",
+  "src/qed/model_outputs.py",
+  "src/qed/operations.py",
+  "src/qed/prompting.py",
+  "src/qed/runtime",
+  "src/qed/schemas.py",
+  "src/qed/security",
+  "src/qed/service.py",
+  "src/qed/service_settings.py",
+  "src/qed/state_machine.py",
+  "src/qed/store.py",
+  "src/qed/store_schema.py",
+  "src/qed/workflow.py",
+  "src/qed/workflow_support.py",
+]
+pytest_add_cli_args_test_selection = ["tests/test_state_machine.py", "tests/test_decision.py", "tests/test_export.py", "tests/test_bundle_verifier.py", "tests/test_persistence_migrations.py"]
 
 [tool.ruff]
 target-version = "py313"

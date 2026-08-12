@@ -1,4 +1,4 @@
-import { formatDate, shortHash, titleCase } from "../format";
+import { formatDate, runStatusLabel, shortHash, titleCase } from "../format";
 import type { CandidateRecord, Evidence, RunSnapshot, VerificationRecord } from "../types";
 import { useModalDrawer } from "../useModalDrawer";
 import { StatusBadge } from "./StatusBadge";
@@ -101,7 +101,10 @@ function RunInspector({ snapshot }: { snapshot: RunSnapshot }) {
   return (
     <>
       <section className="inspector-lead">
-        <StatusBadge value={run.status} />
+        <StatusBadge value={run.status} label={runStatusLabel(run.status)} />
+        {run.stage === "export" && run.status !== "completed" && (
+          <StatusBadge value="running" label="Export intent" tone="progress" />
+        )}
         <h2>{run.id}</h2>
         <p>{input?.problem ?? "The frozen problem input is unavailable."}</p>
       </section>

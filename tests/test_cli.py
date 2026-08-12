@@ -14,8 +14,8 @@ from qed.cli import app
 from qed.config import QEDConfig
 from qed.inputs import RunInput
 from qed.logging import configure_logging, get_logger
-from qed.service import _default_mock_runtime, build_mock_service
 from qed.service_settings import ServiceSettings
+from tests.mock_service import build_mock_service, default_mock_runtime
 
 _RUNNER = CliRunner()
 
@@ -65,7 +65,7 @@ def test_init_creates_managed_sqlite_store(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == 4
+    assert payload["schema_version"] == 5
     assert payload["journal_mode"] == "wal"
     assert (data_root / "qed.sqlite3").is_file()
 
@@ -116,7 +116,24 @@ def test_help_exposes_required_operational_commands() -> None:
         assert command in result.stdout
 
 
-def test_mock_run_completes_and_exports_a_reproducible_bundle(tmp_path: Path) -> None:
+def test_cli_rejects_mock_runtime_selection(tmp_path: Path) -> None:
+    result = _RUNNER.invoke(
+        app,
+        ["run", "Prove P.", "--runtime", "mock", "--data-root", str(tmp_path)],
+    )
+
+    assert result.exit_code == 2
+
+
+def test_run_completes_with_an_explicit_test_service_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "_build_runtime_service",
+        lambda settings, mode: build_mock_service(settings),
+    )
     result = _RUNNER.invoke(
         app,
         [
@@ -124,8 +141,6 @@ def test_mock_run_completes_and_exports_a_reproducible_bundle(tmp_path: Path) ->
             "Prove P.",
             "--run-id",
             "run-mock-e2e",
-            "--runtime",
-            "mock",
             "--data-root",
             str(tmp_path),
         ],
@@ -138,12 +153,14 @@ def test_mock_run_completes_and_exports_a_reproducible_bundle(tmp_path: Path) ->
         "manifest.json",
         "proof.md",
         "report.md",
+        "event-chain.json",
+        "audit.json",
     }
     manifest_path = next(path for path in exported if path.name == "manifest.json")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["runtime_version"] == "mock-runtime/1"
+    assert manifest["runtime_version"] == "fixture-runtime/1"
     assert {item["runtime_version"] for item in manifest["execution_segments"]} == {
-        "mock-runtime/1"
+        "fixture-runtime/1"
     }
     assert {item["backend"] for item in manifest["turns"]} == {"mock"}
 
@@ -156,7 +173,7 @@ def test_codex_run_scopes_runtime_state_to_managed_data_root(
 
     def runtime_factory(codex_home: Path) -> object:
         codex_homes.append(codex_home)
-        runtime = _default_mock_runtime()
+        runtime = default_mock_runtime()
         runtime.runtime_version = "test-codex/1"
         return runtime
 
@@ -178,7 +195,15 @@ def test_codex_run_scopes_runtime_state_to_managed_data_root(
     assert codex_homes == [tmp_path / "codex-home"]
 
 
-def test_cancel_and_resume_commands_share_durable_service_state(tmp_path: Path) -> None:
+def test_cancel_and_resume_commands_share_durable_service_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "_build_runtime_service",
+        lambda settings, mode: build_mock_service(settings),
+    )
     service = build_mock_service(ServiceSettings(data_root=tmp_path))
     service.create_run(RunInput(problem="Prove P."), QEDConfig(), run_id="run-cli")
     asyncio.run(service.close())
@@ -188,15 +213,13 @@ def test_cancel_and_resume_commands_share_durable_service_state(tmp_path: Path) 
         [
             "cancel",
             "run-cli",
-            "--runtime",
-            "mock",
             "--data-root",
             str(tmp_path),
         ],
     )
     resumed = _RUNNER.invoke(
         app,
-        ["resume", "run-cli", "--runtime", "mock", "--data-root", str(tmp_path)],
+        ["resume", "run-cli", "--data-root", str(tmp_path)],
     )
 
     assert cancelled.exit_code == 0, cancelled.output
@@ -262,6 +285,18 @@ def test_doctor_reconcile_and_abandon_are_explicit_and_idempotent(
     assert json.loads(replay.stdout)["replayed"] is True
 
 
+def test_environment_doctor_fails_closed_on_unknown_checks(tmp_path: Path) -> None:
+    result = _RUNNER.invoke(
+        app,
+        ["doctor", "--json", "--data-root", str(tmp_path / "uninitialized")],
+    )
+
+    assert result.exit_code == 1, result.output
+    report = json.loads(result.stdout)
+    assert report["checks"]
+    assert any(check["status"] == "unknown" for check in report["checks"])
+
+
 def test_serve_rejects_non_loopback_bind_without_bearer_token(tmp_path: Path) -> None:
     result = _RUNNER.invoke(
         app,
@@ -269,8 +304,6 @@ def test_serve_rejects_non_loopback_bind_without_bearer_token(tmp_path: Path) ->
             "serve",
             "--host",
             str(ip_address(0)),
-            "--runtime",
-            "mock",
             "--data-root",
             str(tmp_path),
         ],

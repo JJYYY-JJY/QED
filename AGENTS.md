@@ -54,12 +54,11 @@ npm ci
 npm run lint
 npm run typecheck
 npm run test
-npm run test:impeccable
 npm run build
 npm run test:e2e
 ```
 
 Real Codex smoke tests are opt-in and must never run in the default test suite.
-Frontend changes also run the checked-in Impeccable detector and Playwright
+Frontend changes run the checked-in unit, accessibility, contract, and Playwright
 tests. Update architecture, configuration, migration, and threat-model documents
 when their contracts change.

@@ -17,9 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from qed.config import QEDConfig
 from qed.decision import (
+    STABLE_REQUIRED_REPORT_KINDS,
     CandidateDecision,
     candidate_decision_sha256,
-    decide_candidate,
+    decide_stable_candidate,
 )
 from qed.inputs import RunInput
 from qed.schemas import (
@@ -38,6 +39,11 @@ from qed.schemas import (
     evidence_sha256,
     sha256_text,
     verification_report_sha256,
+)
+from qed.stable_contracts import (
+    ProofObligationGraph,
+    RuntimeProvenance,
+    VerifierRole,
 )
 from qed.state_machine import (
     RUN_TRANSITIONS,
@@ -380,13 +386,18 @@ class RunStore:
             check_same_thread=False,
         )
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA busy_timeout = 5000")
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        journal_mode = self._connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-        if str(journal_mode).lower() != "wal":
+        try:
+            self._connection.execute("PRAGMA busy_timeout = 5000")
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            journal_mode = self._connection.execute(
+                "PRAGMA journal_mode = WAL"
+            ).fetchone()[0]
+            if str(journal_mode).lower() != "wal":
+                raise StoreError("SQLite WAL mode is required")
+            self._initialize_schema()
+        except BaseException:
             self._connection.close()
-            raise StoreError("SQLite WAL mode is required")
-        self._initialize_schema()
+            raise
 
     def __enter__(self) -> Self:
         return self
@@ -442,6 +453,17 @@ class RunStore:
             CREATE TABLE IF NOT EXISTS schema_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS runtime_provenance (
+                run_id TEXT PRIMARY KEY,
+                provenance_json TEXT NOT NULL,
+                provenance_sha256 TEXT NOT NULL CHECK (
+                    length(provenance_sha256) = 64
+                    AND provenance_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
             ) STRICT;
 
             CREATE TABLE IF NOT EXISTS runs (
@@ -1174,6 +1196,12 @@ class RunStore:
         """Bind a full, content-addressed runtime resolution before model work."""
 
         _validate_nonempty(runtime_version, field="runtime_version")
+        try:
+            provenance = RuntimeProvenance.model_validate(resolution)
+        except ValueError as error:
+            raise StoreIntegrityError(f"runtime provenance schema failure: {error}") from error
+        if provenance.codex_runtime_version != runtime_version:
+            raise ConflictError("observed runtime version does not match provenance")
         rendered = canonical_json(resolution)
         resolution_sha256 = canonical_sha256(resolution)
         now = self._now()
@@ -1189,6 +1217,10 @@ class RunStore:
             existing = connection.execute(
                 "SELECT * FROM runtime_resolutions WHERE segment_id = ?",
                 (segment["id"],),
+            ).fetchone()
+            run_provenance = connection.execute(
+                "SELECT * FROM runtime_provenance WHERE run_id = ?",
+                (segment["run_id"],),
             ).fetchone()
             if existing is not None:
                 if (
@@ -1211,6 +1243,20 @@ class RunStore:
                     segment["id"],
                 ),
             )
+            if run_provenance is None:
+                connection.execute(
+                    """
+                    INSERT INTO runtime_provenance (
+                        run_id, provenance_json, provenance_sha256, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        segment["run_id"],
+                        rendered,
+                        canonical_sha256(provenance),
+                        _render_time(now),
+                    ),
+                )
             connection.execute(
                 """
                 INSERT INTO runtime_resolutions (
@@ -2500,11 +2546,41 @@ class RunStore:
             required_rule_ids = tuple(
                 rule.id for rule in run_input.frozen_verification_rules
             )
-            decision = decide_candidate(
+            graph_rows = connection.execute(
+                "SELECT content_json FROM stage_outputs WHERE run_id = ? AND kind = ?",
+                (run_id, f"claim_graph:{candidate_id}"),
+            ).fetchall()
+            if len(graph_rows) != 1:
+                raise ConflictError("decision requires exactly one immutable claim graph")
+            try:
+                graph = ProofObligationGraph.model_validate_json(graph_rows[0]["content_json"])
+                graph.validate_against_proof(
+                    candidate.proof,
+                    evidence_ids=frozenset(item.id for item in evidence),
+                    rule_ids=frozenset(required_rule_ids),
+                )
+            except ValueError as error:
+                raise ConflictError(f"claim graph is invalid: {error}") from error
+            required_roles = {
+                VerifierRole.STRUCTURAL,
+                VerifierRole.DETAILED_STEP,
+                VerifierRole.ASSUMPTIONS_QUANTIFIERS,
+                VerifierRole.COUNTEREXAMPLE_EDGE_CASE,
+                VerifierRole.RECONSTRUCTION,
+            }
+            if evidence:
+                required_roles.add(VerifierRole.CITATION)
+            covered_roles = {
+                coverage.role
+                for node in graph.nodes
+                for coverage in node.coverage
+            }
+            if not required_roles.issubset(covered_roles):
+                raise ConflictError("claim graph does not cover every required verifier role")
+            decision = decide_stable_candidate(
                 candidate,
                 reports,
                 prover_external_thread_id=prover_external_thread_id,
-                require_citation=citation_required,
                 required_evidence=evidence,
                 required_rule_ids=required_rule_ids,
             )
@@ -3671,15 +3747,8 @@ class RunStore:
 
         now = self._now()
         with self._transaction() as connection:
+            self._authorize_runtime_lifecycle(connection, run_id, execution)
             run = self._require_run_row(connection, run_id)
-            segment = self._require_execution_row(connection, execution.segment_id)
-            self._validate_execution_identity(segment, execution)
-            if (
-                segment["run_id"] != run_id
-                or int(run["execution_version"]) != execution.version
-                or segment["released_at"] is not None
-            ):
-                raise ConflictError("stale execution token")
             return self._append_event(
                 connection,
                 run_id,
@@ -3700,15 +3769,8 @@ class RunStore:
 
         now = self._now()
         with self._transaction() as connection:
+            self._authorize_runtime_lifecycle(connection, run_id, execution)
             run = self._require_run_row(connection, run_id)
-            segment = self._require_execution_row(connection, execution.segment_id)
-            self._validate_execution_identity(segment, execution)
-            if (
-                segment["run_id"] != run_id
-                or int(run["execution_version"]) != execution.version
-                or segment["released_at"] is not None
-            ):
-                raise ConflictError("stale execution token")
             return self._append_event(
                 connection,
                 run_id,
@@ -3729,15 +3791,16 @@ class RunStore:
 
         now = self._now()
         with self._transaction() as connection:
+            try:
+                self._authorize_runtime_lifecycle(connection, run_id, execution)
+            except ConflictError:
+                self._authorize_abandoned_late_terminal(
+                    connection,
+                    run_id,
+                    payload,
+                    execution,
+                )
             run = self._require_run_row(connection, run_id)
-            segment = self._require_execution_row(connection, execution.segment_id)
-            self._validate_execution_identity(segment, execution)
-            if (
-                segment["run_id"] != run_id
-                or int(run["execution_version"]) != execution.version
-                or segment["released_at"] is not None
-            ):
-                raise ConflictError("stale execution token")
             return self._append_event(
                 connection,
                 run_id,
@@ -3746,6 +3809,47 @@ class RunStore:
                 payload=payload,
                 created_at=now,
             )
+
+    def _authorize_abandoned_late_terminal(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        payload: dict[str, JsonValue],
+        execution: ExecutionToken,
+    ) -> None:
+        """Allow one authentic terminal observation after operator abandonment.
+
+        The old segment may append audit evidence after its lease expires, but it
+        cannot change durable lifecycle state, release a lease, or write any
+        other event. This preserves reconciliation evidence without reopening a
+        failed run.
+        """
+
+        run = self._require_run_row(connection, run_id)
+        row = self._require_execution_row(connection, execution.segment_id)
+        self._validate_execution_identity(row, execution)
+        if (
+            row["run_id"] != run_id
+            or int(run["execution_version"]) != execution.version
+            or row["released_at"] is not None
+            or RunStatus(run["status"]) is not RunStatus.FAILED
+        ):
+            raise ConflictError("stale execution token")
+        abandoned = connection.execute(
+            "SELECT 1 FROM events WHERE run_id = ? "
+            "AND event_type = 'operator.run_abandoned' LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if abandoned is None:
+            raise ConflictError("stale execution token")
+        thread_id = payload.get("thread_id")
+        turn_id = payload.get("turn_id")
+        backend = payload.get("backend")
+        if not all(isinstance(item, str) and item for item in (thread_id, turn_id, backend)):
+            raise ConflictError("late terminal identity is incomplete")
+        pending = self._unconfirmed_runtime_turns(connection, run_id)
+        if ("turn", backend, thread_id, turn_id) not in pending:
+            raise ConflictError("late terminal is not bound to an unconfirmed turn")
 
     def list_events(self, run_id: str, *, after_seq: int = 0) -> tuple[Event, ...]:
         with self._lock:
@@ -4000,6 +4104,7 @@ class RunStore:
             row["run_id"] != run_id
             or int(run["execution_version"]) != execution.version
             or row["released_at"] is not None
+            or _parse_time(row["lease_expires_at"]) <= self._now()
         ):
             raise ConflictError("stale execution token")
         return row
@@ -4341,8 +4446,8 @@ class RunStore:
                 after_seq=entry_seq,
             ):
                 raise InvalidTransitionError(
-                    "adjudication requires structural, detailed, and ledger-required "
-                    "citation reports from independent threads"
+                    "adjudication requires all stable verifier reports from independent "
+                    "threads"
                 )
             return
 
@@ -4475,11 +4580,9 @@ class RunStore:
         citation_required = connection.execute(
             "SELECT 1 FROM evidence WHERE run_id = ? LIMIT 1", (run_id,)
         ).fetchone() is not None
-        required_kinds = (
-            {"structural", "detailed", "citation"}
-            if citation_required
-            else {"structural", "detailed"}
-        )
+        required_kinds = set(STABLE_REQUIRED_REPORT_KINDS)
+        if citation_required:
+            required_kinds.add("citation")
         for candidate_id in candidate_ids:
             candidate_row = self._require_candidate_row(connection, candidate_id)
             if candidate_row["run_id"] != run_id or candidate_row["sealed_at"] is None:

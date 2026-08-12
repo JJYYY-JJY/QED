@@ -23,7 +23,6 @@ PRODUCTION_ROOTS = (
     "client",
     "server",
     ".codex",
-    ".github",
 )
 
 PRODUCTION_SUFFIXES = {

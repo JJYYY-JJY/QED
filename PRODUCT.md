@@ -21,6 +21,17 @@ independent verification reports, and reproducible proof, report, and manifest
 exports. Success means a researcher can audit the evidence chain and the
 code-computed decision without trusting a model's claim of completion.
 
+## State language
+
+The console distinguishes Running, Paused, Failed, Uncertain, Export intent,
+and Complete. A candidate decision is labeled **QED policy PASS** when the
+application recomputes all required gates; that label never means formally
+verified, mathematically guaranteed, proven true, or peer-reviewed.
+
+Fresh verifier threads isolate conversation state, not model weights. Exports
+also distinguish the `running/export` publication intent from the later
+SQLite-observed `complete/completed` terminal state.
+
 ## Positioning
 
 QED turns a mathematical problem into a content-addressed, reproducible research
@@ -44,4 +55,7 @@ marketing website or a general-purpose chat interface.
 
 ## Accessibility & Inclusion
 
-No project-specific accessibility requirement was specified.
+Research state is conveyed by text and semantic structure, not color alone.
+Interactive controls retain keyboard focus, modal drawers expose labels and
+focus boundaries, reduced-motion preferences are respected, and the release
+gate includes unit, accessibility, and real-browser checks.

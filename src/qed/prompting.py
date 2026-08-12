@@ -14,6 +14,9 @@ TurnRole = Literal[
     "proof",
     "structural_verifier",
     "detailed_verifier",
+    "assumptions_quantifiers_verifier",
+    "counterexample_edge_case_verifier",
+    "reconstruction_verifier",
     "citation_verifier",
     "adjudication",
 ]
@@ -34,6 +37,18 @@ ROLE_POLICY: dict[TurnRole, str] = {
         "Independently check each inference, hypothesis, quantifier, estimate, and edge case. "
         "For every frozen verification rule you actually test, attach its application-assigned "
         "rule ID to the corresponding structured check."
+    ),
+    "assumptions_quantifiers_verifier": (
+        "Actively check every assumption, domain, and quantifier order. Reject hidden "
+        "assumption changes and vacuous or reversed quantifiers."
+    ),
+    "counterexample_edge_case_verifier": (
+        "Try to falsify the candidate with counterexamples, boundary cases, degeneracies, "
+        "and invalid induction bases or limiting operations."
+    ),
+    "reconstruction_verifier": (
+        "Reconstruct the argument from the frozen claim obligations and definitions alone. "
+        "Do not rely on another verifier's verdict or the candidate author's intent."
     ),
     "citation_verifier": (
         "Independently check that cited sources support the exact claims attributed to them. "

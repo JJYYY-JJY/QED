@@ -1,4 +1,7 @@
-# Impeccable phase record
+# Impeccable phase record — historical / non-runtime
+
+> Archived alpha development record. Impeccable, its hook, detector, assets,
+> and npm dependency are not part of QED v2 stable runtime or release gates.
 
 Review date: 2026-07-16
 
@@ -9,7 +12,7 @@ dense evidence, explicit provenance, and stable reading layouts. It does not use
 marketing-page or general-chat patterns. The project asks for sound semantic and
 keyboard defaults but sets no separate accessibility certification target.
 
-Each named phase is a reference workflow in the repo-local Impeccable bundle.
+Each named phase was a reference workflow in the former repo-local Impeccable bundle.
 This record applies all eight workflows to the same target and records their
 durable evidence.
 

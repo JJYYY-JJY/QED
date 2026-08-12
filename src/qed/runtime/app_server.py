@@ -6,6 +6,8 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from qed.schemas import canonical_sha256
+
 from .isolation import server_config
 from .models import (
     CapabilityRequest,
@@ -61,8 +63,6 @@ class _EffortOption(_WireModel):
 
 
 class _CatalogModel(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     model: str = Field(min_length=1)
     supported_reasoning_efforts: tuple[_EffortOption, ...] = Field(
         alias="supportedReasoningEfforts", min_length=1
@@ -76,8 +76,6 @@ class _ModelPage(_WireModel):
 
 
 class _Feature(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     name: str = Field(min_length=1)
     enabled: bool
     default_enabled: bool = Field(alias="defaultEnabled")
@@ -90,49 +88,36 @@ class _FeaturePage(_WireModel):
 
 
 class _Identifier(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     id: str = Field(min_length=1)
 
 
 class _ThreadResponse(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     thread: _Identifier
 
 
 class _TurnResponse(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     turn: _Identifier
 
 
 class _UsageBreakdown(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     input_tokens: int = Field(alias="inputTokens", ge=0)
     output_tokens: int = Field(alias="outputTokens", ge=0)
     cached_input_tokens: int = Field(default=0, alias="cachedInputTokens", ge=0)
     reasoning_output_tokens: int = Field(default=0, alias="reasoningOutputTokens", ge=0)
+    total_tokens: int | None = Field(default=None, alias="totalTokens", ge=0)
 
 
 class _TokenUsage(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     last: _UsageBreakdown
 
 
 class _UsageParams(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     thread_id: str = Field(alias="threadId", min_length=1)
     turn_id: str = Field(alias="turnId", min_length=1)
     token_usage: _TokenUsage = Field(alias="tokenUsage")
 
 
 class _ItemParams(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     thread_id: str = Field(alias="threadId", min_length=1)
     turn_id: str = Field(alias="turnId", min_length=1)
     item: dict[str, Any]
@@ -144,21 +129,15 @@ class _ItemParams(_WireModel):
 
 
 class _TurnParams(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     thread_id: str = Field(alias="threadId", min_length=1)
     turn: dict[str, Any]
 
 
 class _ErrorDetail(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     message: str = Field(min_length=1)
 
 
 class _ErrorParams(_WireModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
     thread_id: str = Field(alias="threadId", min_length=1)
     turn_id: str = Field(alias="turnId", min_length=1)
     error: _ErrorDetail
@@ -188,7 +167,22 @@ class AppServerRuntime:
             default_effort=selected.default_reasoning_effort,
         )
         multi_agent = any(feature.name == "multi_agent" and feature.enabled for feature in features)
-        return resolve_capability(request, model=model, multi_agent=multi_agent)
+        resolved = resolve_capability(request, model=model, multi_agent=multi_agent)
+        return resolved.model_copy(
+            update={
+                "model_version": selected.model,
+                "backend": RuntimeBackend.APP_SERVER,
+                "model_catalog_sha256": canonical_sha256(
+                    [entry.model_dump(mode="json") for entry in models]
+                ),
+                "capability_response_sha256": canonical_sha256(
+                    {
+                        "models": [entry.model_dump(mode="json") for entry in models],
+                        "features": [entry.model_dump(mode="json") for entry in features],
+                    }
+                ),
+            }
+        )
 
     async def _model_catalog(self) -> list[_CatalogModel]:
         return await self._page("model/list", _ModelPage)
@@ -321,6 +315,8 @@ class AppServerRuntime:
                         output=final_output if final_output is not None else fallback_output,
                     )
                     return
+                if method.startswith(("thread/", "turn/", "item/")):
+                    raise RuntimeProtocolError(f"unknown critical App Server event: {method}")
                 yield UnknownNotification(method=method, payload=params)
 
             raise RuntimeProtocolError(

@@ -20,7 +20,7 @@ from uuid import uuid4
 from pydantic import BaseModel, JsonValue, ValidationError
 
 from qed.config import QEDConfig
-from qed.decision import CandidateDecision, decide_candidate
+from qed.decision import CandidateDecision, decide_stable_candidate
 from qed.export import build_export_bundle, write_export_bundle
 from qed.inputs import RunInput
 from qed.logging import get_logger
@@ -37,7 +37,13 @@ from qed.model_outputs import (
     materialize_plan,
     materialize_report,
 )
-from qed.prompting import FrozenTurnInput, TurnRole, freeze_turn_input, render_turn_prompt
+from qed.prompting import (
+    ROLE_POLICY,
+    FrozenTurnInput,
+    TurnRole,
+    freeze_turn_input,
+    render_turn_prompt,
+)
 from qed.runtime import (
     CapabilityRequest,
     CodexRuntime,
@@ -65,6 +71,16 @@ from qed.schemas import (
     VerificationReport,
     canonical_json,
     canonical_sha256,
+    sha256_text,
+)
+from qed.security.paths import PathSecurityError, ensure_private_directory, require_descendant
+from qed.stable_contracts import (
+    ClaimCoverage,
+    ClaimType,
+    ProofObligation,
+    ProofObligationGraph,
+    RuntimeProvenance,
+    VerifierRole,
 )
 from qed.store import (
     ArtifactRecord,
@@ -93,6 +109,9 @@ PROMPT_VERSIONS: dict[TurnRole, str] = {
     "proof": "qed-proof-v1",
     "structural_verifier": "qed-structural-verifier-v1",
     "detailed_verifier": "qed-detailed-verifier-v1",
+    "assumptions_quantifiers_verifier": "qed-assumptions-quantifiers-verifier-v1",
+    "counterexample_edge_case_verifier": "qed-counterexample-edge-case-verifier-v1",
+    "reconstruction_verifier": "qed-reconstruction-verifier-v1",
     "citation_verifier": "qed-citation-verifier-v1",
     "adjudication": "qed-adjudication-v1",
 }
@@ -276,14 +295,66 @@ class ResearchWorkflow:
                 JsonValue,
                 capabilities.model_dump(mode="json"),
             )
-            observed_capabilities_json = cast(
-                JsonValue,
-                capability_resolution.observed.model_dump(mode="json"),
+            prompt_binding = canonical_sha256(cast(JsonValue, PROMPT_VERSIONS))
+            schema_binding = canonical_sha256(
+                cast(
+                    JsonValue,
+                    {
+                    "roles": ROLE_POLICY,
+                    "evidence": EvidenceBatch.model_json_schema(),
+                    "plan": PlanDraft.model_json_schema(),
+                    "proof": ProofDraft.model_json_schema(),
+                    "verification": VerificationDraft.model_json_schema(),
+                    "adjudication": AdjudicationDraft.model_json_schema(),
+                    },
+                )
             )
+            try:
+                resolver = getattr(self._runtime, "runtime_resolution", None)
+                if callable(resolver):
+                    runtime_resolution = resolver(
+                        capability_resolution.observed,
+                        requested_effort=run.config.effort,
+                        config_sha256=run.config.sha256,
+                        prompt_sha256=prompt_binding,
+                        schema_sha256=schema_binding,
+                        requested_backend=runtime_preference(run.config.backend),
+                    )
+                else:
+                    fixture_hash = canonical_sha256(
+                        {"runtime_version": self._runtime_version, "model": run.config.model}
+                    )
+                    runtime_resolution = {
+                        "schema_version": 1,
+                        "model_provider": "OpenAI",
+                        "model": capability_resolution.observed.model,
+                        "model_version": "fixture-model-version",
+                        "backend": "fixture",
+                        "codex_runtime_version": self._runtime_version,
+                        "codex_cli_version": "fixture-cli/1",
+                        "sdk_version": "fixture-sdk/1",
+                        "app_server_version": "fixture-app-server/1",
+                        "requested_effort": run.config.effort,
+                        "selected_effort": capability_resolution.observed.selected_effort,
+                        "model_catalog_sha256": fixture_hash,
+                        "config_sha256": run.config.sha256,
+                        "prompt_sha256": prompt_binding,
+                        "schema_sha256": schema_binding,
+                        "executable_sha256": fixture_hash,
+                        "capability_response_sha256": fixture_hash,
+                        "protocol_version": "qed-fixture-protocol-v1",
+                    }
+                if runtime_resolution.get("backend") == "fixture":
+                    runtime_resolution["codex_runtime_version"] = self._runtime_version
+                RuntimeProvenance.model_validate(runtime_resolution)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise WorkflowExecutionError(
+                    f"runtime provenance is incomplete or invalid: {error}"
+                ) from error
             self._store.record_execution_resolution(
                 execution,
                 runtime_version=self._runtime_version,
-                resolution=observed_capabilities_json,
+                resolution=cast(JsonValue, runtime_resolution),
             )
             self._put_output(
                 run.id,
@@ -549,11 +620,10 @@ class ResearchWorkflow:
                 )
 
             advisory_decisions = {
-                candidate.id: decide_candidate(
+                candidate.id: decide_stable_candidate(
                     candidate,
                     reports_by_candidate[candidate.id],
                     prover_external_thread_id=prover_external_ids[candidate.id],
-                    require_citation=require_citation,
                     required_evidence=evidence,
                     required_rule_ids=required_rule_ids,
                 )
@@ -1016,7 +1086,17 @@ class ResearchWorkflow:
                     run_id,
                     prompt_role=prompt_role,
                     thread_role=ThreadRole.VERIFIER,
-                    work_role=(WorkRole.CITATION if kind == "citation" else WorkRole.VERIFIER),
+                    work_role=(
+                        WorkRole.CITATION
+                        if kind == "citation"
+                        else WorkRole.ASSUMPTIONS_QUANTIFIERS
+                        if kind == "assumptions_quantifiers"
+                        else WorkRole.COUNTEREXAMPLE_EDGE_CASE
+                        if kind == "counterexample_edge_case"
+                        else WorkRole.RECONSTRUCTION
+                        if kind == "reconstruction"
+                        else WorkRole.VERIFIER
+                    ),
                     schema=VerificationDraft,
                     payload={
                         "problem": run_input.problem,
@@ -1046,6 +1126,9 @@ class ResearchWorkflow:
             required: list[tuple[VerificationKind, TurnRole]] = [
                 ("structural", "structural_verifier"),
                 ("detailed", "detailed_verifier"),
+                ("assumptions_quantifiers", "assumptions_quantifiers_verifier"),
+                ("counterexample_edge_case", "counterexample_edge_case_verifier"),
+                ("reconstruction", "reconstruction_verifier"),
             ]
             if evidence:
                 required.append(("citation", "citation_verifier"))
@@ -1061,12 +1144,111 @@ class ResearchWorkflow:
         for report in reports:
             if (report.candidate_id, report.kind) not in stored:
                 self._store.add_verification(run_id, report, execution=self._execution(run_id))
+        for candidate in candidates:
+            candidate_reports = tuple(
+                report for report in reports if report.candidate_id == candidate.id
+            )
+            self._persist_claim_graph(
+                run_id,
+                run_input,
+                candidate,
+                candidate_reports,
+            )
         grouped: dict[str, list[VerificationReport]] = {
             candidate.id: [] for candidate in candidates
         }
         for report in reports:
             grouped[report.candidate_id].append(report)
         return {candidate_id: tuple(items) for candidate_id, items in grouped.items()}
+
+    def _persist_claim_graph(
+        self,
+        run_id: str,
+        run_input: RunInput,
+        candidate: ProofCandidate,
+        reports: tuple[VerificationReport, ...],
+    ) -> None:
+        """Materialize a byte-bound graph; model output never controls graph identity."""
+
+        role_by_kind = {
+            "structural": VerifierRole.STRUCTURAL,
+            "detailed": VerifierRole.DETAILED_STEP,
+            "assumptions_quantifiers": VerifierRole.ASSUMPTIONS_QUANTIFIERS,
+            "counterexample_edge_case": VerifierRole.COUNTEREXAMPLE_EDGE_CASE,
+            "reconstruction": VerifierRole.RECONSTRUCTION,
+            "citation": VerifierRole.CITATION,
+        }
+        coverage = tuple(
+            ClaimCoverage(
+                role=role_by_kind[report.kind],
+                status=report.verdict.value,
+                report_id=report.id,
+                check_id=report.checks[0].id,
+            )
+            for report in reports
+            if report.kind in role_by_kind
+        )
+        nodes: list[ProofObligation] = []
+        nonempty_lines = [
+            (offset, line)
+            for offset, line in self._proof_lines_with_offsets(candidate.proof)
+            if line.strip()
+        ]
+        for index, (byte_start, line) in enumerate(nonempty_lines):
+            nodes.append(
+                ProofObligation(
+                    claim_id=f"claim-{candidate.id}-step-{index + 1}",
+                    byte_start=byte_start,
+                    byte_end=byte_start + len(line.encode("utf-8")),
+                    span_sha256=sha256_text(line),
+                    claim_text=line,
+                    claim_type=(
+                        ClaimType.CONCLUSION
+                        if index == len(nonempty_lines) - 1
+                        else ClaimType.STEP
+                    ),
+                    dependencies=(
+                        (f"claim-{candidate.id}-step-{index}",) if index else ()
+                    ),
+                    evidence_ids=candidate.evidence_ids,
+                    rule_ids=tuple(rule.id for rule in run_input.frozen_verification_rules),
+                    coverage=coverage,
+                )
+            )
+        if not nodes:
+            raise WorkflowExecutionError("candidate proof did not contain a proof obligation")
+        graph = ProofObligationGraph.from_proof(
+            candidate_sha256=canonical_sha256(candidate),
+            proof=candidate.proof,
+            nodes=tuple(nodes),
+        )
+        run = self._store.get_run(run_id)
+        self._put_output(
+            run_id,
+            RunStage.VERIFICATION,
+            f"claim_graph:{candidate.id}",
+            cast(JsonValue, graph.model_dump(mode="json")),
+            self._application_provenance(
+                run.config,
+                source_id=candidate.id,
+                prompt_version="qed-claim-graph-v1",
+            ),
+        )
+
+    @staticmethod
+    def _proof_lines_with_offsets(proof: str) -> tuple[tuple[int, str], ...]:
+        """Return deterministic UTF-8 byte spans for non-empty proof lines."""
+
+        lines: list[tuple[int, str]] = []
+        offset = 0
+        for raw_line in proof.splitlines(keepends=True):
+            line = raw_line.rstrip("\r\n")
+            if line:
+                lines.append((offset, line))
+            offset += len(raw_line.encode("utf-8"))
+        if not lines and proof:
+            lines.append((0, proof))
+        return tuple(lines)
 
     async def _adjudication(
         self,
@@ -1086,7 +1268,7 @@ class ResearchWorkflow:
             run_id,
             prompt_role="adjudication",
             thread_role=ThreadRole.ADJUDICATOR,
-            work_role=WorkRole.GENERAL,
+            work_role=WorkRole.ADJUDICATOR,
             schema=AdjudicationDraft,
             payload={
                 "problem": run_input.problem,
@@ -1337,6 +1519,7 @@ class ResearchWorkflow:
         can_search = (
             run.config.search.enabled
             and work_role.value in run.config.search.allowed_roles
+            and work_role is WorkRole.LITERATURE
         )
         return RunRequest(
             model=run.config.model,
@@ -1353,10 +1536,10 @@ class ResearchWorkflow:
 
     def _new_turn_workspace(self) -> _TurnWorkspace:
         root = self._workspace_root
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if root.is_symlink() or not root.is_dir():
-            raise WorkflowExecutionError("runtime workspace root is not a directory")
-        os.chmod(root, 0o700)
+        try:
+            ensure_private_directory(root, create=True)
+        except PathSecurityError as error:
+            raise WorkflowExecutionError(str(error)) from error
         executable = shutil.which("git")
         if executable is None:
             raise WorkflowExecutionError("git is required for isolated runtime workspaces")
@@ -1366,6 +1549,10 @@ class ResearchWorkflow:
         try:
             directory = tempfile.TemporaryDirectory(prefix=".turn-", dir=root)
             cwd = Path(directory.name).resolve(strict=True)
+            try:
+                require_descendant(root, cwd)
+            except PathSecurityError as error:
+                raise WorkflowExecutionError(str(error)) from error
             subprocess.run(  # noqa: S603 - resolved executable and fixed argv
                 (
                     str(git),

@@ -1,5 +1,8 @@
 # QED pre-rewrite repository audit
 
+> Historical / non-runtime research record. Commands and recommendations in
+> this note are not current stable release gates.
+
 Audit date: 2026-07-16 (America/Los_Angeles)
 Audited revision: `7dccd9be9f900aeae31ab0a0473ce7bd3e4ec35d`
 Scope: the complete tracked tree at that revision plus the current untracked/ignored Impeccable setup. This is a read-only assessment of the legacy implementation; this note is the only file created by the audit.

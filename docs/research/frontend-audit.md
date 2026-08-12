@@ -1,5 +1,8 @@
 # Frontend audit and research-console design requirements
 
+> Historical / non-runtime research record. The alpha-only visual tooling
+> mentioned below is not a dependency or current release gate.
+
 Status: audit complete; implementation not started
 Audit date: 2026-07-16
 Branch observed: `codex-native-rewrite`

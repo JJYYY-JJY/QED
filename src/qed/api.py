@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import secrets
 from collections.abc import AsyncIterator
@@ -61,6 +62,10 @@ CommandKey = Annotated[
 ]
 _SSE_EVENT_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 _MAX_REQUEST_BODY_BYTES = 1024 * 1024
+_MAX_SSE_CONNECTIONS = 32
+_MAX_SSE_CONNECTIONS_PER_CLIENT = 4
+_MAX_SSE_REPLAY_EVENTS = 1000
+_MAX_SSE_LIFETIME_SECONDS = 2 * 60 * 60
 _LOGGER = get_logger(__name__)
 
 
@@ -326,6 +331,9 @@ def create_app(
     )
     app.state.application_service = selected_service
     app.state.service_settings = settings
+    sse_lock = asyncio.Lock()
+    sse_clients: dict[str, int] = {}
+    sse_total = 0
     app.add_middleware(
         _RequestBodyLimitMiddleware,
         max_body_bytes=_MAX_REQUEST_BODY_BYTES,
@@ -531,7 +539,7 @@ def create_app(
     ) -> CommandReceipt:
         return await service.resume_run(run_id, idempotency_key=command.idempotency_key)
 
-    @app.get("/api/v1/runs/{run_id}/events")
+    @app.get("/api/v1/runs/{run_id}/events", response_model=None)
     async def events(
         request: Request,
         run_id: RunId,
@@ -540,20 +548,52 @@ def create_app(
             int | None,
             Header(alias="Last-Event-ID", ge=0),
         ] = None,
-    ) -> StreamingResponse:
+    ) -> StreamingResponse | JSONResponse:
+        nonlocal sse_total
         service.get_run(run_id)
+        client_id = request.client.host if request.client is not None else "unknown"
+        async with sse_lock:
+            if (
+                sse_total >= _MAX_SSE_CONNECTIONS
+                or sse_clients.get(client_id, 0) >= _MAX_SSE_CONNECTIONS_PER_CLIENT
+            ):
+                return _error_response(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    code="sse_quota_exceeded",
+                    message="The event stream quota is temporarily exhausted.",
+                )
+            sse_total += 1
+            sse_clients[client_id] = sse_clients.get(client_id, 0) + 1
 
         async def body() -> AsyncIterator[str]:
-            async for item in service.stream_events(
-                run_id,
-                after_seq=last_event_id or 0,
-            ):
-                if await request.is_disconnected():
-                    return
-                if isinstance(item, StreamHeartbeat):
-                    yield ": heartbeat\n\n"
-                else:
-                    yield _render_sse_event(item)
+            nonlocal sse_total
+            delivered = 0
+            try:
+                async with asyncio.timeout(_MAX_SSE_LIFETIME_SECONDS):
+                    async for item in service.stream_events(
+                        run_id,
+                        after_seq=last_event_id or 0,
+                    ):
+                        if await request.is_disconnected():
+                            return
+                        if isinstance(item, StreamHeartbeat):
+                            yield ": heartbeat\n\n"
+                        else:
+                            delivered += 1
+                            if delivered > _MAX_SSE_REPLAY_EVENTS:
+                                yield "event: qed.stream_limit\ndata: {\"schema_version\":1}\n\n"
+                                return
+                            yield _render_sse_event(item)
+            except TimeoutError:
+                yield "event: qed.stream_timeout\ndata: {\"schema_version\":1}\n\n"
+            finally:
+                async with sse_lock:
+                    sse_total -= 1
+                    remaining = sse_clients.get(client_id, 1) - 1
+                    if remaining:
+                        sse_clients[client_id] = remaining
+                    else:
+                        sse_clients.pop(client_id, None)
 
         return StreamingResponse(
             body(),
@@ -561,6 +601,7 @@ def create_app(
             headers={
                 "Cache-Control": "no-cache, no-transform",
                 "X-Accel-Buffering": "no",
+                "X-QED-SSE-Schema-Version": "1",
             },
         )
 

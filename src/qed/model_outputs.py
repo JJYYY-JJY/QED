@@ -27,7 +27,15 @@ from qed.schemas import (
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 EvidenceKind = Literal["paper", "theorem", "computation", "human_guidance", "source", "note"]
-VerificationKind = Literal["structural", "detailed", "citation", "mutation"]
+VerificationKind = Literal[
+    "structural",
+    "detailed",
+    "assumptions_quantifiers",
+    "counterexample_edge_case",
+    "reconstruction",
+    "citation",
+    "mutation",
+]
 
 
 class ModelDraft(BaseModel):

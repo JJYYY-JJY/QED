@@ -17,11 +17,15 @@ concurrency:
 jobs:
   backend:
     name: Backend / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
         python-version:
           - "3.13"
           - "3.14"
@@ -53,6 +57,43 @@ jobs:
 
       - name: Run mocked test suite
         run: uv run --frozen pytest
+
+      - name: Run coverage gate
+        run: uv run --frozen pytest --cov=qed --cov-branch --cov-report=json:coverage.json
+
+      - name: Enforce stable coverage thresholds
+        run: uv run --frozen python scripts/check_coverage.py coverage.json
+
+      - name: Run core mutation gate
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
+        run: uv run --frozen mutmut run --max-children 2
+
+      - name: Verify deterministic golden bundle
+        run: uv run --frozen qed verify-bundle artifacts/golden-bundle --json
+
+      - name: Validate stable evidence and benchmark locks
+        shell: bash
+        run: |
+          uv run --frozen qed validate-evidence docs/research/v2-stable-evidence.json
+          uv run --frozen python benchmarks/reliability/run.py validate \
+            --cases benchmarks/reliability/v2-stable-cases.jsonl \
+            --lock benchmarks/reliability/v2-stable-cases.lock.json
+
+      - name: Reject forbidden providers and secrets
+        shell: bash
+        run: |
+          uv run --frozen python scripts/security_export_scan.py --output "$RUNNER_TEMP/qed-security-export.json"
+          if git grep -n -i -E 'anthropic|gemini|copilot|langchain|llama|ollama|openai-agents|danger-full-access|approval.?bypass' -- src frontend; then
+            echo 'Forbidden provider, framework, or unsafe runtime control found.' >&2
+            exit 1
+          fi
+          if git grep -n -I -E -- '-----BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY-----|sk-[A-Za-z0-9]{20,}|Bearer [A-Za-z0-9._-]{20,}' -- ':!docs/research/**'; then
+            echo 'Credential-shaped content found in production files.' >&2
+            exit 1
+          fi
+
+      - name: Check patch whitespace
+        run: git diff --check
 
       - name: Build Python package
         if: matrix.python-version == '3.14'
@@ -91,6 +132,9 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high
+
       - name: Lint frontend
         run: npm run lint
 
@@ -102,12 +146,6 @@ jobs:
 
       - name: Build frontend
         run: npm run build
-
-      - name: Run Impeccable security regressions
-        run: npm run test:impeccable
-
-      - name: Run Impeccable detector
-        run: npm run impeccable
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium

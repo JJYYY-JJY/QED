@@ -18,6 +18,7 @@ from qed.runtime import (
     TurnRef,
     create_codex_runtime,
 )
+from qed.schemas import sha256_text
 
 
 class FakeCapabilityRuntime:
@@ -78,6 +79,9 @@ def _request(
     )
 
 
+_EXECUTABLE = Path("/opt/codex/bin/codex")
+
+
 async def test_runtime_factory_creates_private_server_codex_home(
     tmp_path: Path,
 ) -> None:
@@ -97,7 +101,12 @@ async def test_explicit_effort_streams_never_reprobe_live_capabilities() -> None
     app = FakeTurnRuntime(RuntimeBackend.APP_SERVER)
     exec_runtime = FakeTurnRuntime(RuntimeBackend.EXEC)
     runtime = RoutedCodexRuntime(
-        capabilities, sdk, app, exec_runtime, runtime_version="test-codex/1"
+        capabilities,
+        sdk,
+        app,
+        exec_runtime,
+        executable=_EXECUTABLE,
+        runtime_version="test-codex/1",
     )
     request = _request(effort="high")
 
@@ -114,7 +123,12 @@ async def test_auto_routes_resolved_controls_to_app_server_when_sdk_cannot() -> 
     app = FakeTurnRuntime(RuntimeBackend.APP_SERVER)
     exec_runtime = FakeTurnRuntime(RuntimeBackend.EXEC)
     runtime = RoutedCodexRuntime(
-        capabilities, sdk, app, exec_runtime, runtime_version="test-codex/1"
+        capabilities,
+        sdk,
+        app,
+        exec_runtime,
+        executable=_EXECUTABLE,
+        runtime_version="test-codex/1",
     )
 
     events = [event async for event in runtime.stream(_request())]
@@ -139,6 +153,7 @@ async def test_exec_is_only_selected_explicitly() -> None:
         sdk,
         app,
         exec_runtime,
+        executable=_EXECUTABLE,
         runtime_version="test-codex/1",
     )
 
@@ -158,6 +173,7 @@ def test_preflight_rejects_unrepresentable_explicit_backend_before_stream() -> N
         FakeTurnRuntime(RuntimeBackend.SDK),
         FakeTurnRuntime(RuntimeBackend.APP_SERVER),
         FakeTurnRuntime(RuntimeBackend.EXEC, supported=False),
+        executable=_EXECUTABLE,
         runtime_version="test-codex/1",
     )
 
@@ -176,6 +192,7 @@ async def test_closing_routed_stream_closes_selected_runtime_stream() -> None:
         sdk,
         app,
         exec_runtime,
+        executable=_EXECUTABLE,
         runtime_version="test-codex/1",
     )
     events = runtime.stream(
@@ -191,3 +208,42 @@ async def test_closing_routed_stream_closes_selected_runtime_stream() -> None:
     await events.aclose()
 
     assert app.stream_closed
+
+
+def test_runtime_resolution_records_the_selected_backend(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "codex"
+    executable.write_bytes(b"official codex executable")
+    capabilities = RuntimeCapabilities(
+        model="gpt-5.6-sol",
+        advertised_efforts=("low", "high"),
+        default_effort="low",
+        selected_effort="high",
+        multi_agent=True,
+        proactive_multi_agent=False,
+        model_version="gpt-5.6-sol",
+        backend=RuntimeBackend.APP_SERVER,
+        model_catalog_sha256=sha256_text("catalog"),
+        capability_response_sha256=sha256_text("capability"),
+    )
+    runtime = RoutedCodexRuntime(
+        FakeCapabilityRuntime(),
+        FakeTurnRuntime(RuntimeBackend.SDK),
+        FakeTurnRuntime(RuntimeBackend.APP_SERVER),
+        FakeTurnRuntime(RuntimeBackend.EXEC),
+        executable=executable,
+        runtime_version="test-codex/1",
+    )
+
+    resolution = runtime.runtime_resolution(
+        capabilities,
+        requested_effort="high",
+        config_sha256=sha256_text("config"),
+        prompt_sha256=sha256_text("prompt"),
+        schema_sha256=sha256_text("schema"),
+        requested_backend=RuntimePreference.APP_SERVER,
+    )
+
+    assert resolution["backend"] == "app_server"
+    assert resolution["model"] == "gpt-5.6-sol"

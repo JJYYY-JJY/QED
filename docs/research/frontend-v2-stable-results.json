@@ -1,0 +1,45 @@
+{
+  "commands": [
+    {
+      "command": "npm ci",
+      "duration_seconds": 2.968,
+      "output_tail": "added 242 packages, and audited 243 packages in 3s\n\n60 packages are looking for funding\n  run `npm fund` for details\n\nfound 0 vulnerabilities\nnpm warn allow-scripts 2 packages have install scripts not yet covered by allowScripts:\nnpm warn allow-scripts   fsevents@2.3.2 (install: (install scripts present))\nnpm warn allow-scripts   fsevents@2.3.3 (install: (install scripts present))\nnpm warn allow-scripts\nnpm warn allow-scripts Run `npm approve-scripts --allow-scripts-pending` to review, or `npm approve-scripts <pkg>` to allow.",
+      "returncode": 0
+    },
+    {
+      "command": "npm run lint",
+      "duration_seconds": 2.107,
+      "output_tail": "> qed-research-console@0.1.0 lint\n> eslint frontend/src frontend/tests vite.config.ts playwright.config.ts",
+      "returncode": 0
+    },
+    {
+      "command": "npm run typecheck",
+      "duration_seconds": 0.909,
+      "output_tail": "> qed-research-console@0.1.0 typecheck\n> tsc --noEmit",
+      "returncode": 0
+    },
+    {
+      "command": "npm test -- --run",
+      "duration_seconds": 1.79,
+      "output_tail": "> qed-research-console@0.1.0 test\n> vitest run --run\n\n\n RUN  v4.1.10 /Users/junyeji/Projects/QED/frontend\n\n\n Test Files  3 passed (3)\n      Tests  10 passed (10)\n   Start at  19:16:49\n   Duration  1.37s (transform 111ms, setup 82ms, import 186ms, tests 894ms, environment 731ms)",
+      "returncode": 0
+    },
+    {
+      "command": "npm run build",
+      "duration_seconds": 1.164,
+      "output_tail": "> qed-research-console@0.1.0 build\n> tsc --noEmit && vite build\n\nvite v8.2.1 building client environment for production...\n\u001b[2K\ntransforming...✓ 28 modules transformed.\nrendering chunks...\ncomputing gzip size...\ndist/index.html                   0.55 kB │ gzip:  0.32 kB\ndist/assets/index-CS9Zth08.css   32.15 kB │ gzip:  6.76 kB\ndist/assets/index-CdA_4bn2.js   243.09 kB │ gzip: 73.07 kB\n\n✓ built in 161ms",
+      "returncode": 0
+    },
+    {
+      "command": "npm run test:e2e",
+      "duration_seconds": 2.156,
+      "output_tail": "ight test\n\n\nRunning 6 tests using 6 workers\n\n  -  4 [chromium] › frontend/tests/console.spec.ts:52:1 › uses navigation and inspector drawers on a narrow viewport\n  -  6 [chromium] › frontend/tests/console.spec.ts:75:1 › contains long unbroken proof text on a narrow viewport\n  ✓  5 [mobile-chromium] › frontend/tests/console.spec.ts:75:1 › contains long unbroken proof text on a narrow viewport (579ms)\n  ✓  2 [chromium] › frontend/tests/console.spec.ts:32:1 › keeps proof, reports, and evidence in one auditable workspace (608ms)\n  ✓  1 [mobile-chromium] › frontend/tests/console.spec.ts:52:1 › uses navigation and inspector drawers on a narrow viewport (629ms)\n  ✓  3 [mobile-chromium] › frontend/tests/console.spec.ts:32:1 › keeps proof, reports, and evidence in one auditable workspace (902ms)\n\n  2 skipped\n  4 passed (1.8s)\n[WebServer] (node:55470) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n[WebServer] (Use `node --trace-warnings ...` to show where the warning was created)\n(node:55474) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n(node:55473) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n(node:55476) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n(node:55475) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n(node:55477) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n(node:55472) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)",
+      "returncode": 0
+    }
+  ],
+  "finished_at": "2026-08-12T02:16:54.535623Z",
+  "limitation": "Playwright mobile-only cases are explicitly skipped; desktop E2E assertions ran after Chromium installation.",
+  "schema_version": 1,
+  "started_at": "2026-08-12T02:16:43.440593Z",
+  "status": "passed"
+}

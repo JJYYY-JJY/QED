@@ -25,12 +25,13 @@ Researchers can inspect the evidence chain, proof bytes, proof-linked findings,
 Codex thread provenance, code decision, and artifact hashes without trusting a
 model's completion claim.
 
-Structural and detailed verification run on fresh, read-only, offline Codex
-threads. Citation verification also starts fresh and read-only; it may use the
-restricted literature network policy. Every turn attempt receives a distinct
-server-owned empty Git working directory. QED disables local shell, file,
-browser, code-mode, plugin, and hook capabilities and never requests
-full-access sandboxes or an approval bypass.
+Structural, detailed, assumptions/quantifiers, counterexample/edge-case, and
+reconstruction verification run on fresh, read-only, offline Codex threads.
+Citation network access is disabled unless the restricted citation fetcher is
+the active attested path. Every turn attempt receives a distinct server-owned
+empty Git working directory. QED disables local shell, file, browser, code-mode,
+plugin, and hook capabilities and never requests full-access sandboxes or an
+approval bypass.
 
 A citation check counts only when its structured output binds an exact frozen
 proof span to an exact excerpt from a registered evidence record and its
@@ -50,7 +51,7 @@ See [Architecture](docs/architecture.md) and the
 - [uv](https://docs.astral.sh/uv/) for Python, environments, dependencies, and
   package commands
 - CPython 3.13 or 3.14; `.python-version` pins 3.14.6 for local work
-- Node.js 22.12 or newer and npm for the React console
+- Node.js 22.19 or newer and npm for the React console
 - an authenticated Codex session in QED's dedicated Codex state root for live
   research
 
@@ -134,6 +135,8 @@ A completed run writes:
 .qed/exports/<run-id>/<bundle-sha256>/
 ├── proof.md
 ├── report.md
+├── event-chain.json
+├── audit.json
 └── manifest.json
 ```
 
@@ -149,6 +152,18 @@ turn/backend lineage, prompt versions, canonical runtime resolutions, execution
 segments, detailed usage and timing, and the ordered event-chain hash. Usage
 separates input, output, cached-input, and reasoning-output tokens, and records
 turn, search-query, and execution-time totals.
+
+Verify an export without credentials, Codex, or network access:
+
+```bash
+uv run --frozen qed verify-bundle .qed/exports/<run-id>/<bundle-sha256> --json
+```
+
+The verifier rejects missing/extra files, links, non-canonical JSON, broken
+event chains, unbound verifier threads, incomplete claim/rule coverage, and any
+decision that does not recompute as QED policy PASS. An unsigned bundle reports
+integrity separately from authenticity; SHA-256 is not a signature or trusted
+timestamp.
 
 ## Serve the API
 
@@ -304,9 +319,7 @@ uv build
 npm run lint
 npm run typecheck
 npm test
-npm run test:impeccable
 npm run build
-npm run impeccable
 npx playwright install chromium
 npm run test:e2e
 ```
